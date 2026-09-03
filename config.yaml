@@ -31,6 +31,9 @@ launch:
     - 须知
     - 条款
     - 欢迎使用
+  update_or_card_keywords:
+    - 启动卡片
+    - 更新
   dismiss_buttons:
     - 关闭
     - 取消

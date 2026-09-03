@@ -36,7 +36,7 @@ class LaunchSettings:
         "条款",
         "欢迎使用",
     )
-    update_or_card_keywords: tuple[str, ...] = ("启动卡片", "更新", "欢迎使用")
+    update_or_card_keywords: tuple[str, ...] = ("启动卡片", "更新")
     dismiss_buttons: tuple[str, ...] = ("关闭", "取消", "稍后", "以后再说", "我知道了")
     accept_buttons: tuple[str, ...] = ("同意", "确定", "允许", "是")
 
@@ -122,7 +122,7 @@ def load_config(path: Path | None = None) -> Config:
                 ("启动卡片", "更新", "协议", "隐私", "权限", "须知", "条款", "欢迎使用"),
             ),
             update_or_card_keywords=_tuple(
-                "update_or_card_keywords", ("启动卡片", "更新", "欢迎使用")
+                "update_or_card_keywords", ("启动卡片", "更新")
             ),
             dismiss_buttons=_tuple(
                 "dismiss_buttons", ("关闭", "取消", "稍后", "以后再说", "我知道了")

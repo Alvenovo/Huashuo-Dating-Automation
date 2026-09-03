@@ -29,3 +29,4 @@ def test_update_and_card_prefer_dismiss():
     assert prefer_dismiss("启动卡片窗口", settings)
     assert prefer_dismiss("更新对话框", settings)
     assert not prefer_dismiss("用户协议", settings)
+    assert not prefer_dismiss("欢迎使用 华硕大厅", settings)

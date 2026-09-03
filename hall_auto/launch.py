@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from pywinauto import Application
+from pywinauto import Application, Desktop
 from pywinauto.base_wrapper import ElementNotEnabled
 
 from hall_auto.config import Config, LaunchSettings, REPO_ROOT
@@ -54,18 +54,58 @@ def _save_screenshot(wrapper, stem: str) -> Path | None:
 
 def _overlay_windows(main) -> list:
     found = []
+    seen = set()
+    try:
+        main_handle = main.handle
+    except Exception:
+        main_handle = None
+
+    def _add(name: str, node) -> None:
+        try:
+            handle = node.handle
+        except Exception:
+            handle = id(node)
+        if handle in seen or (main_handle is not None and handle == main_handle):
+            return
+        if not name:
+            return
+        seen.add(handle)
+        found.append((name, node))
+
     try:
         nodes = main.descendants(control_type="Window")
     except Exception:
-        return found
+        nodes = []
     for node in nodes:
         try:
             name = popup_text(node.element_info.name or node.window_text())
         except Exception:
             continue
-        if name:
-            found.append((name, node))
+        _add(name, node)
+
+    try:
+        pid = main.element_info.process_id
+        for win in Desktop(backend="uia").windows():
+            try:
+                if win.element_info.process_id != pid:
+                    continue
+                name = popup_text(win.window_text() or win.element_info.name)
+            except Exception:
+                continue
+            _add(name, win)
+    except Exception:
+        pass
     return found
+
+
+def click_first_run_agree(main, settings: LaunchSettings) -> bool:
+    """首次协议画在主窗口上时，没有子 Window，直接点「同意」。更新框有 VersionLabel 则不点同意。"""
+    present = _auto_ids_present(main)
+    if settings.required_auto_ids[0] in present:
+        return False
+    if "VersionLabel" in present or "ChangeLog" in present:
+        return False
+    return _click_named_button(main, settings.accept_buttons)
 
 
 def _click_named_button(overlay, labels: tuple[str, ...]) -> bool:
@@ -101,11 +141,31 @@ def _click_named_button(overlay, labels: tuple[str, ...]) -> bool:
     return False
 
 
+def _looks_like_first_run(overlay) -> bool:
+    labels = []
+    try:
+        buttons = overlay.descendants(control_type="Button")
+    except Exception:
+        return False
+    for btn in buttons:
+        try:
+            labels.append(popup_text(btn.element_info.name or btn.window_text()))
+        except Exception:
+            continue
+    return any("同意" == x or x.endswith("同意") for x in labels) and any(
+        "取消" in x for x in labels
+    )
+
+
 def dismiss_whitelist_popups(main, settings: LaunchSettings) -> None:
     for name, overlay in _overlay_windows(main):
-        if not is_whitelisted(name, settings):
+        first_run = _looks_like_first_run(overlay)
+        if not (is_whitelisted(name, settings) or first_run):
             continue
-        labels = settings.dismiss_buttons if prefer_dismiss(name, settings) else settings.accept_buttons
+        if prefer_dismiss(name, settings) and not first_run:
+            labels = settings.dismiss_buttons
+        else:
+            labels = settings.accept_buttons
         if not _click_named_button(overlay, labels):
             _click_named_button(overlay, settings.dismiss_buttons)
         time.sleep(1)
@@ -113,9 +173,10 @@ def dismiss_whitelist_popups(main, settings: LaunchSettings) -> None:
 
 def unknown_popups(main, settings: LaunchSettings) -> list[str]:
     names = []
-    for name, _overlay in _overlay_windows(main):
-        if not is_whitelisted(name, settings):
-            names.append(name)
+    for name, overlay in _overlay_windows(main):
+        if is_whitelisted(name, settings) or _looks_like_first_run(overlay):
+            continue
+        names.append(name)
     return names
 
 
@@ -192,6 +253,7 @@ def wait_until_ready(cfg: Config, main) -> LaunchResult:
     last_unknown: list[str] = []
     while time.time() < deadline:
         dismiss_whitelist_popups(main, settings)
+        click_first_run_agree(main, settings)
         last_unknown = unknown_popups(main, settings)
         if last_unknown:
             evidence = _save_screenshot(main, "unknown_popup")
