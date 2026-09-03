@@ -17,6 +17,28 @@ class Timeouts:
     uninstall_sec: int = 300
     version_settle_sec: int = 180
     process_stop_sec: int = 30
+    launch_sec: int = 45
+    ready_sec: int = 90
+
+
+@dataclass(frozen=True)
+class LaunchSettings:
+    cold_starts: int = 3
+    required_auto_ids: tuple[str, ...] = ("SearchBarInput", "TabList", "MainWeb")
+    webview_ready_names: tuple[str, ...] = ("专题页",)
+    popup_whitelist_keywords: tuple[str, ...] = (
+        "启动卡片",
+        "更新",
+        "协议",
+        "隐私",
+        "权限",
+        "须知",
+        "条款",
+        "欢迎使用",
+    )
+    update_or_card_keywords: tuple[str, ...] = ("启动卡片", "更新", "欢迎使用")
+    dismiss_buttons: tuple[str, ...] = ("关闭", "取消", "稍后", "以后再说", "我知道了")
+    accept_buttons: tuple[str, ...] = ("同意", "确定", "允许", "是")
 
 
 @dataclass(frozen=True)
@@ -28,6 +50,7 @@ class Config:
     search_keyword: str
     search_min_hits: int
     timeouts: Timeouts
+    launch: LaunchSettings
     raw: dict
 
     @property
@@ -67,6 +90,13 @@ def load_config(path: Path | None = None) -> Config:
 
     installer_dir = os.environ.get("HALL_INSTALLER_DIR") or data.get("installer_dir") or ""
     timeouts_raw = data.get("timeouts") or {}
+    launch_raw = data.get("launch") or {}
+
+    def _tuple(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        value = launch_raw.get(key)
+        if not value:
+            return default
+        return tuple(str(x) for x in value)
 
     return Config(
         installer_dir=Path(str(installer_dir)),
@@ -80,6 +110,24 @@ def load_config(path: Path | None = None) -> Config:
             uninstall_sec=int(timeouts_raw.get("uninstall_sec") or 300),
             version_settle_sec=int(timeouts_raw.get("version_settle_sec") or 180),
             process_stop_sec=int(timeouts_raw.get("process_stop_sec") or 30),
+            launch_sec=int(timeouts_raw.get("launch_sec") or 45),
+            ready_sec=int(timeouts_raw.get("ready_sec") or 90),
+        ),
+        launch=LaunchSettings(
+            cold_starts=int(launch_raw.get("cold_starts") or 3),
+            required_auto_ids=_tuple("required_auto_ids", ("SearchBarInput", "TabList", "MainWeb")),
+            webview_ready_names=_tuple("webview_ready_names", ("专题页",)),
+            popup_whitelist_keywords=_tuple(
+                "popup_whitelist_keywords",
+                ("启动卡片", "更新", "协议", "隐私", "权限", "须知", "条款", "欢迎使用"),
+            ),
+            update_or_card_keywords=_tuple(
+                "update_or_card_keywords", ("启动卡片", "更新", "欢迎使用")
+            ),
+            dismiss_buttons=_tuple(
+                "dismiss_buttons", ("关闭", "取消", "稍后", "以后再说", "我知道了")
+            ),
+            accept_buttons=_tuple("accept_buttons", ("同意", "确定", "允许", "是")),
         ),
         raw=data,
     )

@@ -170,6 +170,17 @@ def _kill_image(name: str) -> None:
         subprocess.run(args, capture_output=True, check=False)
 
 
+def stop_main_process(timeout_sec: int = 30) -> None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if "AsusMemberCenter" not in _running_image_names():
+            return
+        _kill_image("AsusMemberCenter")
+        time.sleep(1)
+    if "AsusMemberCenter" in _running_image_names():
+        raise TimeoutError("未能结束主进程 AsusMemberCenter")
+
+
 def stop_product(timeout_sec: int = 30) -> None:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:

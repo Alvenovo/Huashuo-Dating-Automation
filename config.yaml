@@ -11,6 +11,37 @@ timeouts:
   uninstall_sec: 300
   version_settle_sec: 180
   process_stop_sec: 30
+  launch_sec: 45
+  ready_sec: 90
+
+launch:
+  cold_starts: 3
+  required_auto_ids:
+    - SearchBarInput
+    - TabList
+    - MainWeb
+  webview_ready_names:
+    - 专题页
+  popup_whitelist_keywords:
+    - 启动卡片
+    - 更新
+    - 协议
+    - 隐私
+    - 权限
+    - 须知
+    - 条款
+    - 欢迎使用
+  dismiss_buttons:
+    - 关闭
+    - 取消
+    - 稍后
+    - 以后再说
+    - 我知道了
+  accept_buttons:
+    - 同意
+    - 确定
+    - 允许
+    - 是
 
 accounts:
   password:
