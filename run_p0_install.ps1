@@ -1,4 +1,5 @@
 Set-Location $PSScriptRoot
+Write-Host "Use Administrator PowerShell. This uninstalls and reinstalls ASUS Hall."
 $env:HALL_ALLOW_INSTALL = "1"
-Write-Host "Run this in Administrator PowerShell. It uninstalls and reinstalls ASUS Hall."
-python -m pytest tests/install -m "install" -v
+$python = if (Test-Path ".\.venv\Scripts\python.exe") { ".\.venv\Scripts\python.exe" } else { "python" }
+& $python -m pytest tests/install -m "install" -v

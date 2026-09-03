@@ -1,3 +1,4 @@
 Set-Location $PSScriptRoot
-Write-Host "Launch smoke P0-03/04. Does not reinstall. Closes and restarts ASUS Hall 3 times."
-python -m pytest tests/launch -m "launch" -v
+Write-Host "P0-03/04 launch smoke. Does not reinstall. Restarts ASUS Hall 3 extra times."
+$python = if (Test-Path ".\.venv\Scripts\python.exe") { ".\.venv\Scripts\python.exe" } else { "python" }
+& $python -m pytest tests/launch -m "launch" -v
