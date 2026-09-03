@@ -9,3 +9,4 @@ __pycache__/
 reports/
 config.local.yaml
 *.log
+myappstore_*_Setup.exe
