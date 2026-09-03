@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import pytest
 
-from hall_auto.product import read_installed
-from hall_auto.version import expected_version_from_setup_name, versions_equal
+from hall_auto.product import (
+    CRITICAL_PROCESS_NAMES,
+    HELPER_PROCESS_NAMES,
+    read_installed,
+)
+from hall_auto.version import versions_equal
+
+
+@pytest.mark.unit
+def test_appstoreserver_is_helper_not_critical():
+    assert "AppStoreServer" in HELPER_PROCESS_NAMES
+    assert "AppStoreServer" not in CRITICAL_PROCESS_NAMES
+    assert "AsusMemberCenter" in CRITICAL_PROCESS_NAMES
 
 
 @pytest.mark.unit

@@ -14,13 +14,14 @@ UNINSTALL_KEY_32 = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AsusMem
 EXE_NAME = "AsusMemberCenter.exe"
 DEFAULT_INSTALL_DIR = Path(r"C:\Program Files (x86)\ASUS\ASUS Member Center")
 
-PROCESS_NAMES = (
-    "AsusMemberCenter",
+CRITICAL_PROCESS_NAMES = ("AsusMemberCenter",)
+HELPER_PROCESS_NAMES = (
     "AppStoreServer",
     "NotifyApp",
     "UpAppNotify",
     "AppCheck",
 )
+PROCESS_NAMES = CRITICAL_PROCESS_NAMES + HELPER_PROCESS_NAMES
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,14 @@ def _running_image_names() -> set[str]:
     return names
 
 
+def _kill_image(name: str) -> None:
+    for args in (
+        ["taskkill", "/IM", f"{name}.exe", "/F", "/T"],
+        ["taskkill", "/IM", f"{name}.exe", "/F"],
+    ):
+        subprocess.run(args, capture_output=True, check=False)
+
+
 def stop_product(timeout_sec: int = 30) -> None:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
@@ -168,12 +177,10 @@ def stop_product(timeout_sec: int = 30) -> None:
         if not running:
             return
         for name in running:
-            subprocess.run(
-                ["taskkill", "/IM", f"{name}.exe", "/F", "/T"],
-                capture_output=True,
-                check=False,
-            )
+            _kill_image(name)
         time.sleep(1)
-    leftover = [name for name in PROCESS_NAMES if name in _running_image_names()]
-    if leftover:
-        raise TimeoutError(f"未能结束进程: {leftover}")
+    leftover_critical = [
+        name for name in CRITICAL_PROCESS_NAMES if name in _running_image_names()
+    ]
+    if leftover_critical:
+        raise TimeoutError(f"未能结束主进程: {leftover_critical}")
