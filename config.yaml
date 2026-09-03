@@ -1,0 +1,27 @@
+installer_dir: "C:/Users/admin/Desktop/Test/华硕大厅"
+baseline_setup: "myappstore_1.6.8.17S_Setup.exe"
+latest_setup: "myappstore_1.6.10.7S_Setup.exe"
+
+display_name_contains: "华硕大厅"
+search_keyword: "qq"
+search_min_hits: 2
+
+timeouts:
+  install_sec: 900
+  uninstall_sec: 300
+  version_settle_sec: 180
+  process_stop_sec: 30
+
+accounts:
+  password:
+    user: ""
+    password: ""
+  microsoft:
+    user: ""
+    password: ""
+
+fixture_apps:
+  install: ""
+  update: ""
+  uninstall: ""
+  sync: ""

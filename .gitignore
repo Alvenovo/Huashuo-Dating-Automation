@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+reports/
+config.local.yaml
+*.log
