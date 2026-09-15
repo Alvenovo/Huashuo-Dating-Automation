@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 
 from pywinauto import Application, Desktop
-from pywinauto.base_wrapper import ElementNotEnabled
 
 from hall_auto.config import Config, LaunchSettings, REPO_ROOT
 from hall_auto.product import EXE_NAME, read_installed, stop_main_process
@@ -45,6 +44,12 @@ def prefer_dismiss(name: str, settings: LaunchSettings) -> bool:
 def _save_screenshot(wrapper, stem: str) -> Path | None:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     path = REPORTS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{stem}.png"
+    try:
+        # capture_as_image 抓的是屏幕像素，不置顶会拍到挡在前面的窗口
+        wrapper.set_focus()
+        time.sleep(0.5)
+    except Exception:
+        pass
     try:
         wrapper.capture_as_image().save(path)
         return path
@@ -108,36 +113,42 @@ def click_first_run_agree(main, settings: LaunchSettings) -> bool:
     return _click_named_button(main, settings.accept_buttons)
 
 
+def _press_button(btn) -> bool:
+    """优先 UIA Invoke：不依赖鼠标坐标和窗口层级。click_input 在大厅被遮挡时会点到遮挡窗口上。"""
+    try:
+        btn.invoke()
+        return True
+    except Exception:
+        pass
+    try:
+        btn.set_focus()
+        btn.click_input()
+        return True
+    except Exception:
+        return False
+
+
+def matches_button(aid: str, name: str, labels: tuple[str, ...]) -> bool:
+    if aid in ("CancelBtn", "closebtn"):
+        return any(x in ("取消", "关闭") for x in labels)
+    if aid == "ConfirmBtn":
+        return any(x in ("同意", "确定") for x in labels)
+    return any(label and label in name for label in labels)
+
+
 def _click_named_button(overlay, labels: tuple[str, ...]) -> bool:
     try:
         buttons = overlay.descendants(control_type="Button")
     except Exception:
         return False
-    lowered = labels
     for btn in buttons:
         try:
             aid = btn.element_info.automation_id or ""
             name = popup_text(btn.element_info.name or btn.window_text())
         except Exception:
             continue
-        if aid in ("CancelBtn", "closebtn") and any(x in ("取消", "关闭") for x in lowered):
-            try:
-                btn.click_input()
-                return True
-            except (ElementNotEnabled, Exception):
-                continue
-        if aid == "ConfirmBtn" and any(x in ("同意", "确定") for x in lowered):
-            try:
-                btn.click_input()
-                return True
-            except (ElementNotEnabled, Exception):
-                continue
-        if any(label and label in name for label in lowered):
-            try:
-                btn.click_input()
-                return True
-            except (ElementNotEnabled, Exception):
-                continue
+        if matches_button(aid, name, labels) and _press_button(btn):
+            return True
     return False
 
 
@@ -166,7 +177,7 @@ def dismiss_whitelist_popups(main, settings: LaunchSettings) -> None:
             labels = settings.dismiss_buttons
         else:
             labels = settings.accept_buttons
-        if not _click_named_button(overlay, labels):
+        if not _click_named_button(overlay, labels) and labels != settings.dismiss_buttons:
             _click_named_button(overlay, settings.dismiss_buttons)
         time.sleep(1)
 
@@ -178,6 +189,17 @@ def unknown_popups(main, settings: LaunchSettings) -> list[str]:
             continue
         names.append(name)
     return names
+
+
+def _back_if_subpage(main) -> bool:
+    """大厅会恢复上次的页面（实测重装后首跑落在设置/关于页），点返回回首页。"""
+    for node in main.descendants(control_type="Button"):
+        try:
+            if (node.element_info.automation_id or "") == "BackBtn":
+                return _press_button(node)
+        except Exception:
+            continue
+    return False
 
 
 def _auto_ids_present(main) -> set[str]:
@@ -237,6 +259,47 @@ def main_window(app: Application, title_contains: str, timeout_sec: int):
     raise LaunchError(f"未出现主窗口（标题含 {title_contains}）: {last}")
 
 
+def dismiss_pre_main_popups(app: Application, settings: LaunchSettings) -> bool:
+    """首跑协议/权限页是独立顶层窗口（实测叫「权限确认窗口」），点完同意主窗口才出现，所以等主窗口之前就要关它。"""
+    clicked = False
+    try:
+        pid = app.process
+        wins = Desktop(backend="uia").windows()
+    except Exception:
+        return False
+    for win in wins:
+        try:
+            if win.element_info.process_id != pid:
+                continue
+            name = popup_text(win.window_text() or win.element_info.name)
+        except Exception:
+            continue
+        first_run = _looks_like_first_run(win)
+        if not (is_whitelisted(name, settings) or first_run):
+            continue
+        if prefer_dismiss(name, settings) and not first_run:
+            labels = settings.dismiss_buttons
+        else:
+            labels = settings.accept_buttons
+        if _click_named_button(win, labels):
+            clicked = True
+            time.sleep(0.5)
+    return clicked
+
+
+def wait_main_window(app: Application, cfg: Config):
+    deadline = time.time() + cfg.timeouts.launch_sec
+    last = None
+    while time.time() < deadline:
+        dismiss_pre_main_popups(app, cfg.launch)
+        try:
+            return main_window(app, cfg.display_name_contains, 3)
+        except LaunchError as exc:
+            last = exc
+            time.sleep(1)
+    raise LaunchError(f"未出现主窗口（标题含 {cfg.display_name_contains}）: {last}")
+
+
 def start_fresh(cfg: Config) -> Application:
     info = read_installed()
     if info is None or not info.exe_path.is_file():
@@ -266,6 +329,9 @@ def wait_until_ready(cfg: Config, main) -> LaunchResult:
             continue
         present = _auto_ids_present(main)
         missing = [aid for aid in settings.required_auto_ids if aid not in present]
+        if missing and _back_if_subpage(main):
+            time.sleep(1)
+            continue
         if not missing and _webview_ready(main, settings):
             return LaunchResult(
                 title=popup_text(main.window_text()),
@@ -285,7 +351,7 @@ def wait_until_ready(cfg: Config, main) -> LaunchResult:
 
 def launch_until_ready(cfg: Config) -> LaunchResult:
     app = start_fresh(cfg)
-    main = main_window(app, cfg.display_name_contains, cfg.timeouts.launch_sec)
+    main = wait_main_window(app, cfg)
     result = wait_until_ready(cfg, main)
     if cfg.display_name_contains not in result.title:
         raise LaunchError(f"主窗口标题不是 {cfg.display_name_contains!r}: {result.title!r}")

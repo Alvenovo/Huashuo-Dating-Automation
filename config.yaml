@@ -59,3 +59,15 @@ fixture_apps:
   update: ""
   uninstall: ""
   sync: ""
+
+# P1-A 更新夹具：钉一个官方老版本，大厅目录里就永远有更新可点。
+# package 是相对 installer_dir 的路径；sha256 防本地包被换；版本号一律运行时读，不写死。
+update_fixture:
+  name: ""
+  registry_hint: ""
+  pinned_version: ""
+  package: ""
+  sha256: ""
+  url: ""
+  install_dir: ""
+  version_exe: ""

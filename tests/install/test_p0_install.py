@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from hall_auto.about import read_about_version
 from hall_auto.installer import install_baseline_clean, upgrade_to_latest
 from hall_auto.product import is_admin, read_installed
 from hall_auto.version import expected_version_from_setup_name, versions_equal
@@ -28,6 +29,13 @@ def _assert_product(info, expected_version: str, display_name_contains: str):
     )
 
 
+def _assert_about_version(cfg, expected_version: str):
+    about = read_about_version(cfg)
+    assert versions_equal(about, expected_version), (
+        f"关于页版本 期望 {expected_version}，实际 {about!r}"
+    )
+
+
 @pytest.mark.install
 @pytest.mark.destructive
 def test_p0_01_install_baseline(cfg):
@@ -37,6 +45,7 @@ def test_p0_01_install_baseline(cfg):
     expected = expected_version_from_setup_name(cfg.baseline_setup)
     info = install_baseline_clean(cfg)
     _assert_product(info, expected, cfg.display_name_contains)
+    _assert_about_version(cfg, expected)
 
 
 @pytest.mark.install
@@ -50,3 +59,4 @@ def test_p0_02_upgrade_latest(cfg):
     _assert_product(info, expected, cfg.display_name_contains)
     current = read_installed()
     _assert_product(current, expected, cfg.display_name_contains)
+    _assert_about_version(cfg, expected)

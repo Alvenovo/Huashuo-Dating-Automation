@@ -28,3 +28,11 @@ def versions_equal(actual: str | None, expected: str) -> bool:
     if actual is None:
         return False
     return str(actual).strip() == str(expected).strip()
+
+
+def four_segment(version: str) -> str:
+    """点分版本补成四段：注册表 26.03 对应 exe FileVersion 26.3.0.0。"""
+    parts = [int(p) for p in parse_dotted_version(version)]
+    while len(parts) < 4:
+        parts.append(0)
+    return ".".join(str(p) for p in parts[:4])

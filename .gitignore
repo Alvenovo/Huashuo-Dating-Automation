@@ -8,5 +8,7 @@ __pycache__/
 .vscode/
 reports/
 config.local.yaml
+# 归档交接里有本机个人规则部署记录（私有仓库名、用户目录），与项目无关，不进公开仓库
+交接归档/
 *.log
 myappstore_*_Setup.exe

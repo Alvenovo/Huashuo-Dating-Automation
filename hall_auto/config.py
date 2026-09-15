@@ -42,6 +42,38 @@ class LaunchSettings:
 
 
 @dataclass(frozen=True)
+class FixtureApps:
+    """P1-A 夹具应用。执行类动作只允许对这里的应用做，日常软件一律不碰。"""
+
+    install: str = ""
+    update: str = ""
+    uninstall: str = ""
+    sync: str = ""
+
+
+@dataclass(frozen=True)
+class UpdateFixture:
+    """P1-A 更新夹具：钉一个官方老版本，让大厅目录里永远有更新可点。
+
+    复位（tools/reset_fixture.py）把机器压回 pinned_version；用例从大厅点「更新」，
+    断言注册表版本变成向导标题声明的目标版本，且不写死版本号。
+    """
+
+    name: str = ""
+    registry_hint: str = ""
+    pinned_version: str = ""
+    package: str = ""
+    sha256: str = ""
+    url: str = ""
+    install_dir: str = ""
+    version_exe: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.name and self.registry_hint and self.pinned_version and self.package)
+
+
+@dataclass(frozen=True)
 class Config:
     installer_dir: Path
     baseline_setup: str
@@ -51,6 +83,8 @@ class Config:
     search_min_hits: int
     timeouts: Timeouts
     launch: LaunchSettings
+    fixture_apps: FixtureApps
+    update_fixture: UpdateFixture
     raw: dict
 
     @property
@@ -60,6 +94,21 @@ class Config:
     @property
     def latest_path(self) -> Path:
         return self.installer_dir / self.latest_setup
+
+    @property
+    def update_package_path(self) -> Path:
+        return self.installer_dir / self.update_fixture.package
+
+    @property
+    def update_version_exe(self) -> Path:
+        return Path(self.update_fixture.install_dir) / self.update_fixture.version_exe
+
+    def test_account(self) -> tuple[str, str]:
+        """凭据优先走环境变量，密码不落盘（规则红线）。"""
+        stored = (self.raw.get("accounts") or {}).get("password") or {}
+        user = os.environ.get("HALL_TEST_USER") or str(stored.get("user") or "")
+        password = os.environ.get("HALL_TEST_PASSWORD") or str(stored.get("password") or "")
+        return user, password
 
 
 def _read_yaml(path: Path) -> dict:
@@ -91,6 +140,8 @@ def load_config(path: Path | None = None) -> Config:
     installer_dir = os.environ.get("HALL_INSTALLER_DIR") or data.get("installer_dir") or ""
     timeouts_raw = data.get("timeouts") or {}
     launch_raw = data.get("launch") or {}
+    fixture_raw = data.get("fixture_apps") or {}
+    update_raw = data.get("update_fixture") or {}
 
     def _tuple(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
         value = launch_raw.get(key)
@@ -128,6 +179,22 @@ def load_config(path: Path | None = None) -> Config:
                 "dismiss_buttons", ("关闭", "取消", "稍后", "以后再说", "我知道了")
             ),
             accept_buttons=_tuple("accept_buttons", ("同意", "确定", "允许", "是")),
+        ),
+        fixture_apps=FixtureApps(
+            install=str(fixture_raw.get("install") or ""),
+            update=str(fixture_raw.get("update") or ""),
+            uninstall=str(fixture_raw.get("uninstall") or ""),
+            sync=str(fixture_raw.get("sync") or ""),
+        ),
+        update_fixture=UpdateFixture(
+            name=str(update_raw.get("name") or ""),
+            registry_hint=str(update_raw.get("registry_hint") or ""),
+            pinned_version=str(update_raw.get("pinned_version") or ""),
+            package=str(update_raw.get("package") or ""),
+            sha256=str(update_raw.get("sha256") or ""),
+            url=str(update_raw.get("url") or ""),
+            install_dir=str(update_raw.get("install_dir") or ""),
+            version_exe=str(update_raw.get("version_exe") or ""),
         ),
         raw=data,
     )

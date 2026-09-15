@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from hall_auto.launch import is_whitelisted, prefer_dismiss
+from hall_auto.launch import is_whitelisted, matches_button, prefer_dismiss
 from hall_auto.config import load_config
 
 
@@ -30,3 +30,23 @@ def test_update_and_card_prefer_dismiss():
     assert prefer_dismiss("更新对话框", settings)
     assert not prefer_dismiss("用户协议", settings)
     assert not prefer_dismiss("欢迎使用 华硕大厅", settings)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("aid", "name", "labels", "expected"),
+    [
+        ("", "关闭", ("关闭", "取消"), True),
+        ("", "我选好了", ("关闭", "取消"), False),
+        ("", "我知道了", ("我知道了",), True),
+        ("closebtn", "", ("关闭",), True),
+        ("closebtn", "", ("同意",), False),
+        ("ConfirmBtn", "", ("同意", "确定"), True),
+        # aid 命中时不再按名称兜底，避免把确认按钮当成关闭按钮点掉
+        ("ConfirmBtn", "关闭", ("关闭",), False),
+        ("", "关闭", (), False),
+        ("", "我已阅读并同意", ("同意",), True),
+    ],
+)
+def test_matches_button(aid, name, labels, expected):
+    assert matches_button(aid, name, labels) is expected

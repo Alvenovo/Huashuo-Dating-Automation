@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
 
-from hall_auto.config import load_config
-from hall_auto.version import expected_version_from_setup_name, versions_equal
+from hall_auto.config import DEFAULT_CONFIG, load_config
+from hall_auto.version import expected_version_from_setup_name, four_segment, versions_equal
 
 
 @pytest.mark.unit
@@ -42,8 +43,25 @@ def test_versions_equal_strips():
 
 
 @pytest.mark.unit
-def test_load_config_default_installer_dir():
-    cfg = load_config()
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("26.02", "26.2.0.0"),
+        ("26.03", "26.3.0.0"),
+        ("1.6.8.17", "1.6.8.17"),
+        ("1.2.3", "1.2.3.0"),
+    ],
+)
+def test_four_segment(version, expected):
+    assert four_segment(version) == expected
+
+
+@pytest.mark.unit
+def test_load_config_repo_defaults(tmp_path):
+    # 复制后加载：load_config 只在路径等于仓库 config.yaml 时才合并 config.local.yaml
+    copied = tmp_path / "config.yaml"
+    shutil.copyfile(DEFAULT_CONFIG, copied)
+    cfg = load_config(copied)
     assert cfg.installer_dir == Path("C:/Users/ASUS/Desktop/华硕大厅")
     assert expected_version_from_setup_name(cfg.baseline_setup) == "1.6.8.17"
     assert expected_version_from_setup_name(cfg.latest_setup) == "1.6.10.7"
