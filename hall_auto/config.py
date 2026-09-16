@@ -114,6 +114,11 @@ class Config:
         """改密码往返用例的临时新密码，只走环境变量，绝不读配置文件、绝不落盘。"""
         return os.environ.get("HALL_TEST_NEW_PASSWORD") or ""
 
+    def microsoft_account(self) -> str:
+        """微软登录邮箱，优先环境变量；committed 的 config.yaml 不放邮箱（仓库公开）。"""
+        stored = ((self.raw.get("accounts") or {}).get("microsoft") or {})
+        return os.environ.get("HALL_MS_USER") or str(stored.get("email") or "")
+
 
 def _read_yaml(path: Path) -> dict:
     if not path.is_file():

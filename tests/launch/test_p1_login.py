@@ -15,12 +15,17 @@ from hall_auto.login import (
     login_with_sms_code,
     logged_in,
     logout,
+    microsoft_pick_account,
     open_forgot_password_page,
     open_login_dialog,
+    open_microsoft_login,
     request_forgot_sms,
     request_sms_code,
     submit_forgot_reset,
+    submit_microsoft_email,
     switch_login_tab,
+    wait_microsoft_logged_in,
+    wait_microsoft_state,
 )
 from hall_auto.product import stop_main_process
 
@@ -74,6 +79,41 @@ def test_logout_returns_to_anonymous(ready_pid):
     logout(ready_pid)
     assert not logged_in(ready_pid)
     assert not login_dialog_open(ready_pid)
+
+
+@pytest.mark.login
+def test_microsoft_login_sso(cfg, ready_pid):
+    """微软账号登录：填邮箱→下一步→点缓存账号磁贴走 SSO 免密→断言已登录→finally 还原登出。
+
+    设计边界（主流程自动化设计.md）：微软账号测到系统/WebView 登录窗为止；
+    出现密码页(i0118)或 MFA 则标记人工、不算脚本失败（skip）。
+    本机有缓存的 Windows/MS 会话时，点「下一步」直接出账号选择器，可免密 SSO，
+    所以这条在专用机上能无人值守跑通；无缓存会话的机器会落到 password 分支 skip。
+    邮箱走 HALL_MS_USER（或 config.local.yaml 的 accounts.microsoft.email），不进 git、不进对话。
+    2026-09-16 探针实跑通过：SSO 后用户区=已登录用户 61935，logout 还原成未登录。
+    """
+    email = cfg.microsoft_account()
+    if not email:
+        pytest.skip("缺微软邮箱：设置 HALL_MS_USER")
+    logout(ready_pid)
+    ms_win = open_microsoft_login(ready_pid)
+    submit_microsoft_email(ms_win, email)
+    state = wait_microsoft_state(ready_pid, ms_win, email)
+    if state == "password":
+        pytest.skip("微软要密码(i0118)：本机无缓存 MS 会话，需人工在自己终端输入，标记人工")
+    if state == "mfa":
+        pytest.skip("微软要二次验证(MFA)：按设计标记人工，不算脚本失败")
+    if state == "waiting":
+        pytest.fail("微软登录点「下一步」后没到任何已知分支（picker/password/mfa）")
+    try:
+        if state == "account_picker":
+            microsoft_pick_account(ms_win, email)
+        name = wait_microsoft_logged_in(ready_pid)
+        assert logged_in(ready_pid), "SSO 后仍未进入已登录态"
+        assert "已登录" in name, f"已登录态用户区文案异常: {name!r}"
+    finally:
+        logout(ready_pid)
+    assert not logged_in(ready_pid), "还原登出后应回到未登录态"
 
 
 @pytest.mark.login

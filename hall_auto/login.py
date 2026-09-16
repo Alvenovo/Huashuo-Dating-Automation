@@ -10,10 +10,14 @@ from pywinauto.uia_element_info import UIAElementInfo
 from hall_auto.config import Config
 from hall_auto.launch import LaunchError, _press_button, popup_text
 from hall_auto.waiting import wait_until, wait_until_or_raise
+from hall_auto.winapi import _hwnd_pid, _hwnd_visible, _top_hwnds
 
 LOGIN_DIALOG_TIMEOUT_SEC = 15
 LOGIN_SUBMIT_TIMEOUT_SEC = 25
 CODE_RESEND_TIMEOUT_SEC = 65  # 短信网关冷却常为 60s，还原程紧接第一程再发时要等发送按钮回来
+MICROSOFT_WINDOW_TIMEOUT_SEC = 15  # 点微软入口后内嵌登录窗出现
+MICROSOFT_PAGE_TIMEOUT_SEC = 20  # WebView 里邮箱框出现（实测 ~1.7s，留余量）
+MICROSOFT_SSO_TIMEOUT_SEC = 25  # 点磁贴/提交后回到大厅已登录态
 
 
 def _windows(pid: int) -> list:
@@ -25,7 +29,15 @@ def _windows(pid: int) -> list:
             hwnds.append(hwnd)
 
     win32gui.EnumWindows(_collect, None)
-    return [UIAWrapper(UIAElementInfo(h)) for h in hwnds]
+    windows = []
+    for h in hwnds:
+        # 微软 SSO 登录完成时，内嵌的 WinForms 登录窗会关闭，句柄瞬间失效，
+        # UIAElementInfo(h) 抛 COMError；跳过失效句柄，别让整轮枚举崩掉。
+        try:
+            windows.append(UIAWrapper(UIAElementInfo(h)))
+        except Exception:
+            continue
+    return windows
 
 
 def _nodes(pid: int, control_type: str | None = None):
@@ -301,3 +313,132 @@ def login_with_password_value(pid: int, user: str, password: str) -> str:
             return popup_text(_by_aid(pid, "Button", "UserInfoPart").element_info.name)
         time.sleep(0.5)
     raise LaunchError("登录：提交后未进入已登录态")
+
+
+def _ms_nodes(ms_win):
+    try:
+        return list(ms_win.descendants())
+    except Exception:
+        return []
+
+
+def _ms_by_aid(ms_win, aid: str):
+    for node in _ms_nodes(ms_win):
+        try:
+            if (node.element_info.automation_id or "") == aid:
+                return node
+        except Exception:
+            continue
+    return None
+
+
+def _wait_microsoft_window(pid: int, before: set[int]):
+    """等本进程新增的、内嵌 webBrowser 面板的顶层窗（微软登录窗）。"""
+    deadline = time.time() + MICROSOFT_WINDOW_TIMEOUT_SEC
+    while time.time() < deadline:
+        for h in _top_hwnds():
+            if not _hwnd_visible(h) or h in before or _hwnd_pid(h) != pid:
+                continue
+            try:
+                win = UIAWrapper(UIAElementInfo(h))
+            except Exception:
+                continue
+            if _ms_by_aid(win, "webBrowser") is not None:
+                return win
+        time.sleep(0.5)
+    raise LaunchError("微软登录：内嵌登录窗没出现")
+
+
+def open_microsoft_login(pid: int):
+    """点登录弹窗的微软入口，返回内嵌的微软登录窗（UIAWrapper）。
+
+    微软登录不是外部 msedge 进程，而是大厅进程内的 WinForms 窗（内嵌 webBrowser 面板），
+    所以按「本进程新增的、含 webBrowser 面板的顶层窗」定位。
+    不勾协议点微软入口无反应（与密码/短信同一道闸），先 _check_agree。
+    """
+    open_login_dialog(pid)
+    _check_agree(pid)
+    before = {h for h in _top_hwnds() if _hwnd_visible(h)}
+    entry = _by_name(pid, "Image", "微软") or _by_name(pid, None, "微软账号登录")
+    if entry is None or not _press_button(entry):
+        raise LaunchError("微软登录：点不到微软入口")
+    return _wait_microsoft_window(pid, before)
+
+
+def submit_microsoft_email(ms_win, email: str) -> None:
+    """微软登录窗填邮箱（i0116）并点「下一步」（idSIButton9）。"""
+    box = None
+    deadline = time.time() + MICROSOFT_PAGE_TIMEOUT_SEC
+    while time.time() < deadline and box is None:
+        box = _ms_by_aid(ms_win, "i0116")
+        time.sleep(0.4)
+    if box is None:
+        raise LaunchError("微软登录：等不到邮箱输入框 i0116")
+    box.set_edit_text(email)
+    nxt = _ms_by_aid(ms_win, "idSIButton9")
+    if nxt is None or not _press_button(nxt):
+        raise LaunchError("微软登录：点不到「下一步」")
+
+
+def microsoft_state(pid: int, ms_win, email: str) -> str:
+    """点「下一步」后的一次快照分支。
+
+    返回 account_picker(本机有缓存 MS 会话，免密点磁贴) / password(要密码 i0118) /
+    mfa(要二次验证) / logged_in(已回大厅) / waiting(还在跳转)。
+    """
+    if logged_in(pid):
+        return "logged_in"
+    for node in _ms_nodes(ms_win):
+        try:
+            name = popup_text(node.element_info.name or "")
+            aid = node.element_info.automation_id or ""
+        except Exception:
+            continue
+        if aid == "i0118":
+            return "password"
+        if "验证你的身份" in name or "verify your identity" in name.lower():
+            return "mfa"
+        if email and email in name:
+            return "account_picker"
+    return "waiting"
+
+
+def wait_microsoft_state(pid: int, ms_win, email: str, timeout_sec: int = 15) -> str:
+    deadline = time.time() + timeout_sec
+    state = "waiting"
+    while time.time() < deadline:
+        state = microsoft_state(pid, ms_win, email)
+        if state != "waiting":
+            return state
+        time.sleep(0.5)
+    return state
+
+
+def microsoft_pick_account(ms_win, email: str) -> None:
+    """账号选择器里点缓存账号磁贴（名字含邮箱的那块），走 SSO 免密。"""
+    tile = None
+    deadline = time.time() + MICROSOFT_WINDOW_TIMEOUT_SEC
+    while time.time() < deadline and tile is None:
+        for node in _ms_nodes(ms_win):
+            try:
+                name = popup_text(node.element_info.name or "")
+            except Exception:
+                continue
+            if email and email in name:
+                tile = node
+                break
+        time.sleep(0.5)
+    if tile is None:
+        raise LaunchError("微软登录：没找到缓存账号磁贴")
+    if not _press_button(tile):
+        tile.click_input()
+
+
+def wait_microsoft_logged_in(pid: int) -> str:
+    """SSO/提交后等回大厅已登录态，返回用户区文案。"""
+    deadline = time.time() + MICROSOFT_SSO_TIMEOUT_SEC
+    while time.time() < deadline:
+        if logged_in(pid):
+            return popup_text(_by_aid(pid, "Button", "UserInfoPart").element_info.name)
+        time.sleep(0.5)
+    raise LaunchError("微软登录：提交后未进入已登录态")
