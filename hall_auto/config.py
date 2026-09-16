@@ -110,6 +110,10 @@ class Config:
         password = os.environ.get("HALL_TEST_PASSWORD") or str(stored.get("password") or "")
         return user, password
 
+    def new_password(self) -> str:
+        """改密码往返用例的临时新密码，只走环境变量，绝不读配置文件、绝不落盘。"""
+        return os.environ.get("HALL_TEST_NEW_PASSWORD") or ""
+
 
 def _read_yaml(path: Path) -> dict:
     if not path.is_file():
