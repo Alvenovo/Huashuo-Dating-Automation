@@ -20,6 +20,7 @@ _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 _user32.IsWindowVisible.argtypes = [wintypes.HWND]
 _user32.IsWindowEnabled.argtypes = [wintypes.HWND]
+_user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 # SendMessageTimeoutW 必须显式声明返回值：ctypes 默认按 c_int 截断，64 位下会丢掉高位
 _user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
 _user32.SendMessageTimeoutW.argtypes = [
@@ -34,6 +35,7 @@ _user32.SendMessageTimeoutW.argtypes = [
 
 WM_GETTEXT = 0x000D
 WM_GETTEXTLENGTH = 0x000E
+WM_CLOSE = 0x0010
 SMTO_ABORTIFHUNG = 0x0002
 
 
@@ -109,3 +111,8 @@ def _hwnd_alive(hwnd: int) -> bool:
 
 def _hwnd_visible(hwnd: int) -> bool:
     return bool(_user32.IsWindowVisible(hwnd))
+
+
+def _close_window(hwnd: int) -> None:
+    """给顶层窗发 WM_CLOSE，等同于点它的关闭按钮；不销毁别进程的窗口。"""
+    _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)

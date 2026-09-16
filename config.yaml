@@ -71,3 +71,13 @@ update_fixture:
   url: ""
   install_dir: ""
   version_exe: ""
+
+# P2 安全验证（组长用例表「安全验证」板块的固定项：安装包数字签名 / 个人空间盘签名 /
+# 控制面板信息 / 签章检查报告）。CheckAppV.exe、SignCheck_v2.ps1 是公司内部工具，
+# 不进仓库：tools_dir 每台机器在 config.local.yaml 指到本地目录，空则用例 skip。
+security:
+  tools_dir: ""
+  seven_zip: "C:/Program Files/7-Zip/7z.exe"
+  personal_storage_dir: "C:/Program Files (x86)/ASUS/PersonalStorage"
+  package: ""
+  work_dir: ""

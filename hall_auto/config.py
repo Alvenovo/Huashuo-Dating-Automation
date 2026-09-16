@@ -74,6 +74,25 @@ class UpdateFixture:
 
 
 @dataclass(frozen=True)
+class SecuritySettings:
+    """P2 安全验证。CheckAppV / SignCheck_v2 是公司内部工具，不进仓库，本机 tools_dir 指过去。
+
+    CheckAppV.exe 只扫自己所在目录（递归），所以产品目录（PersonalStorage 非提权不可写）
+    走「只读拷贝镜像」：把带签名文件按相对路径拷进工作目录再跑，验的是文件字节，与用例等价。
+    """
+
+    tools_dir: str = ""
+    seven_zip: str = "C:/Program Files/7-Zip/7z.exe"
+    personal_storage_dir: str = "C:/Program Files (x86)/ASUS/PersonalStorage"
+    package: str = ""
+    work_dir: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.tools_dir)
+
+
+@dataclass(frozen=True)
 class Config:
     installer_dir: Path
     baseline_setup: str
@@ -85,6 +104,7 @@ class Config:
     launch: LaunchSettings
     fixture_apps: FixtureApps
     update_fixture: UpdateFixture
+    security: SecuritySettings
     raw: dict
 
     @property
@@ -102,6 +122,12 @@ class Config:
     @property
     def update_version_exe(self) -> Path:
         return Path(self.update_fixture.install_dir) / self.update_fixture.version_exe
+
+    @property
+    def security_package_path(self) -> Path:
+        name = self.security.package or self.latest_setup
+        path = Path(name)
+        return path if path.is_absolute() else self.installer_dir / name
 
     def test_account(self) -> tuple[str, str]:
         """凭据优先走环境变量，密码不落盘（规则红线）。"""
@@ -151,6 +177,7 @@ def load_config(path: Path | None = None) -> Config:
     launch_raw = data.get("launch") or {}
     fixture_raw = data.get("fixture_apps") or {}
     update_raw = data.get("update_fixture") or {}
+    security_raw = data.get("security") or {}
 
     def _tuple(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
         value = launch_raw.get(key)
@@ -204,6 +231,16 @@ def load_config(path: Path | None = None) -> Config:
             url=str(update_raw.get("url") or ""),
             install_dir=str(update_raw.get("install_dir") or ""),
             version_exe=str(update_raw.get("version_exe") or ""),
+        ),
+        security=SecuritySettings(
+            tools_dir=str(security_raw.get("tools_dir") or ""),
+            seven_zip=str(security_raw.get("seven_zip") or "C:/Program Files/7-Zip/7z.exe"),
+            personal_storage_dir=str(
+                security_raw.get("personal_storage_dir")
+                or "C:/Program Files (x86)/ASUS/PersonalStorage"
+            ),
+            package=str(security_raw.get("package") or ""),
+            work_dir=str(security_raw.get("work_dir") or ""),
         ),
         raw=data,
     )
