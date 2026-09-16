@@ -76,20 +76,24 @@ def _wrap_hwnd(hwnd: int):
         return None
 
 
-def _overlay_windows(main, settings: LaunchSettings) -> list[Overlay]:
+def _overlay_windows(main, settings: LaunchSettings, main_handle=None, pid=None) -> list[Overlay]:
     """大厅自己弹的覆盖层：主窗口下的子 Window + 同进程的其他顶层窗。
 
     顶层窗用 Win32 EnumWindows 按 pid 过滤（0.00s 级），只把命中的 hwnd 包成
     UIA 节点；Desktop().windows() 全系统 UIA 枚举实测 1s 左右，就绪循环每轮
     要跑多次，用不起。first_run 只对非白名单顶层窗算 —— 首跑协议窗是独立
     顶层窗，子 Window 用不着走那次昂贵的 Button 子树遍历。
+
+    main_handle / pid 是窗口生命周期内的不变量，但 UIA 每次取要 ~1s（实测），
+    就绪循环里别反复取 —— 调用方算一次传进来；不传才退化成本地取。
     """
     found: list[Overlay] = []
     seen = set()
-    try:
-        main_handle = main.handle
-    except Exception:
-        main_handle = None
+    if main_handle is None:
+        try:
+            main_handle = main.handle
+        except Exception:
+            main_handle = None
 
     def _add(name: str, node, top_level: bool) -> None:
         try:
@@ -119,10 +123,11 @@ def _overlay_windows(main, settings: LaunchSettings) -> list[Overlay]:
             continue
         _add(name, node, top_level=False)
 
-    try:
-        pid = main.element_info.process_id
-    except Exception:
-        pid = None
+    if pid is None:
+        try:
+            pid = main.element_info.process_id
+        except Exception:
+            pid = None
     if pid:
         for hwnd in _top_hwnds():
             # EnumWindows 连隐藏的消息窗（Default IME 之类）一起给，UIA 的
@@ -376,10 +381,20 @@ def start_fresh(cfg: Config) -> Application:
 
 def wait_until_ready(cfg: Config, main) -> LaunchResult:
     settings = cfg.launch
+    # handle / pid 是不变量，但 UIA 每次取要 ~1s（实测），就绪循环每轮都跑覆盖层
+    # 扫描，循环外算一次传进去，别每轮重取。
+    try:
+        main_handle = main.handle
+    except Exception:
+        main_handle = None
+    try:
+        pid = main.element_info.process_id
+    except Exception:
+        pid = None
     deadline = time.time() + cfg.timeouts.ready_sec
     while time.time() < deadline:
         # 每轮只枚举一次覆盖层，白名单/未知判定复用同一份列表
-        overlays = _overlay_windows(main, settings)
+        overlays = _overlay_windows(main, settings, main_handle=main_handle, pid=pid)
         dismiss_whitelist_popups(overlays, settings)
         unknown = [o.name for o in overlays if is_unknown(o, settings)]
         if unknown:
@@ -406,7 +421,7 @@ def wait_until_ready(cfg: Config, main) -> LaunchResult:
     evidence = _save_screenshot(main, "not_ready")
     present, web = _structure(main, settings)
     missing = [aid for aid in settings.required_auto_ids if aid not in present]
-    leftover = [o.name for o in _overlay_windows(main, settings)]
+    leftover = [o.name for o in _overlay_windows(main, settings, main_handle=main_handle, pid=pid)]
     raise LaunchError(
         f"超时未就绪 missing={missing} webview={web} overlays={leftover}；截图: {evidence}",
         evidence=evidence,
