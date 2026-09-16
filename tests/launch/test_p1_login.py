@@ -119,6 +119,8 @@ def test_forgot_password_reset_manual(cfg, ready_pid):
     new_password = cfg.new_password()
     if not (user and old_password and new_password):
         pytest.skip("缺凭据：设置 HALL_TEST_USER / HALL_TEST_PASSWORD / HALL_TEST_NEW_PASSWORD")
+    if new_password == old_password:
+        pytest.skip("新密码与原密码相同，往返验证证明不了密码真被改过；换一个不同的 HALL_TEST_NEW_PASSWORD")
     if not sys.stdin.isatty():
         pytest.skip("非交互式终端：改密码要人工回填两次验证码，请在自己终端跑 -m manual")
 
@@ -134,9 +136,9 @@ def test_forgot_password_reset_manual(cfg, ready_pid):
     code1 = input("【第1次·改成新密码】输入手机收到的重置验证码（回车放弃）: ").strip()
     if not code1:
         pytest.skip("人工放弃（验证码已发出，密码尚未修改）")
-    submit_forgot_reset(ready_pid, code1, new_password)
-    # 提交已发出，密码可能已变 NEW（也可能被拒仍是 OLD）；finally 一律压回 OLD
+    # 提交一旦发出，密码就可能已变 NEW；放进 try，让 finally 的还原程兜住提交本身报错的情况
     try:
+        submit_forgot_reset(ready_pid, code1, new_password)
         logout(ready_pid)
         login_with_password_value(ready_pid, user, new_password)
         assert logged_in(ready_pid), "新密码登录后仍未进入已登录态，重置可能没生效"

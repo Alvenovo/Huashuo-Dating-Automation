@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import time
 
-from pywinauto import Desktop
+import win32gui
+import win32process
+from pywinauto.controls.uiawrapper import UIAWrapper
+from pywinauto.uia_element_info import UIAElementInfo
 
 from hall_auto.config import Config
 from hall_auto.launch import LaunchError, _press_button, popup_text
@@ -10,17 +13,19 @@ from hall_auto.waiting import wait_until, wait_until_or_raise
 
 LOGIN_DIALOG_TIMEOUT_SEC = 15
 LOGIN_SUBMIT_TIMEOUT_SEC = 25
+CODE_RESEND_TIMEOUT_SEC = 65  # 短信网关冷却常为 60s，还原程紧接第一程再发时要等发送按钮回来
 
 
 def _windows(pid: int) -> list:
-    found = []
-    for win in Desktop(backend="uia").windows():
-        try:
-            if win.element_info.process_id == pid:
-                found.append(win)
-        except Exception:
-            continue
-    return found
+    """本进程的顶层窗口。用 Win32 EnumWindows 按 pid 过滤，比 UIA 枚举整个桌面再逐个读 process_id 快得多。"""
+    hwnds: list[int] = []
+
+    def _collect(hwnd, _):
+        if win32process.GetWindowThreadProcessId(hwnd)[1] == pid:
+            hwnds.append(hwnd)
+
+    win32gui.EnumWindows(_collect, None)
+    return [UIAWrapper(UIAElementInfo(h)) for h in hwnds]
 
 
 def _nodes(pid: int, control_type: str | None = None):
@@ -216,14 +221,21 @@ def request_forgot_sms(pid: int, user: str) -> None:
     if phone is None:
         raise LaunchError("忘记密码：找不到手机号输入框")
     phone.set_edit_text(user)
+    # 还原程紧接第一程再发时可能还在冷却（CodeSendBtn 未回控件树），先等它出现再点
+    if not wait_until(
+        lambda: _by_aid(pid, "Button", "CodeSendBtn") is not None,
+        timeout_sec=CODE_RESEND_TIMEOUT_SEC,
+        interval=0.5,
+    ):
+        raise LaunchError("忘记密码：等不到「发送验证码」按钮（可能仍在冷却）")
     send = _by_aid(pid, "Button", "CodeSendBtn")
-    if send is None or not _press_button(send):
-        raise LaunchError("忘记密码：点不到「发送验证码」")
+    if not _press_button(send):
+        raise LaunchError("忘记密码：点不动「发送验证码」")
     if not wait_until(lambda: _by_aid(pid, "Button", "CodeSendBtn") is None, timeout_sec=8, interval=0.5):
         raise LaunchError("忘记密码：点发送后 CodeSendBtn 没消失，可能没触发")
 
 
-def submit_forgot_reset(pid: int, code: str, new_password: str) -> None:
+def submit_forgot_reset(pid: int, code: str, new_password: str) -> dict:
     """忘记密码页填验证码 + 新密码 + 确认密码，点「提交」完成重置。
 
     手机号和发送已由 request_forgot_sms 做好。提交按钮 aid=SetBtn 和主窗口导航栏
@@ -231,6 +243,7 @@ def submit_forgot_reset(pid: int, code: str, new_password: str) -> None:
     提交后页面行为未知（可能自动登录、可能关窗回登录页），以「忘记密码页关闭
     （MobileInput 消失）或进入已登录态」为成功信号；都不发生说明验证码/密码被拒。
     调用方拿到成功信号后仍应 logout 再用新密码登录一次，才算真验到重置生效。
+    返回 {"page_closed": bool, "logged_in": bool}，标明命中了哪个信号，方便定位。
     """
     code_box = _by_aid(pid, "Edit", "CodeInput")
     secret = _by_aid(pid, "Edit", "PasswordSecInput")
@@ -243,12 +256,18 @@ def submit_forgot_reset(pid: int, code: str, new_password: str) -> None:
     submit = _by_name(pid, "Button", "提交", exact=True)
     if submit is None or not _press_button(submit):
         raise LaunchError("忘记密码：点不到「提交」按钮")
-    if not wait_until(
-        lambda: _by_aid(pid, "Edit", "MobileInput") is None or logged_in(pid),
-        timeout_sec=LOGIN_SUBMIT_TIMEOUT_SEC,
-        interval=0.5,
-    ):
-        raise LaunchError("忘记密码：提交后页面没关也没登录，可能验证码错或新密码不合法")
+    deadline = time.time() + LOGIN_SUBMIT_TIMEOUT_SEC
+    page_closed = False
+    loggedin = False
+    while time.time() < deadline:
+        page_closed = _by_aid(pid, "Edit", "MobileInput") is None
+        loggedin = logged_in(pid)
+        if page_closed or loggedin:
+            return {"page_closed": page_closed, "logged_in": loggedin}
+        time.sleep(0.5)
+    raise LaunchError(
+        f"忘记密码：提交后页面没关也没登录（page_closed={page_closed}, logged_in={loggedin}），可能验证码错或新密码不合法"
+    )
 
 
 def login_with_password(cfg: Config, pid: int) -> str:
