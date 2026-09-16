@@ -7,6 +7,7 @@ from pathlib import Path
 from hall_auto.config import Config
 from hall_auto.product import InstalledProduct, image_running, read_installed, stop_product
 from hall_auto.version import expected_version_from_setup_name, versions_equal
+from hall_auto.waiting import wait_until
 
 
 class InstallError(RuntimeError):
@@ -36,14 +37,8 @@ def _run_nsis(exe: Path, timeout_sec: int) -> None:
 
 
 def _wait_until(predicate, timeout_sec: int, message: str) -> None:
-    deadline = time.time() + timeout_sec
-    last = None
-    while time.time() < deadline:
-        last = predicate()
-        if last:
-            return
-        time.sleep(2)
-    raise InstallError(f"{message}；最后状态: {last!r}")
+    if not wait_until(predicate, timeout_sec=timeout_sec, interval=1):
+        raise InstallError(f"{message}；等了 {timeout_sec}s 仍未满足")
 
 
 def wait_version(expected: str, timeout_sec: int) -> InstalledProduct:

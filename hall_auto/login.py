@@ -6,6 +6,7 @@ from pywinauto import Desktop
 
 from hall_auto.config import Config
 from hall_auto.launch import LaunchError, _press_button, popup_text
+from hall_auto.waiting import wait_until, wait_until_or_raise
 
 LOGIN_DIALOG_TIMEOUT_SEC = 15
 LOGIN_SUBMIT_TIMEOUT_SEC = 25
@@ -67,15 +68,16 @@ def open_login_dialog(pid: int) -> None:
     entry = _by_aid(pid, "Button", "UserInfoPart") or _by_name(pid, "Button", "点击登录")
     if entry is None or not _press_button(entry):
         raise LaunchError("登录：点不到登录入口 UserInfoPart")
-    deadline = time.time() + LOGIN_DIALOG_TIMEOUT_SEC
-    while time.time() < deadline:
-        if login_dialog_open(pid):
-            return
-        time.sleep(1)
-    raise LaunchError("登录：弹窗没出现（找不到 MobileInputBox）")
+    wait_until_or_raise(
+        lambda: login_dialog_open(pid),
+        "登录：弹窗没出现（找不到 MobileInputBox）",
+        timeout_sec=LOGIN_DIALOG_TIMEOUT_SEC,
+        interval=0.5,
+    )
 
 
-def switch_login_tab(pid: int, keyword: str) -> None:
+def switch_login_tab(pid: int, keyword: str, ready=None) -> None:
+    """切登录弹窗页签。ready 传「切好了」的谓词（如目标页签特有控件出现），不传则不等。"""
     tab = (
         _by_name(pid, "TabItem", keyword)
         or _by_name(pid, "Text", keyword)
@@ -85,7 +87,8 @@ def switch_login_tab(pid: int, keyword: str) -> None:
         raise LaunchError(f"登录：找不到页签 {keyword!r}")
     if not _press_button(tab):
         raise LaunchError(f"登录：点不动页签 {keyword!r}")
-    time.sleep(1)
+    if ready is not None:
+        wait_until_or_raise(ready, f"登录：切到页签 {keyword!r} 后界面没就绪", timeout_sec=10)
 
 
 def login_field_aids(pid: int) -> dict[str, str]:
@@ -113,16 +116,22 @@ def logout(pid: int) -> None:
     entry = _by_aid(pid, "Button", "UserInfoPart")
     if entry is None or not _press_button(entry):
         raise LaunchError("退出登录：点不开用户菜单")
-    time.sleep(2)
     deadline = time.time() + LOGIN_DIALOG_TIMEOUT_SEC
     while time.time() < deadline:
         button = _by_name(pid, "Button", "退出登录", exact=True)
         if button is not None:
             _press_button(button)
-        time.sleep(1)
+        time.sleep(0.5)
         if not logged_in(pid):
             return
     raise LaunchError("退出登录：点完仍是已登录态")
+
+
+def _agree_toggled(node) -> bool:
+    try:
+        return node.get_toggle_state() == 1
+    except Exception:
+        return False
 
 
 def login_with_password(cfg: Config, pid: int) -> str:
@@ -130,7 +139,11 @@ def login_with_password(cfg: Config, pid: int) -> str:
     if not user or not password:
         raise LaunchError("登录：缺凭据，设置 HALL_TEST_USER / HALL_TEST_PASSWORD")
     open_login_dialog(pid)
-    switch_login_tab(pid, "账号密码登录")
+    switch_login_tab(
+        pid,
+        "账号密码登录",
+        ready=lambda: _by_aid(pid, "Edit", "PasswordSecInput") is not None,
+    )
     phone = _by_aid(pid, "Edit", "MobileInputBox")
     secret = _by_aid(pid, "Edit", "PasswordSecInput")
     if phone is None or secret is None:
@@ -140,7 +153,9 @@ def login_with_password(cfg: Config, pid: int) -> str:
     agree = _by_name(pid, "CheckBox", "同意协议")
     if agree is not None:
         _press_button(agree)
-    time.sleep(0.5)
+        # 读不到勾选状态（控件不支持 TogglePattern）时退化成短固定等待，不阻塞登录
+        if not wait_until(lambda: _agree_toggled(agree), timeout_sec=2, interval=0.2):
+            time.sleep(0.3)
     submit = _by_name(pid, "Button", "登录", exact=True)
     if submit is None or not _press_button(submit):
         raise LaunchError("登录：点不到登录按钮")
@@ -148,5 +163,5 @@ def login_with_password(cfg: Config, pid: int) -> str:
     while time.time() < deadline:
         if logged_in(pid):
             return popup_text(_by_aid(pid, "Button", "UserInfoPart").element_info.name)
-        time.sleep(1)
+        time.sleep(0.5)
     raise LaunchError("登录：提交后未进入已登录态")

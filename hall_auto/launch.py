@@ -6,12 +6,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from pywinauto import Application, Desktop
+from pywinauto import Application
+from pywinauto.controls.uiawrapper import UIAWrapper
+from pywinauto.uia_element_info import UIAElementInfo
 
 from hall_auto.config import Config, LaunchSettings, REPO_ROOT
 from hall_auto.product import EXE_NAME, read_installed, stop_main_process
+from hall_auto.winapi import _hwnd_pid, _hwnd_text, _hwnd_visible, _top_hwnds
 
 REPORTS_DIR = REPO_ROOT / "reports" / "launch"
+
+HOME_TAB_NAME = "推荐"
 
 
 class LaunchError(RuntimeError):
@@ -57,15 +62,36 @@ def _save_screenshot(wrapper, stem: str) -> Path | None:
         return None
 
 
-def _overlay_windows(main) -> list:
-    found = []
+@dataclass(frozen=True)
+class Overlay:
+    name: str
+    node: object
+    first_run: bool = False
+
+
+def _wrap_hwnd(hwnd: int):
+    try:
+        return UIAWrapper(UIAElementInfo(hwnd))
+    except Exception:
+        return None
+
+
+def _overlay_windows(main, settings: LaunchSettings) -> list[Overlay]:
+    """大厅自己弹的覆盖层：主窗口下的子 Window + 同进程的其他顶层窗。
+
+    顶层窗用 Win32 EnumWindows 按 pid 过滤（0.00s 级），只把命中的 hwnd 包成
+    UIA 节点；Desktop().windows() 全系统 UIA 枚举实测 1s 左右，就绪循环每轮
+    要跑多次，用不起。first_run 只对非白名单顶层窗算 —— 首跑协议窗是独立
+    顶层窗，子 Window 用不着走那次昂贵的 Button 子树遍历。
+    """
+    found: list[Overlay] = []
     seen = set()
     try:
         main_handle = main.handle
     except Exception:
         main_handle = None
 
-    def _add(name: str, node) -> None:
+    def _add(name: str, node, top_level: bool) -> None:
         try:
             handle = node.handle
         except Exception:
@@ -75,7 +101,12 @@ def _overlay_windows(main) -> list:
         if not name:
             return
         seen.add(handle)
-        found.append((name, node))
+        first_run = (
+            top_level
+            and not is_whitelisted(name, settings)
+            and _looks_like_first_run(node)
+        )
+        found.append(Overlay(name=name, node=node, first_run=first_run))
 
     try:
         nodes = main.descendants(control_type="Window")
@@ -86,26 +117,35 @@ def _overlay_windows(main) -> list:
             name = popup_text(node.element_info.name or node.window_text())
         except Exception:
             continue
-        _add(name, node)
+        _add(name, node, top_level=False)
 
     try:
         pid = main.element_info.process_id
-        for win in Desktop(backend="uia").windows():
-            try:
-                if win.element_info.process_id != pid:
-                    continue
-                name = popup_text(win.window_text() or win.element_info.name)
-            except Exception:
-                continue
-            _add(name, win)
     except Exception:
-        pass
+        pid = None
+    if pid:
+        for hwnd in _top_hwnds():
+            # EnumWindows 连隐藏的消息窗（Default IME 之类）一起给，UIA 的
+            # Desktop 枚举不会，必须自己过滤，否则全被当成未知弹窗
+            if not _hwnd_visible(hwnd) or _hwnd_pid(hwnd) != pid:
+                continue
+            if main_handle is not None and hwnd == main_handle:
+                continue
+            node = _wrap_hwnd(hwnd)
+            if node is None:
+                continue
+            name = popup_text(_hwnd_text(hwnd))
+            if not name:
+                try:
+                    name = popup_text(node.element_info.name)
+                except Exception:
+                    continue
+            _add(name, node, top_level=True)
     return found
 
 
-def click_first_run_agree(main, settings: LaunchSettings) -> bool:
+def click_first_run_agree(main, settings: LaunchSettings, present: set[str]) -> bool:
     """首次协议画在主窗口上时，没有子 Window，直接点「同意」。更新框有 VersionLabel 则不点同意。"""
-    present = _auto_ids_present(main)
     if settings.required_auto_ids[0] in present:
         return False
     if "VersionLabel" in present or "ChangeLog" in present:
@@ -168,69 +208,84 @@ def _looks_like_first_run(overlay) -> bool:
     )
 
 
-def dismiss_whitelist_popups(main, settings: LaunchSettings) -> None:
-    for name, overlay in _overlay_windows(main):
-        first_run = _looks_like_first_run(overlay)
+def dismiss_whitelist_popups(overlays, settings: LaunchSettings) -> None:
+    for overlay in overlays:
+        name = overlay.name
+        first_run = overlay.first_run
         if not (is_whitelisted(name, settings) or first_run):
             continue
         if prefer_dismiss(name, settings) and not first_run:
             labels = settings.dismiss_buttons
         else:
             labels = settings.accept_buttons
-        if not _click_named_button(overlay, labels) and labels != settings.dismiss_buttons:
-            _click_named_button(overlay, settings.dismiss_buttons)
+        if not _click_named_button(overlay.node, labels) and labels != settings.dismiss_buttons:
+            _click_named_button(overlay.node, settings.dismiss_buttons)
         time.sleep(1)
 
 
-def unknown_popups(main, settings: LaunchSettings) -> list[str]:
-    names = []
-    for name, overlay in _overlay_windows(main):
-        if is_whitelisted(name, settings) or _looks_like_first_run(overlay):
-            continue
-        names.append(name)
-    return names
+def is_unknown(overlay: Overlay, settings: LaunchSettings) -> bool:
+    return not (is_whitelisted(overlay.name, settings) or overlay.first_run)
 
 
 def _back_if_subpage(main) -> bool:
-    """大厅会恢复上次的页面（实测重装后首跑落在设置/关于页），点返回回首页。"""
-    for node in main.descendants(control_type="Button"):
+    """大厅会恢复上次的页面，点回首页。实测重装后首跑落在设置/关于页（有
+    BackBtn），应用详情页连 BackBtn 都没有，所以三级兜底：aid=BackBtn →
+    名叫「返回」的按钮 → 侧边栏「推荐」页签。"""
+    home = None
+    try:
+        buttons = main.descendants(control_type="Button")
+    except Exception:
+        buttons = []
+    for node in buttons:
         try:
-            if (node.element_info.automation_id or "") == "BackBtn":
+            aid = node.element_info.automation_id or ""
+            if aid == "BackBtn":
+                return _press_button(node)
+            name = popup_text(node.element_info.name or node.window_text())
+            if name == "返回":
                 return _press_button(node)
         except Exception:
             continue
-    return False
+    try:
+        items = main.descendants(control_type="ListItem")
+    except Exception:
+        items = []
+    for node in items:
+        try:
+            name = popup_text(node.element_info.name or node.window_text())
+        except Exception:
+            continue
+        if name == HOME_TAB_NAME:
+            home = node
+            break
+    return home is not None and _press_button(home)
 
 
-def _auto_ids_present(main) -> set[str]:
-    found: set[str] = set()
+def _structure(main, settings: LaunchSettings) -> tuple[set[str], bool]:
+    """一次全树遍历同时收 AutomationId 集合和 webview 就绪标志。
+
+    descendants() 全树遍历实测 1.4s 一次，就绪循环每轮原来要走两次
+    （查 id 一次、查 webview 一次），合成一次省一半。
+    """
+    aids: set[str] = set()
+    webview = False
     try:
         descendants = main.descendants()
     except Exception:
-        return found
+        return aids, webview
     for node in descendants:
         try:
-            aid = node.element_info.automation_id
+            info = node.element_info
+            aid = info.automation_id
+            if aid:
+                aids.add(aid)
+            if not webview:
+                name = popup_text(info.name)
+                if name and any(key in name for key in settings.webview_ready_names if key):
+                    webview = True
         except Exception:
             continue
-        if aid:
-            found.add(aid)
-    return found
-
-
-def _webview_ready(main, settings: LaunchSettings) -> bool:
-    try:
-        descendants = main.descendants()
-    except Exception:
-        return False
-    for node in descendants:
-        try:
-            name = popup_text(node.element_info.name)
-        except Exception:
-            continue
-        if any(key and key in name for key in settings.webview_ready_names):
-            return True
-    return False
+    return aids, webview
 
 
 def connect_app(timeout_sec: int) -> Application:
@@ -260,21 +315,30 @@ def main_window(app: Application, title_contains: str, timeout_sec: int):
 
 
 def dismiss_pre_main_popups(app: Application, settings: LaunchSettings) -> bool:
-    """首跑协议/权限页是独立顶层窗口（实测叫「权限确认窗口」），点完同意主窗口才出现，所以等主窗口之前就要关它。"""
+    """首跑协议/权限页是独立顶层窗口（实测叫「权限确认窗口」），点完同意主窗口才出现，所以等主窗口之前就要关它。
+
+    枚举走 Win32 按 pid 过滤（等主窗口时这个循环每秒都在跑，UIA 全系统枚举用不起）。
+    """
     clicked = False
     try:
         pid = app.process
-        wins = Desktop(backend="uia").windows()
     except Exception:
         return False
-    for win in wins:
-        try:
-            if win.element_info.process_id != pid:
-                continue
-            name = popup_text(win.window_text() or win.element_info.name)
-        except Exception:
+    for hwnd in _top_hwnds():
+        if not _hwnd_visible(hwnd) or _hwnd_pid(hwnd) != pid:
             continue
-        first_run = _looks_like_first_run(win)
+        win = _wrap_hwnd(hwnd)
+        if win is None:
+            continue
+        name = popup_text(_hwnd_text(hwnd))
+        if not name:
+            try:
+                name = popup_text(win.element_info.name)
+            except Exception:
+                continue
+        if not name:
+            continue
+        first_run = not is_whitelisted(name, settings) and _looks_like_first_run(win)
         if not (is_whitelisted(name, settings) or first_run):
             continue
         if prefer_dismiss(name, settings) and not first_run:
@@ -313,36 +377,36 @@ def start_fresh(cfg: Config) -> Application:
 def wait_until_ready(cfg: Config, main) -> LaunchResult:
     settings = cfg.launch
     deadline = time.time() + cfg.timeouts.ready_sec
-    last_unknown: list[str] = []
     while time.time() < deadline:
-        dismiss_whitelist_popups(main, settings)
-        click_first_run_agree(main, settings)
-        last_unknown = unknown_popups(main, settings)
-        if last_unknown:
+        # 每轮只枚举一次覆盖层，白名单/未知判定复用同一份列表
+        overlays = _overlay_windows(main, settings)
+        dismiss_whitelist_popups(overlays, settings)
+        unknown = [o.name for o in overlays if is_unknown(o, settings)]
+        if unknown:
             evidence = _save_screenshot(main, "unknown_popup")
             raise LaunchError(
-                f"未知弹窗: {last_unknown}；截图: {evidence}",
+                f"未知弹窗: {unknown}；截图: {evidence}",
                 evidence=evidence,
             )
-        if _overlay_windows(main):
-            time.sleep(1)
+        if overlays:
+            time.sleep(0.5)
             continue
-        present = _auto_ids_present(main)
+        present, webview = _structure(main, settings)
+        click_first_run_agree(main, settings, present)
         missing = [aid for aid in settings.required_auto_ids if aid not in present]
         if missing and _back_if_subpage(main):
-            time.sleep(1)
+            time.sleep(0.5)
             continue
-        if not missing and _webview_ready(main, settings):
+        if not missing and webview:
             return LaunchResult(
                 title=popup_text(main.window_text()),
                 structure_ids=tuple(settings.required_auto_ids),
             )
-        time.sleep(1)
+        time.sleep(0.5)
     evidence = _save_screenshot(main, "not_ready")
-    present = _auto_ids_present(main)
+    present, web = _structure(main, settings)
     missing = [aid for aid in settings.required_auto_ids if aid not in present]
-    web = _webview_ready(main, settings)
-    leftover = [name for name, _ in _overlay_windows(main)]
+    leftover = [o.name for o in _overlay_windows(main, settings)]
     raise LaunchError(
         f"超时未就绪 missing={missing} webview={web} overlays={leftover}；截图: {evidence}",
         evidence=evidence,

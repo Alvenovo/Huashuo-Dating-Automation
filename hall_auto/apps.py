@@ -20,9 +20,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from hall_auto.config import Config
-from hall_auto.launch import LaunchError, _press_button, popup_text
+from hall_auto.launch import HOME_TAB_NAME, LaunchError, _press_button, popup_text
 from hall_auto.product import is_admin
 from hall_auto.search import open_detail_until_ready, search_hits
+from hall_auto.waiting import wait_until, wait_until_or_raise
+from hall_auto.winapi import (
+    SMTO_ABORTIFHUNG,
+    _child_hwnds,
+    _hwnd_alive,
+    _hwnd_class,
+    _hwnd_pid,
+    _hwnd_rect,
+    _hwnd_text,
+    _top_hwnds,
+    _user32,
+)
 
 MINE_TAB_NAME = "我的"
 MINE_AUTO_ID = "Mine"
@@ -78,12 +90,12 @@ def open_mine(main, timeout_sec: int = MINE_TIMEOUT_SEC) -> None:
     tab = _by_name(main, "ListItem", MINE_TAB_NAME, exact=True)
     if tab is None or not _press_button(tab):
         raise LaunchError("P1-A：点不开侧栏「我的」")
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        if _by_aid(main, "Custom", MINE_AUTO_ID) is not None:
-            return
-        time.sleep(1)
-    raise LaunchError("P1-A：「我的」页面没出现（找不到 aid=Mine）")
+    wait_until_or_raise(
+        lambda: _by_aid(main, "Custom", MINE_AUTO_ID) is not None,
+        "P1-A：「我的」页面没出现（找不到 aid=Mine）",
+        timeout_sec=timeout_sec,
+        interval=0.5,
+    )
 
 
 def switch_app_tab(main, tab: str) -> None:
@@ -91,7 +103,13 @@ def switch_app_tab(main, tab: str) -> None:
     button = _by_aid(main, "Button", aid)
     if button is None or not _press_button(button):
         raise LaunchError(f"P1-A：点不动页签 {tab}（aid={aid}）")
-    time.sleep(2)
+    list_aid = LIST_AIDS.get(tab)
+    if list_aid:
+        wait_until(lambda: _by_aid(main, "List", list_aid) is not None)
+    else:
+        # 同步页没有已知容器，等更新/卸载的容器消失即认为旧页签内容已让位，
+        # 否则 _synced_item_names 会把上个页签的 ListItem 误当同步页数据。
+        wait_until(lambda: all(_by_aid(main, "List", aid_) is None for aid_ in LIST_AIDS.values()))
 
 
 def _item_names(container) -> list[str]:
@@ -130,7 +148,7 @@ def app_list_state(main, tab: str, timeout_sec: int = LIST_TIMEOUT_SEC) -> AppLi
                 return AppListState(tab=tab, loaded=True, needs_login=False, items=names)
             if _by_name(main, "Text", SYNC_LOGIN_HINT) is not None:
                 return AppListState(tab=tab, loaded=True, needs_login=True, items=())
-        time.sleep(2)
+        time.sleep(0.5)
     return AppListState(tab=tab, loaded=False, needs_login=False, items=())
 
 
@@ -328,105 +346,9 @@ DIALOG_CLASSES = ("#32770",)
 # 右上角关闭叉 36x36=1296，协议链接最大 144x25=3600，都远在门槛之下。
 CTA_MIN_AREA = 12000
 
-_user32 = ctypes.windll.user32
-_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-_user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
-_user32.EnumChildWindows.argtypes = [wintypes.HWND, _WNDENUMPROC, wintypes.LPARAM]
-_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-_user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-_user32.IsWindowVisible.argtypes = [wintypes.HWND]
-_user32.IsWindowEnabled.argtypes = [wintypes.HWND]
-# SendMessageTimeoutW 必须显式声明返回值：ctypes 默认按 c_int 截断，64 位下会丢掉高位
-_user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
-_user32.SendMessageTimeoutW.argtypes = [
-    wintypes.HWND,
-    ctypes.c_uint,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
-    ctypes.c_uint,
-    ctypes.c_uint,
-    ctypes.POINTER(ctypes.c_void_p),
-]
-
-WM_GETTEXT = 0x000D
-WM_GETTEXTLENGTH = 0x000E
 BM_CLICK = 0x00F5
-SMTO_ABORTIFHUNG = 0x0002
 MOUSE_LEFTDOWN = 0x0002
 MOUSE_LEFTUP = 0x0004
-
-
-def _top_hwnds() -> list[int]:
-    found: list[int] = []
-
-    def callback(hwnd, _lparam):
-        found.append(int(hwnd))
-        return True
-
-    _user32.EnumWindows(_WNDENUMPROC(callback), 0)
-    return found
-
-
-def _child_hwnds(hwnd: int) -> list[int]:
-    found: list[int] = []
-
-    def callback(child, _lparam):
-        found.append(int(child))
-        return True
-
-    _user32.EnumChildWindows(hwnd, _WNDENUMPROC(callback), 0)
-    return found
-
-
-def _hwnd_pid(hwnd: int) -> int:
-    pid = wintypes.DWORD(0)
-    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return int(pid.value)
-
-
-def _hwnd_class(hwnd: int) -> str:
-    buf = ctypes.create_unicode_buffer(256)
-    return buf.value if _user32.GetClassNameW(hwnd, buf, 256) else ""
-
-
-def _hwnd_text(hwnd: int) -> str:
-    """窗口文字。GetWindowTextW 读系统缓存，WM_GETTEXT 让控件自己交出来；
-
-    自绘控件常常只有后者能读到，所以两个都试。
-    """
-    length = _user32.GetWindowTextLengthW(hwnd)
-    if length > 0:
-        buf = ctypes.create_unicode_buffer(length + 1)
-        _user32.GetWindowTextW(hwnd, buf, length + 1)
-        if buf.value.strip():
-            return buf.value
-    result = ctypes.c_void_p()
-    sent = _user32.SendMessageTimeoutW(
-        hwnd, WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, 500, ctypes.byref(result)
-    )
-    size = int(result.value or 0)
-    if not sent or size <= 0:
-        return ""
-    buf = ctypes.create_unicode_buffer(size + 1)
-    got = _user32.SendMessageTimeoutW(
-        hwnd, WM_GETTEXT, size + 1, ctypes.addressof(buf), SMTO_ABORTIFHUNG, 500,
-        ctypes.byref(result),
-    )
-    return buf.value if got else ""
-
-
-def _hwnd_rect(hwnd: int) -> tuple[int, int, int, int]:
-    rect = wintypes.RECT()
-    if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return (0, 0, 0, 0)
-    return (rect.left, rect.top, rect.right, rect.bottom)
-
-
-def _hwnd_alive(hwnd: int) -> bool:
-    return bool(_user32.IsWindowVisible(hwnd)) or _hwnd_class(hwnd) != ""
 
 
 _ACCELERATOR = re.compile(r"\(&\w\)")
@@ -575,12 +497,16 @@ def drive_vendor_installer(app_name: str = "", drawn_ok: bool = True) -> list[st
             continue
         before = _button_signature(hwnd)
         _click_hwnd(target.hwnd)
-        time.sleep(2)
+
+        def _advanced() -> bool:
+            return not _hwnd_alive(hwnd) or _button_signature(hwnd) != before
+
+        wait_until(_advanced, timeout_sec=2)
         # 鼠标兜底只对可见按钮有意义：隐藏按钮的 rect 是 NSIS 默认布局的位置，
         # 跟皮肤实际画出来的东西对不上，往那儿点是乱点。
         if target.visible and _hwnd_alive(hwnd) and _button_signature(hwnd) == before:
             _mouse_click(target.rect)
-            time.sleep(2)
+            wait_until(_advanced, timeout_sec=2)
         clicked.append(target.describe())
     return clicked
 
@@ -601,7 +527,7 @@ def dismiss_vendor_dialogs(app_name: str = "", rounds: int = 5) -> list[str]:
         clicked.extend(step)
         if not step:
             break
-        time.sleep(3)
+        wait_until(lambda: not installer_dialogs(app_name), timeout_sec=3, interval=0.5)
     return clicked
 
 
@@ -712,7 +638,7 @@ def install_fixture(cfg: Config, main, app_name: str, timeout_sec: int | None = 
         if time.time() >= next_trace:
             dump_wizard_windows(app_name, path=WIZARD_TIMELINE, append=True)
             next_trace = time.time() + 30
-        time.sleep(5)
+        time.sleep(1)
     dump = dump_wizard_windows(app_name)
     raise LaunchError(
         f"P1-A：{app_name} 安装超时，注册表里没出现；向导点过 {wizard_clicks}；"
@@ -720,16 +646,12 @@ def install_fixture(cfg: Config, main, app_name: str, timeout_sec: int | None = 
     )
 
 
-HOME_TAB_NAME = "推荐"
-
-
 def _leave_mine(main) -> bool:
     """退回首页，好让下次 open_mine 真的重进一次页面（open_mine 看到 aid=Mine 就直接返回）。"""
     home = _by_name(main, "ListItem", HOME_TAB_NAME, exact=True)
     if home is None or not _press_button(home):
         return False
-    time.sleep(2)
-    return _by_aid(main, "Custom", MINE_AUTO_ID) is None
+    return wait_until(lambda: _by_aid(main, "Custom", MINE_AUTO_ID) is None, timeout_sec=5)
 
 
 def _item_action_button(main, app_name: str, tab: str, timeout_sec: int = 40):
@@ -746,7 +668,7 @@ def _item_action_button(main, app_name: str, tab: str, timeout_sec: int = 40):
             button = find_item_button(main, app_name, action_aid)
             if button is not None:
                 return button
-            time.sleep(3)
+            time.sleep(1)
         if attempt == 1 and not _leave_mine(main):
             break
     return None
@@ -785,7 +707,7 @@ def uninstall_fixture(cfg: Config, main, app_name: str, timeout_sec: int | None 
         if not is_app_installed(app_name):
             dismiss_vendor_dialogs(app_name)
             return
-        time.sleep(3)
+        time.sleep(1)
     dump = dump_wizard_windows(app_name)
     raise LaunchError(
         f"P1-A：{app_name} 卸载超时，注册表里还在；厂商向导点过 {wizard_clicks}；"

@@ -99,7 +99,7 @@ def test_update_fixture_via_hall(cfg, ready_main):
         if entry and entry["version"] != uf.pinned_version:
             updated = entry
             break
-        time.sleep(3)
+        time.sleep(1)
     dismiss_vendor_dialogs()
     assert updated is not None, (
         f"{uf.name} 更新超时，注册表版本没变；向导目标版本 {target}；当前向导 {wizard_snapshot()}"
@@ -114,7 +114,6 @@ def test_update_fixture_via_hall(cfg, ready_main):
     )
 
     _leave_mine(ready_main)
-    time.sleep(2)
     open_mine(ready_main)
     state = app_list_state(ready_main, "update")
     assert uf.name not in state.items, f"更新完 {uf.name} 还在更新列表里: {list(state.items)}"

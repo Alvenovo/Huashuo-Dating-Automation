@@ -99,14 +99,19 @@ def test_register_wrong_code_shows_feedback(register_pid):
         if popup_text(n.element_info.name or "")
     }
     assert click_register(register_pid)
-    time.sleep(5)
-    feedback = []
-    if not register_open(register_pid):
-        feedback.append("注册窗口关闭")
-    now = {
-        (n.element_info.control_type, n.element_info.automation_id, popup_text(n.element_info.name or ""))
-        for n in _nodes(register_pid)
-        if popup_text(n.element_info.name or "")
-    }
-    feedback += [name for _, _, name in (now - before)]
+    deadline = time.time() + 5
+    feedback: list[str] = []
+    while time.time() < deadline:
+        if not register_open(register_pid):
+            feedback.append("注册窗口关闭")
+            break
+        now = {
+            (n.element_info.control_type, n.element_info.automation_id, popup_text(n.element_info.name or ""))
+            for n in _nodes(register_pid)
+            if popup_text(n.element_info.name or "")
+        }
+        feedback = [name for _, _, name in (now - before)]
+        if feedback:
+            break
+        time.sleep(0.5)
     assert feedback, "点提交后应出现错误反馈（toast/红字/关窗任一）"

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import time
-
 from hall_auto.launch import LaunchError, _press_button
 from hall_auto.login import _by_aid
 from hall_auto.screen import grab_virtual_screen, mean_luminance
+from hall_auto.waiting import wait_until, wait_until_or_raise
 
 SETTINGS_OPEN_TIMEOUT_SEC = 15
 THEME_APPLY_TIMEOUT_SEC = 10
@@ -20,12 +19,13 @@ def open_settings(main) -> int:
     btn = _by_aid(pid, "Button", "SetBtn")
     if btn is None or not _press_button(btn):
         raise LaunchError("设置页：点不到设置按钮 SetBtn")
-    deadline = time.time() + SETTINGS_OPEN_TIMEOUT_SEC
-    while time.time() < deadline:
-        if theme_nodes(pid):
-            return pid
-        time.sleep(1)
-    raise LaunchError("设置页：主题三档没出现（设置页没打开？）")
+    wait_until_or_raise(
+        lambda: bool(theme_nodes(pid)),
+        "设置页：主题三档没出现（设置页没打开？）",
+        timeout_sec=SETTINGS_OPEN_TIMEOUT_SEC,
+        interval=0.5,
+    )
+    return pid
 
 
 def ensure_settings(main) -> int:
@@ -70,12 +70,8 @@ def set_theme(pid: int, label: str) -> None:
         raise LaunchError(f"主题：找不到 {label} 单选钮")
     if not _select_radio(node):
         raise LaunchError(f"主题：点不动 {label}")
-    deadline = time.time() + THEME_APPLY_TIMEOUT_SEC
-    while time.time() < deadline:
-        if theme_selected(pid) == label:
-            return
-        time.sleep(0.5)
-    raise LaunchError(f"主题：点了 {label} 但选中状态没变（当前 {theme_selected(pid)}）")
+    if not wait_until(lambda: theme_selected(pid) == label, timeout_sec=THEME_APPLY_TIMEOUT_SEC):
+        raise LaunchError(f"主题：点了 {label} 但选中状态没变（当前 {theme_selected(pid)}）")
 
 
 def main_luminance(main) -> float:

@@ -4,6 +4,7 @@ import pytest
 
 from hall_auto.launch import start_fresh, wait_main_window, wait_until_ready
 from hall_auto.login import (
+    _by_aid,
     login_dialog_open,
     login_field_aids,
     login_with_password,
@@ -35,7 +36,11 @@ def test_login_dialog_controls(ready_pid):
     assert "agree" in fields, f"缺同意协议复选框: {fields}"
     assert "登录" in fields, f"缺登录按钮: {fields}"
     assert "忘记密码" in fields and "注册账号" in fields, f"缺找回/注册入口: {fields}"
-    switch_login_tab(ready_pid, "短信验证码登录")
+    switch_login_tab(
+        ready_pid,
+        "短信验证码登录",
+        ready=lambda: _by_aid(ready_pid, "Edit", "CodeInput") is not None,
+    )
     sms = login_field_aids(ready_pid)
     assert "CodeInput" in sms, f"短信页签缺验证码输入框: {sms}"
     assert "CodeSendBtn" in sms, f"短信页签缺发送验证码按钮: {sms}"

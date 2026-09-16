@@ -5,6 +5,8 @@ import time
 from hall_auto.launch import LaunchError, _press_button
 from hall_auto.login import _by_aid, _by_name, open_login_dialog
 from hall_auto.screen import count_red_pixels, grab_virtual_screen
+from hall_auto.search import _edit_value
+from hall_auto.waiting import wait_until, wait_until_or_raise
 
 REGISTER_OPEN_TIMEOUT_SEC = 10
 RED_PIXEL_THRESHOLD = 50
@@ -28,12 +30,12 @@ def open_register_page(pid: int) -> None:
     entry = _by_name(pid, "Button", "注册账号") or _by_name(pid, "Text", "注册账号")
     if entry is None or not _press_button(entry):
         raise LaunchError("注册：点不开注册页入口")
-    deadline = time.time() + REGISTER_OPEN_TIMEOUT_SEC
-    while time.time() < deadline:
-        if _by_aid(pid, "Button", "RegisterBtn") is not None:
-            return
-        time.sleep(1)
-    raise LaunchError("注册：注册页没出来（找不到 RegisterBtn）")
+    wait_until_or_raise(
+        lambda: _by_aid(pid, "Button", "RegisterBtn") is not None,
+        "注册：注册页没出来（找不到 RegisterBtn）",
+        timeout_sec=REGISTER_OPEN_TIMEOUT_SEC,
+        interval=0.5,
+    )
 
 
 def register_controls(pid: int) -> dict[str, bool]:
@@ -50,8 +52,17 @@ def fill_register(pid: int, phone: str, code: str, password: str, confirm: str) 
         node = _by_aid(pid, ctype, aid)
         if node is None:
             raise LaunchError(f"注册：找不到输入框 {aid}")
+        before = _edit_value(node)
         node.set_edit_text(value)
-        time.sleep(0.3)
+        if before is not None:
+            # 密码框可能只回掩码值：等不到精确匹配时，值相比写入前有变化即算成功
+            wait_until(
+                lambda: (rv := _edit_value(node)) == value or rv != before,
+                timeout_sec=1.5,
+                interval=0.1,
+            )
+        else:
+            time.sleep(0.3)
 
 
 def _agree_state(pid: int) -> str | None:
@@ -72,7 +83,7 @@ def set_agree(pid: int, agree: bool) -> None:
         if (_agree_state(pid) == "1") == agree:
             return
         _press_button(box)
-        time.sleep(0.5)
+        time.sleep(0.3)
     raise LaunchError(f"注册：协议复选框切不到 {agree}")
 
 

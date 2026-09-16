@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from hall_auto.config import Config
 from hall_auto.launch import LaunchError, popup_text
+from hall_auto.waiting import wait_until_or_raise
 
 SEARCH_BOX_AUTO_ID = "SearchBarInput"
 ACTION_PREFIXES = ("安装应用：", "打开应用：", "更新应用：", "安装 ", "打开 ", "更新 ")
@@ -83,10 +84,26 @@ def _search_box(main):
         raise LaunchError(f"找不到搜索框 {SEARCH_BOX_AUTO_ID}: {exc}") from exc
 
 
+def _edit_value(node) -> str | None:
+    try:
+        return node.get_value()
+    except Exception:
+        return None
+
+
 def submit_keyword(cfg: Config, main) -> None:
     box = _search_box(main)
-    box.set_edit_text(cfg.search_keyword)
-    time.sleep(1)
+    keyword = cfg.search_keyword
+    box.set_edit_text(keyword)
+    if _edit_value(box) is not None:
+        wait_until_or_raise(
+            lambda: _edit_value(box) == keyword,
+            f"搜索框内容没变成 {keyword!r}",
+            timeout_sec=5,
+            interval=0.1,
+        )
+    else:
+        time.sleep(0.3)
     box.type_keys("{ENTER}", set_foreground=True)
 
 
@@ -99,7 +116,7 @@ def search_hits(cfg: Config, main) -> list[str]:
         hits = filter_hits(visible_titles(main), cfg.search_keyword)
         if len(hits) >= cfg.search_min_hits:
             return hits
-        time.sleep(2)
+        time.sleep(0.5)
     return hits
 
 
@@ -143,7 +160,6 @@ def open_detail(main, title: str) -> None:
             continue
         node.set_focus()
         node.click_input()
-        time.sleep(3)
         return
     raise LaunchError(f"结果页里找不到可点击的标题「{title}」")
 
@@ -172,5 +188,5 @@ def open_detail_until_ready(cfg: Config, main, title: str) -> Detail:
         state = detail_state(main, title)
         if state is not None:
             return state
-        time.sleep(2)
+        time.sleep(0.5)
     raise LaunchError(f"点进「{title}」后详情页没出现主按钮")

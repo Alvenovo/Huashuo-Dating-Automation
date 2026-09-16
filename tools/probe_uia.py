@@ -60,16 +60,16 @@ def probe_once(cfg, tag: str) -> tuple[list[str], bool]:
     app = start_fresh(cfg)
     main = wait_main_window(app, cfg)
     for _ in range(30):
-        overlays = _overlay_windows(main)
+        overlays = _overlay_windows(main, cfg.launch)
         if overlays:
             break
         time.sleep(1)
-    overlays = _overlay_windows(main)
+    overlays = _overlay_windows(main, cfg.launch)
     lines += dump_tree(f"main window title={main.window_text()!r}", main)
-    for name, overlay in overlays:
-        if "启动卡片" in name:
+    for ov in overlays:
+        if "启动卡片" in ov.name:
             card_seen = True
-        lines += dump_tree(f"overlay name={name!r}", overlay, max_nodes=300)
+        lines += dump_tree(f"overlay name={ov.name!r}", ov.node, max_nodes=300)
     try:
         wait_until_ready(cfg, main)
         lines.append("===== wait_until_ready: PASS =====")

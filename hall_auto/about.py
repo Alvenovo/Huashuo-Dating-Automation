@@ -16,6 +16,7 @@ from hall_auto.launch import (
     wait_until_ready,
 )
 from hall_auto.product import stop_main_process
+from hall_auto.waiting import wait_until_or_raise
 
 ABOUT_DIR = REPO_ROOT / "reports" / "about"
 OCR_SCRIPT = REPO_ROOT / "tools" / "ocr_text.ps1"
@@ -51,14 +52,19 @@ def parse_version(text: str) -> str | None:
     return match.group(0) if match else None
 
 
-def _click_aid(main, aid: str) -> bool:
-    for node in main.descendants(control_type="Button"):
+def _find_aid(main, control_type: str, aid: str):
+    for node in main.descendants(control_type=control_type):
         try:
             if (node.element_info.automation_id or "") == aid:
-                return _press_button(node)
+                return node
         except Exception:
             continue
-    return False
+    return None
+
+
+def _click_aid(main, aid: str) -> bool:
+    node = _find_aid(main, "Button", aid)
+    return node is not None and _press_button(node)
 
 
 def _version_node(main):
@@ -111,18 +117,18 @@ def read_about_version(cfg: Config) -> str:
         wait_until_ready(cfg, main)
         if not _click_aid(main, "SetBtn"):
             raise LaunchError("关于页：点不到设置按钮 SetBtn")
-        time.sleep(2)
+        wait_until_or_raise(
+            lambda: _find_aid(main, "Button", "AboutBtn") is not None,
+            "关于页：点完设置后 AboutBtn 没出现（设置页没打开？）",
+        )
         if not _click_aid(main, "AboutBtn"):
             raise LaunchError("关于页：点不到关于按钮 AboutBtn")
-        time.sleep(2)
-        node = None
-        for _ in range(10):
-            node = _version_node(main)
-            if node is not None:
-                break
-            time.sleep(1)
-        if node is None:
-            raise LaunchError("关于页：找不到 VersionLabel 节点")
+        wait_until_or_raise(
+            lambda: _version_node(main) is not None,
+            "关于页：找不到 VersionLabel 节点",
+            interval=0.5,
+        )
+        node = _version_node(main)
         try:
             main.set_focus()
             time.sleep(0.5)
