@@ -42,6 +42,10 @@ TAB_AIDS = {"update": "UpTabBtn", "uninstall": "UnTabBtn", "sync": "NoTabBtn"}
 LIST_AIDS = {"update": "UpAppListBox", "uninstall": "UnAppListBox"}
 ITEM_ACTION_AIDS = {"update": "UpBtn", "uninstall": "UnstallBtn"}
 SYNC_LOGIN_HINT = "登录后查看同账号在其他电脑已安装应用"
+SYNC_LIST_AID = "NoAppListBox"
+# 登录后同步列表的 ListItem name 是内部类名占位符（无障碍缺陷，同 VersionLabel='ver' 一类），
+# 真应用名在条目内的 Text 子节点里。
+SYNC_ITEM_PLACEHOLDER = "AppStore.NetWork.AppListInfo"
 MINE_TIMEOUT_SEC = 20
 LIST_TIMEOUT_SEC = 30
 
@@ -153,17 +157,28 @@ def app_list_state(main, tab: str, timeout_sec: int = LIST_TIMEOUT_SEC) -> AppLi
 
 
 def _synced_item_names(main) -> list[str] | None:
-    """同步页登录后的列表容器 aid 未知，只在「我的页面」容器里收 ListItem，避免把左侧分类栏算进来。"""
-    container = _by_aid(main, "Custom", MINE_AUTO_ID)
+    """同步页（登录后）的应用名列表。容器 aid=NoAppListBox；未登录没有容器，返回 None
+    让 app_list_state 退回登录提示文案判据。条目 name 是占位符，真名取条目内 Text 子节点。"""
+    container = _by_aid(main, "List", SYNC_LIST_AID)
     if container is None:
         return None
     names: list[str] = []
     try:
-        nodes = container.descendants(control_type="ListItem")
+        items = container.descendants(control_type="ListItem")
     except Exception:
         return None
-    for node in nodes:
-        name = _safe_name(node)
+    for item in items:
+        name = ""
+        try:
+            for text in item.descendants(control_type="Text"):
+                candidate = _safe_name(text)
+                if candidate and candidate != SYNC_ITEM_PLACEHOLDER:
+                    name = candidate
+                    break
+        except Exception:
+            pass
+        if not name:
+            name = _safe_name(item)
         if name and name not in names:
             names.append(name)
     return names or None

@@ -319,6 +319,21 @@ def main_window(app: Application, title_contains: str, timeout_sec: int):
     raise LaunchError(f"未出现主窗口（标题含 {title_contains}）: {last}")
 
 
+def concrete_main(pid: int, title_contains: str):
+    """按 Win32 标题 + pid 重新包一个具体的主窗口 wrapper。
+
+    登录后主窗口的 UIA Name 从「华硕大厅」变成「华硕应用商店」（Win32 标题不变，
+    2026-09-16 实测），main_window 那个按 title_re 懒解析的 WindowSpecification
+    会一直 ElementNotFoundError。登录态下要操作主窗口（进「我的」等）必须换用本函数。
+    """
+    for hwnd in _top_hwnds():
+        if not _hwnd_visible(hwnd) or _hwnd_pid(hwnd) != pid:
+            continue
+        if title_contains in popup_text(_hwnd_text(hwnd)):
+            return UIAWrapper(UIAElementInfo(hwnd))
+    raise LaunchError(f"pid={pid} 名下找不到标题含 {title_contains!r} 的可见顶层窗")
+
+
 def dismiss_pre_main_popups(app: Application, settings: LaunchSettings) -> bool:
     """首跑协议/权限页是独立顶层窗口（实测叫「权限确认窗口」），点完同意主窗口才出现，所以等主窗口之前就要关它。
 

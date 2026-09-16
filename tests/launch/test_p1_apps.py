@@ -5,6 +5,8 @@ import time
 import pytest
 
 from hall_auto.apps import (
+    SYNC_ITEM_PLACEHOLDER,
+    _by_aid,
     _leave_mine,
     app_list_state,
     dismiss_vendor_dialogs,
@@ -20,7 +22,15 @@ from hall_auto.apps import (
     wizard_snapshot,
     wizard_target_version,
 )
-from hall_auto.launch import LaunchError, _press_button, start_fresh, wait_main_window, wait_until_ready
+from hall_auto.launch import (
+    LaunchError,
+    _press_button,
+    concrete_main,
+    start_fresh,
+    wait_main_window,
+    wait_until_ready,
+)
+from hall_auto.login import logged_in, login_with_password, logout
 from hall_auto.product import _file_version, is_admin, stop_main_process
 from hall_auto.version import four_segment
 
@@ -117,3 +127,40 @@ def test_update_fixture_via_hall(cfg, ready_main):
     open_mine(ready_main)
     state = app_list_state(ready_main, "update")
     assert uf.name not in state.items, f"更新完 {uf.name} 还在更新列表里: {list(state.items)}"
+
+
+@pytest.mark.apps
+@pytest.mark.login
+def test_sync_list_logged_in(cfg):
+    """登录后同步列表能刷出「其他电脑已装应用」。只读断言：
+    页底「全部安装」（InstallAllBtn）和条目安装会真装 QQ/网盘这类日常软件，绝不点。
+    自带起停（start_fresh 会顶掉 ready_main 的进程），所以放在本模块最后。"""
+    user, password = cfg.test_account()
+    if not user or not password:
+        pytest.skip("同步列表要登录：设 HALL_TEST_USER / HALL_TEST_PASSWORD")
+    app = start_fresh(cfg)
+    main = wait_main_window(app, cfg)
+    wait_until_ready(cfg, main)
+    pid = main.element_info.process_id
+    try:
+        if logged_in(pid):
+            logout(pid)
+        login_with_password(cfg, pid)
+        # 登录后主窗口 UIA Name 变「华硕应用商店」，按标题懒解析的 spec 失效，按 hwnd 重包
+        logged_main = concrete_main(pid, cfg.display_name_contains)
+        open_mine(logged_main)
+        state = app_list_state(logged_main, "sync")
+        assert state.loaded and not state.needs_login, "登录后同步页仍没刷出列表（NoAppListBox 没出现）"
+        assert state.items, "同步列表为空：该账号在其他电脑没有安装记录，或条目名没读出来"
+        assert all(name != SYNC_ITEM_PLACEHOLDER for name in state.items), (
+            f"条目名读到的还是占位内部类名: {list(state.items)}"
+        )
+        assert _by_aid(logged_main, "Button", "InstallAllBtn") is not None, (
+            "同步页没找到「全部安装」按钮（只断言存在，不点）"
+        )
+    finally:
+        try:
+            logout(pid)
+        except Exception:
+            pass
+        stop_main_process(cfg.timeouts.process_stop_sec)
