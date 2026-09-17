@@ -97,6 +97,11 @@ def _skip_label(item, report) -> str:
     return raw
 
 
+def _case_title(item) -> str:
+    doc = getattr(item.function, "__doc__", None) or ""
+    return doc.strip().splitlines()[0].strip() if doc.strip() else ""
+
+
 def pytest_configure(config):
     config._evidence = EvidenceSession(new_run_dir(), config.getoption("--evidence"))
 
@@ -115,9 +120,9 @@ def pytest_runtest_makereport(item, call):
         else:
             detail = ""
         # 在 call 阶段结束、fixture 还没 teardown 时截图，才能拍到应用运行中的终态
-        session.record(item.nodeid, result, report.duration, detail)
+        session.record(item.nodeid, result, report.duration, detail, title=_case_title(item))
     elif report.when == "setup" and report.skipped:
-        session.record(item.nodeid, OUTCOME_SKIPPED, report.duration, _skip_label(item, report))
+        session.record(item.nodeid, OUTCOME_SKIPPED, report.duration, _skip_label(item, report), title=_case_title(item))
 
 
 def pytest_sessionfinish(session, exitstatus):

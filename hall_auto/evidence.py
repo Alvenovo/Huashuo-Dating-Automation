@@ -73,11 +73,13 @@ class CaseRecord:
     timestamp: str
     assertion: str
     screenshot: str | None
+    title: str = ""
 
     def to_dict(self) -> dict:
         return {
             "module": self.module,
             "case": self.case,
+            "title": self.title,
             "nodeid": self.nodeid,
             "outcome": self.outcome,
             "duration_s": round(self.duration_s, 2),
@@ -96,7 +98,7 @@ class EvidenceSession:
     def _should_capture(self, outcome: str) -> bool:
         return self.mode == MODE_ALL or outcome == OUTCOME_FAILED
 
-    def record(self, nodeid: str, outcome: str, duration: float, assertion: str) -> CaseRecord:
+    def record(self, nodeid: str, outcome: str, duration: float, assertion: str, title: str = "") -> CaseRecord:
         module, case = module_of(nodeid), case_of(nodeid)
         screenshot_rel = None
         if self._should_capture(outcome):
@@ -108,7 +110,7 @@ class EvidenceSession:
             rec = CaseRecord(
                 module=module, case=case, nodeid=nodeid, outcome=outcome,
                 duration_s=duration, timestamp=datetime.now().isoformat(timespec="seconds"),
-                assertion=assertion, screenshot=screenshot_rel,
+                assertion=assertion, screenshot=screenshot_rel, title=title,
             )
             (case_dir / "result.json").write_text(
                 json.dumps(rec.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -117,7 +119,7 @@ class EvidenceSession:
             rec = CaseRecord(
                 module=module, case=case, nodeid=nodeid, outcome=outcome,
                 duration_s=duration, timestamp=datetime.now().isoformat(timespec="seconds"),
-                assertion=assertion, screenshot=None,
+                assertion=assertion, screenshot=None, title=title,
             )
         self.records.append(rec)
         return rec
@@ -186,11 +188,15 @@ _CSS = """
   th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:middle;}
   th{background:#eef1f4;font-size:12px;color:var(--muted);font-weight:600;}
   tr:last-child td{border-bottom:none;}
+  tr.row-failed{background:var(--fail-bg);}
+  tr.row-failed:hover{background:#f8d7d3;}
+  tr.row-skipped{background:var(--skip-bg);}
+  tr.row-skipped:hover{background:#e3e7eb;}
   .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;}
   .badge.pass{color:var(--pass);background:var(--pass-bg);} .badge.fail{color:var(--fail);background:var(--fail-bg);}
   .badge.skipped{color:var(--skip);background:var(--skip-bg);}
   .mod{display:inline-block;padding:1px 8px;border-radius:6px;background:#eef1f4;color:var(--muted);font-size:12px;}
-  .case{font-weight:600;} .assert{color:var(--muted);font-size:12px;margin-top:2px;}
+  .case{font-weight:600;} .title{font-size:13px;color:#3b4149;margin-top:2px;} .assert{color:var(--muted);font-size:12px;margin-top:2px;}
   .err{color:var(--fail);font-size:12px;margin-top:4px;font-family:Consolas,monospace;white-space:pre-wrap;}
   .dur{color:var(--muted);font-size:12px;white-space:nowrap;}
   .thumb{width:120px;height:72px;object-fit:cover;border:1px solid var(--line);border-radius:6px;cursor:zoom-in;background:#fff;display:block;}
@@ -248,12 +254,13 @@ def _render_html(summary: dict, run_dir: Path | None = None) -> str:
         img = (f'<img class="thumb" alt="final" src="{data_uri}">'
                if data_uri else '<span class="noimg">无截图</span>')
         err = f'<div class="err">{html.escape(c["assertion"])}</div>' if (outcome == "failed" and c["assertion"]) else ""
+        title_line = f'<div class="title">{html.escape(c["title"])}</div>' if c.get("title") else ""
         assert_line = f'<div class="assert">{html.escape(c["assertion"]) or "—"}</div>' if outcome != "failed" else ""
         rows.append(
-            f'<tr data-s="{outcome}" data-text="{html.escape(c["module"] + " " + c["case"])}">'
+            f'<tr class="row-{outcome}" data-s="{outcome}" data-text="{html.escape(c["module"] + " " + c["case"] + " " + c.get("title", ""))}">'
             f'<td><span class="badge {outcome}">{badge}</span></td>'
             f'<td><span class="mod">{html.escape(c["module"])}</span></td>'
-            f'<td><div class="case">{html.escape(c["case"])}</div>{assert_line}{err}</td>'
+            f'<td><div class="case">{html.escape(c["case"])}</div>{title_line}{assert_line}{err}</td>'
             f'<td class="dur">{c["duration_s"]}s</td>'
             f'<td>{img}</td></tr>'
         )

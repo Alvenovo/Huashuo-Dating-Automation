@@ -39,6 +39,7 @@ def _assert_about_version(cfg, expected_version: str):
 @pytest.mark.install
 @pytest.mark.destructive
 def test_p0_01_install_baseline(cfg):
+    """P0-01 干净安装基线包：装完注册表版本与「关于」页版本一致"""
     if not is_admin():
         pytest.fail("P0-01 需要管理员权限运行 pytest")
     _require_setup(cfg, cfg.baseline_path)
@@ -51,6 +52,7 @@ def test_p0_01_install_baseline(cfg):
 @pytest.mark.install
 @pytest.mark.destructive
 def test_p0_02_upgrade_latest(cfg):
+    """P0-02 基线升级最新包：升级后注册表与「关于」页版本等于最新包"""
     if not is_admin():
         pytest.fail("P0-02 需要管理员权限运行 pytest")
     _require_setup(cfg, cfg.latest_path)

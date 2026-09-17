@@ -27,12 +27,14 @@ def hits(cfg, ready_main):
 
 
 def test_p0_06_search_lists_keyword_titles(cfg, hits):
+    """P0-06 搜索：关键词命中的结果标题数达标"""
     assert len(hits) >= cfg.search_min_hits, (
         f"搜索 {cfg.search_keyword!r} 命中标题 {len(hits)} 条，少于要求 {cfg.search_min_hits} 条"
     )
 
 
 def test_p0_07_detail_shows_name_and_primary_button(cfg, ready_main, hits):
+    """P0-07 详情页：标题与搜索结果一致且有主操作按钮"""
     if len(hits) < cfg.search_min_hits:
         pytest.skip("P0-06 未命中，按失败策略不做详情")
     detail = open_detail_until_ready(cfg, ready_main, hits[0])

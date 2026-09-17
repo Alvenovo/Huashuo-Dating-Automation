@@ -42,6 +42,7 @@ def ready_pid(cfg):
 
 @pytest.mark.login
 def test_login_dialog_controls(ready_pid):
+    """P1-B 登录弹窗控件图：手机号/密码/协议/登录/找回/注册齐全，短信页签切换后出验证码框"""
     logout(ready_pid)
     open_login_dialog(ready_pid)
     fields = login_field_aids(ready_pid)
@@ -63,6 +64,7 @@ def test_login_dialog_controls(ready_pid):
 
 @pytest.mark.login
 def test_password_login_success(cfg, ready_pid):
+    """P1-B 账号密码登录：填手机号+密码勾选协议登录后进入已登录态，用户区带手机号尾号"""
     user, password = cfg.test_account()
     if not (user and password):
         pytest.skip("缺凭据：设置 HALL_TEST_USER / HALL_TEST_PASSWORD")
@@ -74,6 +76,7 @@ def test_password_login_success(cfg, ready_pid):
 
 @pytest.mark.login
 def test_logout_returns_to_anonymous(ready_pid):
+    """P1-B 退出登录：已登录态点退出后回到未登录态，登录弹窗自动关闭"""
     if not logged_in(ready_pid):
         pytest.skip("当前未登录，先跑密码登录用例")
     logout(ready_pid)

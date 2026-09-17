@@ -50,6 +50,7 @@ def session(cfg):
 
 @pytest.mark.settings
 def test_theme_controls_present(session):
+    """P1-D 主题控件图：浅色/深色/跟随系统三档齐全，且当前有且仅有一档选中"""
     nodes = theme_nodes(session.pid)
     assert set(nodes) == set(THEME_AIDS), f"主题三档没找齐：{sorted(nodes)}"
     assert theme_selected(session.pid) in THEME_AIDS
@@ -57,6 +58,7 @@ def test_theme_controls_present(session):
 
 @pytest.mark.settings
 def test_theme_switch_applies_and_survives_restart(cfg, session):
+    """P1-D 主题切换：切深色主窗真变暗且重启后保持，再切浅色真变亮、深浅亮度差达标"""
     set_theme(session.pid, "深色")
     assert theme_selected(session.pid) == "深色"
     dark = main_luminance(session.main)

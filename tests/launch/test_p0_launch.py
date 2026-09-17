@@ -18,6 +18,7 @@ def installed():
 
 
 def test_p0_03_launch_window(cfg, installed):
+    """P0-03 启动主窗口：标题正确且必备控件结构齐全"""
     result = launch_until_ready(cfg)
     assert cfg.display_name_contains in result.title
     for aid in cfg.launch.required_auto_ids:
@@ -25,6 +26,7 @@ def test_p0_03_launch_window(cfg, installed):
 
 
 def test_p0_04_ready_cold_starts(cfg, installed):
+    """P0-04 冷启动稳定性：连续冷启动多次，首页结构每次完全一致"""
     seen: list[tuple[str, ...]] = []
     errors: list[str] = []
     try:

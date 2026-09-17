@@ -49,6 +49,7 @@ def register_pid(cfg):
 
 @pytest.mark.login
 def test_register_controls_present(register_pid):
+    """P1-C 注册页控件图：手机号/验证码/发送/密码/确认密码/协议/注册齐全"""
     controls = register_controls(register_pid)
     missing = [key for key, ok in controls.items() if not ok]
     assert not missing, f"注册页缺控件: {missing}（全部: {controls}）"
@@ -56,6 +57,7 @@ def test_register_controls_present(register_pid):
 
 @pytest.mark.login
 def test_register_submit_gate(register_pid):
+    """P1-C 注册按钮门禁：未勾协议或密码为空时禁用，四项合法且勾选后才可点"""
     fill_register(register_pid, FAKE_PHONE, FAKE_CODE, VALID_PASSWORD, VALID_PASSWORD)
     set_agree(register_pid, False)
     assert not register_enabled(register_pid), "未勾协议时注册按钮应禁用"
@@ -69,6 +71,7 @@ def test_register_submit_gate(register_pid):
 @pytest.mark.login
 @pytest.mark.parametrize(("password", "confirm", "expected_tips"), INVALID_CASES)
 def test_register_invalid_password_blocks_submit(register_pid, password, confirm, expected_tips):
+    """P1-C 非法密码拦截：过短/纯数字/中文/过长/为空/两次不一致都禁用按钮且对应提示变红"""
     fill_register(register_pid, FAKE_PHONE, FAKE_CODE, password, confirm)
     set_agree(register_pid, True)
     assert not register_enabled(register_pid), f"非法密码 {password!r}/{confirm!r} 应禁用注册按钮"
@@ -79,6 +82,7 @@ def test_register_invalid_password_blocks_submit(register_pid, password, confirm
 
 @pytest.mark.login
 def test_register_valid_password_keeps_tips_gray(register_pid):
+    """P1-C 合法密码放行：按钮可用且两行密码提示保持灰色不变红"""
     fill_register(register_pid, FAKE_PHONE, FAKE_CODE, VALID_PASSWORD, VALID_PASSWORD)
     set_agree(register_pid, True)
     assert register_enabled(register_pid)
@@ -91,6 +95,7 @@ def test_register_valid_password_keeps_tips_gray(register_pid):
     reason="疑似缺陷：验证码未发送/错误时点「注册并登录」无任何反馈（无 toast、无红字、窗口不关），待与开发确认",
 )
 def test_register_wrong_code_shows_feedback(register_pid):
+    """P1-C 错误验证码反馈：不发码直接提交应有 toast/红字/关窗任一反馈（疑似缺陷 xfail）"""
     fill_register(register_pid, FAKE_PHONE, FAKE_CODE, VALID_PASSWORD, VALID_PASSWORD)
     set_agree(register_pid, True)
     before = {

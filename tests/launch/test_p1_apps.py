@@ -61,6 +61,7 @@ def test_mine_lists_refresh(ready_main):
 @pytest.mark.apps
 @pytest.mark.destructive
 def test_fixture_install_then_uninstall(cfg, ready_main):
+    """P1-A 夹具真装真卸：大厅装完注册表有条目、卸完条目消失"""
     app_name = cfg.fixture_apps.install or cfg.fixture_apps.uninstall
     if not app_name:
         pytest.skip("没配夹具应用：config.local.yaml 的 fixture_apps.install")
