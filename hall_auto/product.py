@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import re
 import subprocess
 import time
 from ctypes import wintypes
@@ -134,6 +136,46 @@ def read_installed() -> InstalledProduct | None:
             key_path=f"{hive_name}\\{subkey}",
         )
     return None
+
+
+def agreement_config_path() -> Path | None:
+    """首跑隐私协议同意标记所在的用户级 user.config（Agreen 设置）。
+
+    路径含 exe 哈希目录与版本号目录，用 glob 找；找不到返回 None（用例 skip）。
+    只读/写用户 AppData，无需提权。
+    """
+    base = Path(os.environ.get("LOCALAPPDATA", "")) / "AppStore"
+    if not base.is_dir():
+        return None
+    candidates = sorted(base.glob("AsusMemberCenter.exe_Url_*/*/user.config"))
+    return candidates[-1] if candidates else None
+
+
+def read_agreen() -> str | None:
+    path = agreement_config_path()
+    if path is None:
+        return None
+    match = re.search(
+        r'<setting name="Agreen"[^>]*>\s*<value>([^<]*)</value>',
+        path.read_text(encoding="utf-8"),
+    )
+    return match.group(1) if match else None
+
+
+def set_agreen(value: str) -> None:
+    path = agreement_config_path()
+    if path is None:
+        raise LookupError("未找到大厅 user.config，无法写 Agreen")
+    text = path.read_text(encoding="utf-8")
+    new = re.sub(
+        r'(<setting name="Agreen"[^>]*>\s*<value>)[^<]*(</value>)',
+        rf"\g<1>{value}\g<2>",
+        text,
+        count=1,
+    )
+    if new == text:
+        raise LookupError("user.config 里没有 Agreen 设置")
+    path.write_text(new, encoding="utf-8")
 
 
 def image_running(stem: str) -> bool:

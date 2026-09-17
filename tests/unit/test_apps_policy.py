@@ -203,6 +203,19 @@ def test_pick_wizard_button_never_guesses_between_drawn_ctas():
 
 
 @pytest.mark.unit
+def test_pick_wizard_button_strips_nsis_nav_arrow():
+    """WB 安装器下一页是「下一步(&N) >」带尾箭头；不剥掉就匹配不上白名单、drive 一个都不点。"""
+    buttons = (
+        apps.WizardButton(1, "下一步(&N) >", (1393, 983, 1506, 1015), True, True),
+        apps.WizardButton(2, "取消(&C)", (1521, 983, 1634, 1015), True, True),
+    )
+    picked = apps.pick_wizard_button(buttons)
+    assert picked is not None and picked.hwnd == 1
+    assert apps.button_label(picked.text) == "下一步"
+    assert apps.button_label("< 上一步(&P)") == "上一步"
+
+
+@pytest.mark.unit
 def test_pick_wizard_button_drawn_ok_off_skips_cta():
     """收尾关窗不点自绘大按钮（那块常是「立即体验」，点了会把应用拉起来），改点文字的「关闭」。"""
     picked = apps.pick_wizard_button(NETEASE_PAGE1, drawn_ok=False)

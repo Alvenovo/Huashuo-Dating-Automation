@@ -25,8 +25,10 @@ SIGNABLE_GLOBS = ("*.exe", "*.dll", "*.sys", "*.msi", "*.cab", "*.ocx", "*.ps1")
 UNSIGNED_COUNT_RE = re.compile(r"共有\s*(\d+)\s*个文件未签名")
 _PUBLISHER_EXPECTED = "华硕电脑（上海）有限公司"
 _UNINSTALL_KEYS = (
-    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM"),
+    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM32"),
+    # 按用户安装的应用（WorkBuddy 等）落在 HKCU，也是「程序和功能」的一部分，不扫会漏判未安装。
+    (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", "HKCU"),
 )
 
 
@@ -181,10 +183,14 @@ def signcheck_ecc_rows(report: Path) -> list[str]:
 
 
 def control_panel_entries() -> list[dict[str, str]]:
-    """控制面板「程序和功能」= 卸载注册表镜像，两个位宽视图都扫。"""
+    """控制面板「程序和功能」= 卸载注册表镜像，HKLM 两位宽 + HKCU 共三视图都扫。"""
     entries = []
-    for key_path in _UNINSTALL_KEYS:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as base:
+    for hive, key_path, label in _UNINSTALL_KEYS:
+        try:
+            base = winreg.OpenKey(hive, key_path)
+        except OSError:
+            continue
+        with base:
             for i in range(winreg.QueryInfoKey(base)[0]):
                 name = winreg.EnumKey(base, i)
                 with winreg.OpenKey(base, name) as sub:
@@ -194,7 +200,7 @@ def control_panel_entries() -> list[dict[str, str]]:
                             values[field], _ = winreg.QueryValueEx(sub, field)
                         except OSError:
                             values[field] = ""
-                    values["key"] = f"{key_path}\\{name}"
+                    values["key"] = f"{label}\\{key_path}\\{name}"
                     entries.append(values)
     return entries
 

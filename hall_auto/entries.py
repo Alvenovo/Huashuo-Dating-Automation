@@ -4,8 +4,10 @@ WB 入口的文案被 UIA 拆成「小硕 x」+「WorkBuddy」两个文本节点
 按单节点识别会漏，所以把「含入口关键字但不含『小硕知道』」的节点聚成 WB 组，
 热区取组内 rect 并集。原有入口「小硕知道」单独成组。
 
-红线：本模块只做定位 + 单点/连点 + 像素差，绝不点落地页里的「一键安装」——
-那会真装 WorkBuddy，属破坏性操作。
+红线：非破坏套件只做定位 + 单点/连点 + 像素差，绝不点落地页里的「一键安装」。
+唯一例外是门禁（--allow-install / HALL_ALLOW_INSTALL）放行的破坏性行 25 用例
+（装→验拉起→卸 往返），且只能走本模块的 click_install_button 这一个收口函数，
+便于审计"谁真装了 WorkBuddy"。
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 
 from pywinauto import mouse
 
+from hall_auto.apps import uninstall_entry
 from hall_auto.launch import _back_if_subpage
 from hall_auto.screen import grab_virtual_screen
 from hall_auto.winapi import (
@@ -27,7 +30,8 @@ from hall_auto.winapi import (
 ENTRY_KEYS = ("小硕", "WorkBuddy", "workbuddy")
 ORIGINAL_ENTRY = "小硕知道"
 WB_LABEL = "小硕 x WorkBuddy"
-INSTALL_BUTTON_TEXT = "一键安装"  # 红线：任何情况下都不点
+INSTALL_BUTTON_TEXT = "一键安装"  # 仅破坏性行 25 用例经 click_install_button 点，非破坏套件禁碰
+WB_REGISTRY_HINT = "WorkBuddy"  # 注册表 DisplayName 含此串即视为 WB 已装（HKCU，按用户装）
 LOGIN_WINDOW_KEYWORD = "登录"
 HOME_SETTLE_SEC = 1.5
 CLICK_SETTLE_SEC = 3.0
@@ -152,20 +156,74 @@ def close_window_by_keyword(pid: int, keyword: str) -> bool:
     return closed
 
 
-def region_pixel_change(region: EntryRegion, gap: float = 0.6, threshold: int = 24) -> tuple:
-    """区域两帧像素差，返回 (变化像素数, 区域总像素数)。静态图应为 0，GIF 动图 > 0。"""
-    img1, origin = grab_virtual_screen()
-    time.sleep(gap)
-    img2, _ = grab_virtual_screen()
+def region_frames_changed(region: EntryRegion, seconds: float = 3.0, interval: float = 0.5, threshold: int = 24) -> tuple:
+    """区域在 [0, seconds] 窗口内每 interval 采一帧、逐帧比上一帧，返回 (有变化的帧数, 总帧数)。
+
+    静态图全程 0 帧变化；GIF 动图至少若干帧 >0。连续窗口采样比单次两帧稳：单次 gap
+    若正好撞上 GIF 帧间隔的整数倍会假阴性，连续采样不依赖某个特定 gap。
+    """
+    img, origin = grab_virtual_screen()
     box = (
         region.left - origin[0], region.top - origin[1],
         region.right - origin[0], region.bottom - origin[1],
     )
-    c1 = img1.crop(box).convert("L")
-    c2 = img2.crop(box).convert("L")
-    p1, p2 = c1.load(), c2.load()
-    changed = sum(
-        1 for y in range(c1.height) for x in range(c1.width)
-        if abs(p1[x, y] - p2[x, y]) > threshold
-    )
-    return changed, c1.width * c1.height
+    prev = img.crop(box).convert("L")
+    changed_frames = 0
+    total_frames = 0
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(interval)
+        img, _ = grab_virtual_screen()
+        cur = img.crop(box).convert("L")
+        p1, p2 = prev.load(), cur.load()
+        n = sum(
+            1 for y in range(cur.height) for x in range(cur.width)
+            if abs(p1[x, y] - p2[x, y]) > threshold
+        )
+        total_frames += 1
+        if n:
+            changed_frames += 1
+        prev = cur
+    return changed_frames, total_frames
+
+
+def click_install_button(main, timeout_sec: float = 15) -> bool:
+    """破坏性行 25 用例专用：等 WB 详情页「一键安装」出现并按热区中心点它。
+
+    非破坏套件禁止调用（点了会真装 WorkBuddy）。坐标点而非节点 click_input，
+    与 click_entry 同理：详情页是 WebView，节点点击不稳。
+    """
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for node in main.descendants():
+            try:
+                text = (node.window_text() or "").strip()
+                rect = node.rectangle()
+            except Exception:
+                continue
+            if INSTALL_BUTTON_TEXT in text and rect.width() > 0 and rect.height() > 0:
+                mouse.click(button="left", coords=((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2))
+                return True
+        time.sleep(0.5)
+    return False
+
+
+def wb_uninstall_command() -> str | None:
+    """WB 注册表条目的静默卸载串（优先 QuietUninstallString），供行 25 用例收尾还原。"""
+    entry = uninstall_entry(WB_REGISTRY_HINT)
+    if not entry:
+        return None
+    return entry.get("quiet") or entry.get("uninstall") or None
+
+
+def wb_install_dir() -> str | None:
+    """WB 注册表条目的 InstallLocation（按用户装，形如 ...\\Programs\\XiaoshuoClaw）。
+
+    静默卸载只删注册表条目、常把安装目录的文件留下；残留目录会让下一轮安装走「修复」
+    分支、装不出注册表条目（实测 180s 超时）。行 25 用例收尾要拿这个路径把目录也删掉，
+    保证往返后机器真干净。未装时返回 None。
+    """
+    entry = uninstall_entry(WB_REGISTRY_HINT)
+    if not entry:
+        return None
+    return entry.get("location") or None

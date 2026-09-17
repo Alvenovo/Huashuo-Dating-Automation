@@ -288,6 +288,7 @@ def uninstall_entry(app_hint: str) -> dict[str, str] | None:
                                 "version": get("DisplayVersion"),
                                 "uninstall": get("UninstallString"),
                                 "quiet": get("QuietUninstallString"),
+                                "location": get("InstallLocation"),
                             }
                     except OSError:
                         continue
@@ -370,8 +371,11 @@ _ACCELERATOR = re.compile(r"\(&\w\)")
 
 
 def button_label(text: str) -> str:
-    """去掉 Win32 的快捷键标记：'关闭(&L)' -> '关闭'。"""
-    return popup_text(_ACCELERATOR.sub("", text)).replace("&", "").replace(" ", "")
+    """去掉 Win32 快捷键标记和 NSIS 导航箭头：'关闭(&L)'->'关闭'、
+    '下一步(&N) >'->'下一步'、'< 上一步(&P)'->'上一步'。WB 安装器的下一页按钮带尾
+    箭头，不剥掉就和 WIZARD_BUTTONS 白名单精确匹配不上（drive 会一个都不点）。"""
+    label = popup_text(_ACCELERATOR.sub("", text)).replace("&", "").replace(" ", "")
+    return label.strip("<>")
 
 
 def is_installer_dialog(hwnd: int, app_name: str = "") -> bool:
