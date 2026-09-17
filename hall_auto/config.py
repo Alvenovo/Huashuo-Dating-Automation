@@ -86,6 +86,10 @@ class SecuritySettings:
     personal_storage_dir: str = "C:/Program Files (x86)/ASUS/PersonalStorage"
     package: str = ""
     work_dir: str = ""
+    # 行 14「安全清单 vs 安装包清单对比」：开发给的安全清单，一行一个相对包根路径；空则用例 skip。
+    manifest: str = ""
+    # 对比范围：signable 只比可签名文件（与 SIGNABLE_GLOBS 同口径），all 比包内全部文件。
+    manifest_scope: str = "signable"
 
     @property
     def configured(self) -> bool:
@@ -128,6 +132,11 @@ class Config:
         name = self.security.package or self.latest_setup
         path = Path(name)
         return path if path.is_absolute() else self.installer_dir / name
+
+    @property
+    def security_manifest_path(self) -> Path:
+        path = Path(self.security.manifest)
+        return path if path.is_absolute() else self.installer_dir / path
 
     def test_account(self) -> tuple[str, str]:
         """凭据优先走环境变量，密码不落盘（规则红线）。"""
@@ -241,6 +250,8 @@ def load_config(path: Path | None = None) -> Config:
             ),
             package=str(security_raw.get("package") or ""),
             work_dir=str(security_raw.get("work_dir") or ""),
+            manifest=str(security_raw.get("manifest") or ""),
+            manifest_scope=str(security_raw.get("manifest_scope") or "signable"),
         ),
         raw=data,
     )

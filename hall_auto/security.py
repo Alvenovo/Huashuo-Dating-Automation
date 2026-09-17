@@ -113,6 +113,14 @@ def extract_package(cfg: Config, dest: Path) -> Path:
     return dest
 
 
+def extracted_tree(cfg: Config) -> Path:
+    """解包待检安装包到工作目录并缓存；签名用例与行 14 清单对比共用同一份，避免重复解包。"""
+    dest = work_root(cfg) / f"extract_{cfg.security_package_path.stem}"
+    if not (dest.exists() and any(dest.iterdir())):
+        extract_package(cfg, dest)
+    return dest
+
+
 def run_checkappv(target_dir: Path, cfg: Config) -> CheckResult:
     """把 CheckAppV 拷进目标目录跑（它只扫自己所在目录），返回未签名计数与清单。"""
     checkappv, _ = security_tools(cfg)
@@ -211,3 +219,61 @@ def hall_entries(entries: list[dict[str, str]], display_name_contains: str) -> l
 
 def expected_publisher() -> str:
     return _PUBLISHER_EXPECTED
+
+
+# ---- 行 14：安全清单文件 vs 安装包清单文件对比 ----
+
+MANIFEST_SCOPES = ("signable", "all")
+
+
+def norm_rel(path: str) -> str:
+    """清单与包内路径归一到同一口径再比：正斜杠、去 ./ 前缀、小写（Windows 路径不分大小写）。"""
+    rel = path.strip().replace("\\", "/").lstrip("/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel.lower()
+
+
+def manifest_entries(path: Path) -> tuple[str, ...]:
+    """解析开发给的安全清单：一行一个相对包根路径；容忍 csv（取首列）与 # / // 注释行。"""
+    text = Path(path).read_text(encoding="utf-8-sig", errors="ignore")
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        if "," in line:
+            line = line.split(",", 1)[0].strip()
+        if line:
+            entries.append(norm_rel(line))
+    return tuple(entries)
+
+
+def package_file_index(root: Path, scope: str) -> frozenset[str]:
+    """包内文件相对根路径集合；scope=signable 只收可签名文件，all 收全部文件。"""
+    if scope not in MANIFEST_SCOPES:
+        raise SecurityToolError(f"manifest_scope 只支持 {MANIFEST_SCOPES}: {scope!r}")
+    suffixes = {glob.lstrip("*") for glob in SIGNABLE_GLOBS}
+    out = set()
+    for file in Path(root).rglob("*"):
+        if not file.is_file():
+            continue
+        if scope == "signable" and file.suffix.lower() not in suffixes:
+            continue
+        out.add(norm_rel(str(file.relative_to(root))))
+    return frozenset(out)
+
+
+@dataclass(frozen=True)
+class ManifestDiff:
+    missing: tuple[str, ...]  # 清单里有、包里没有
+    extra: tuple[str, ...]  # 包里有、清单里没有
+
+    @property
+    def consistent(self) -> bool:
+        return not self.missing and not self.extra
+
+
+def compare_manifest(expected, actual) -> ManifestDiff:
+    exp, act = set(expected), set(actual)
+    return ManifestDiff(missing=tuple(sorted(exp - act)), extra=tuple(sorted(act - exp)))

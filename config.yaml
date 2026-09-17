@@ -81,3 +81,8 @@ security:
   personal_storage_dir: "C:/Program Files (x86)/ASUS/PersonalStorage"
   package: ""
   work_dir: ""
+  # 行 14「安全清单 vs 安装包清单对比」：manifest 是开发给的安全清单（一行一个相对包根
+  # 路径，容忍 csv 首列与 # 注释），相对 installer_dir 或绝对路径；空则用例 skip。
+  # manifest_scope 决定对比范围：signable 只比可签名文件，all 比包内全部文件。
+  manifest: ""
+  manifest_scope: "signable"
