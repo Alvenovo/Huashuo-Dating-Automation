@@ -1,0 +1,22 @@
+{
+  "总览": {
+    "file": "00-Dashboard/00-MOC.md",
+    "icon": "map"
+  },
+  "速查表": {
+    "file": "00-Dashboard/01-速查表.md",
+    "icon": "file-text"
+  },
+  "学习进度": {
+    "file": "00-Dashboard/02-学习进度.md",
+    "icon": "trending-up"
+  },
+  "考试陷阱集": {
+    "file": "00-Dashboard/03-考试陷阱集.md",
+    "icon": "alert-triangle"
+  },
+  "术语表": {
+    "file": "00-Dashboard/04-术语表.md",
+    "icon": "book-open"
+  }
+}

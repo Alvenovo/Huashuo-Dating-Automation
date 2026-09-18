@@ -1,0 +1,11 @@
+{
+  "accentColor": "#3b82f6",
+  "theme": "moonstone",
+  "cssTheme": "",
+  "baseFontSize": 17,
+  "translucency": false,
+  "interfaceFontFamily": "Microsoft YaHei UI",
+  "textFontFamily": "Microsoft YaHei",
+  "monospaceFontFamily": "Cascadia Mono, Consolas, monospace",
+  "showViewHeader": true
+}

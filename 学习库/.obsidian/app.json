@@ -1,0 +1,16 @@
+{
+  "showInlineTitle": true,
+  "alwaysUpdateLinks": true,
+  "newLinkFormat": "shortest",
+  "useMarkdownLinks": false,
+  "attachmentFolderPath": "_attachments",
+  "showUnsupportedFiles": false,
+  "defaultViewMode": "preview",
+  "readableLineLength": true,
+  "strictLineBreaks": false,
+  "showLineNumber": false,
+  "foldHeading": true,
+  "foldIndent": true,
+  "showFrontmatter": true,
+  "livePreview": true
+}

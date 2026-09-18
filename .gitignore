@@ -8,7 +8,11 @@ __pycache__/
 .vscode/
 reports/
 config.local.yaml
-# 归档交接里有本机个人规则部署记录（私有仓库名、用户目录），与项目无关，不进公开仓库
 交接归档/
 *.log
 myappstore_*_Setup.exe
+# WorkBuddy 工具目录（会话记忆等），属本机状态，不进仓库
+.workbuddy-ai/
+# Obsidian 工作区状态（打开的标签/光标位置），纯本机 UI 状态，每次开都变
+**/.obsidian/workspace.json
+**/.obsidian/workspace-mobile.json
