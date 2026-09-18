@@ -133,8 +133,18 @@ def check_scale(expected_percent: int | None = None) -> tuple[bool, str]:
 
 
 def machine_profile() -> dict:
-    """采集一份本机环境画像，写进证据 summary / 机器清单，多机汇总时按维度分组用。"""
-    return {
+    """采集一份本机环境画像，写进证据 summary / 机器清单，多机汇总时按维度分组用。
+
+    分两组字段：
+    - **显示相关**（本模块）：DPI / 缩放 / 分辨率 / 监视器数 / 位数。
+    - **兼容性分组相关**（`hall_auto.profile`）：WebView2 有无与版本、已装大厅版本、
+      微软会话、中文 OCR。组长定的目标是兼容性验证，少了这两项会把
+      「机器缺运行时」误判成「版本有缺陷」。
+
+    兼容性那组的探测走注册表/PowerShell，用 try 兜住：**画像采集失败不能拖垮跑批**，
+    单机调试时（注册表被策略锁、非 Windows）宁可字段为 unknown 也要把 profile 返回出去。
+    """
+    profile = {
         "node": platform_node(),
         "os": _os_string(),
         "arch": os.environ.get("PROCESSOR_ARCHITECTURE", ""),
@@ -146,6 +156,18 @@ def machine_profile() -> dict:
         "screen": _screen_size(),
         "monitors": _monitor_count(),
     }
+    try:
+        from hall_auto.profile import compat_facts
+
+        profile.update(compat_facts())
+    except Exception:
+        profile.setdefault("webview2", "unknown")
+        profile.setdefault("webview2_version", "")
+        profile.setdefault("hall_installed", "unknown")
+        profile.setdefault("hall_version", "")
+        profile.setdefault("ms_session", "unknown")
+        profile.setdefault("ocr_zh", "unknown")
+    return profile
 
 
 def platform_node() -> str:

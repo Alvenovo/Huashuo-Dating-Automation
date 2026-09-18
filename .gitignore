@@ -8,6 +8,9 @@ __pycache__/
 .vscode/
 reports/
 config.local.yaml
+# 节点本地凭据文件（密码/测试号/共享盘账号）—— 每台机器自己一份，绝不进 git
+farm_node.env
+tools/farm_node.env
 交接归档/
 *.log
 myappstore_*_Setup.exe

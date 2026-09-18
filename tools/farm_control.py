@@ -96,7 +96,28 @@ def cmd_dispatch(args) -> int:
 
     print(f"\n任务 {task_id} 已投给 {written} 台节点（共 {len(nodes)} 台）。")
     _print_concurrency_notes(suite_names)
+    _warn_missing_credentials(suite_names)
     return 0
+
+
+# 这些套件靠凭据才能真跑；节点上没配 → 用例静默 skip（报告一片黄）。
+# 控制机这边看不出来，所以投任务时就提醒一次，别等汇总时才发现。
+_CRED_REQUIRED = {
+    "login": "HALL_TEST_USER / HALL_TEST_PASSWORD / HALL_MS_USER",
+    "login-manual": "HALL_TEST_USER / HALL_TEST_PASSWORD / HALL_TEST_NEW_PASSWORD",
+}
+
+
+def _warn_missing_credentials(suite_names: list[str]) -> None:
+    """投了需要凭据的套件就提醒：凭据在**节点本地** farm_node.env，不是在这里设。"""
+    needed = sorted({name for name in suite_names if name in _CRED_REQUIRED})
+    if not needed:
+        return
+    print("\n⚠ 凭据提醒：")
+    for name in needed:
+        print(f"  {name} 需要节点本地 tools/farm_node.env 里有：{_CRED_REQUIRED[name]}")
+    print("  （密码不落共享盘、不进任务文件；每台节点机各自的 farm_node.env 已 gitignore）")
+    print("  没配的节点上，这些用例会静默 skip —— 汇总表里看 credentials 字段就能区分。")
 
 
 def _print_concurrency_notes(suite_names: list[str]) -> None:
@@ -167,6 +188,17 @@ _SYMBOL = {"passed": "✓", "failed": "✗", "skipped": "–"}
 _COLOR = {"passed": "#1a7f37", "failed": "#c62828", "skipped": "#9aa0a6"}
 
 
+def _cred_cell(creds: dict, key: str) -> str:
+    """凭据格：有=绿 ✓，没有=红 ✗。
+
+    存在的意义是**区分 skip 的根因** —— 报告上一片黄时，看这列就知道
+    是「这台机器没配凭据」还是「用例本身在跳过」。
+    """
+    ok = bool(creds.get(key))
+    color = _COLOR["passed"] if ok else _COLOR["failed"]
+    return f'<td style="color:{color}">{"✓" if ok else "✗"}</td>'
+
+
 def _render_matrix(nodes_data: dict) -> str:
     """节点 × 用例矩阵：一眼看出「哪台机器挂在哪条用例」，那是兼容性结论的形态。"""
     all_cases = sorted({c for v in nodes_data.values() for c in v["cases"]})
@@ -194,10 +226,13 @@ def _render_matrix(nodes_data: dict) -> str:
     env_rows = []
     for node in nodes:
         profile = nodes_data[node].get("profile") or {}
+        creds = nodes_data[node].get("credentials") or {}
         env_rows.append(
             "<tr><td>" + html.escape(node) + "</td>"
             + "".join(f"<td>{html.escape(str(profile.get(k, '')))}</td>"
-                      for k in ("os", "screen", "scale_percent", "python"))
+                      for k in ("os", "screen", "scale_percent", "webview2", "webview2_version", "ms_session"))
+            + "".join(_cred_cell(creds, k) for k in
+                      ("password_login", "microsoft_sso", "share_creds"))
             + "</tr>"
         )
 
@@ -231,7 +266,7 @@ def _render_matrix(nodes_data: dict) -> str:
 </tbody></table></div>
 
 <h2>节点环境</h2>
-<div class="tbl-scroll"><table><thead><tr><th>节点</th><th>系统</th><th>分辨率</th><th>缩放</th><th>Python</th></tr></thead><tbody>
+<div class="tbl-scroll"><table><thead><tr><th>节点</th><th>系统</th><th>分辨率</th><th>缩放</th><th>WebView2</th><th>WV2 版本</th><th>微软会话</th><th>密码凭据</th><th>SSO 凭据</th><th>共享盘</th></tr></thead><tbody>
 {"".join(env_rows)}
 </tbody></table></div>
 

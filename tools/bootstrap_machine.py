@@ -73,6 +73,19 @@ REQUIRED_FILES = {
     "7z2602-x64.exe": "7-Zip 更新夹具包（fixtures/ 下，路径见下）",
 }
 
+# 节点本地凭据文件的名字（仓库根下，已在 .gitignore）。
+# 与 hall_auto/env_pack.NODE_ENV_FILENAME 是同一条约定，这里 import 过来免得抄错。
+from hall_auto.env_pack import NODE_ENV_FILENAME  # noqa: E402
+
+# bootstrap 时提示"哪些凭据还没配"用的建议清单（**只列键名，不涉及值**）。
+SUGGESTED_NODE_ENV = (
+    "HALL_TEST_USER",
+    "HALL_TEST_PASSWORD",
+    "HALL_MS_USER",
+    "HALL_SHARE_USER",
+    "HALL_SHARE_PASSWORD",
+)
+
 SELFTEST_MARKER = "unit"
 
 # 依赖装好后写的标记文件，内容 = requirements.txt 的 SHA256。
@@ -541,6 +554,101 @@ def step_selftest(skip: bool) -> Step:
 # ---------------- 主流程 ----------------
 
 
+def step_node_env_template() -> Step:
+    """准备节点本地凭据文件模板 `tools/farm_node.env`（已 gitignore）。
+
+    **不生成任何真实凭据**，只在文件不存在时放一份带注释的模板并提示要填什么。
+    密码只走这里（机器本地），不落共享盘、不进任务文件。
+
+    为什么不自动从环境变量导出到文件：那会把"只在环境里"的密码落到磁盘上，
+    与红线相悖。要落盘由人显式决定。
+    """
+    st = Step("节点凭据文件")
+    path = REPO_ROOT / NODE_ENV_FILENAME
+    if path.is_file():
+        # 已存在：只报告有哪些项，**绝不回显值**
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            st.fail(f"读 {path.name} 失败：{exc}")
+            return st
+        from hall_auto.env_pack import parse_env_text
+
+        keys = sorted(parse_env_text(text))
+        st.log(f"{path.name} 已存在，含 {len(keys)} 项：{', '.join(keys) or '（空）'}")
+        missing = [k for k in SUGGESTED_NODE_ENV if k not in keys]
+        if missing:
+            st.log(f"未配置（相关套件会 skip）：{', '.join(missing)}")
+        return st
+
+    template = "\n".join([
+        "# 节点本地凭据（每台机器自己一份，已在 .gitignore，绝不进 git、不进共享盘）。",
+        "# 只填这台机器用得上的；没配的对应套件会自动 skip，不影响其他套件。",
+        "# 格式：KEY=VALUE（值不用加引号）。",
+        "",
+        "# --- 登录套件（P1-B）---",
+        "# 密码登录用例",
+        "HALL_TEST_USER=",
+        "HALL_TEST_PASSWORD=",
+        "# 微软 SSO 免密用例",
+        "HALL_MS_USER=",
+        "# 改密码往返用例（只在 -m manual 人在环时用）",
+        "HALL_TEST_NEW_PASSWORD=",
+        "",
+        "# --- 共享盘取包（取不到包时才需要；也可用 net use /persistent:yes 代替）---",
+        "HALL_SHARE_USER=",
+        "HALL_SHARE_PASSWORD=",
+        "",
+    ])
+    try:
+        path.write_text(template, encoding="utf-8")
+    except OSError as exc:
+        st.fail(f"写 {path.name} 失败：{exc}")
+        return st
+    st.log(f"已生成模板 {path}（全空，填入本机凭据后生效）")
+    st.log("提示：填完不必重跑本脚本，farm_agent 每次取任务时会重新读该文件")
+    return st
+
+
+def step_farm_root(skip: bool) -> Step:
+    """检查/创建农场目录结构（tasks / done / results / logs）。
+
+    `HALL_FARM_ROOT` 指向共享盘上的农场目录，控制机和所有节点共用同一个。
+    目录不存在时 `farm_agent` 的 `ensure_dirs` 也会建，但**首次跑建议在这里建好**：
+    免得节点以自己受限的权限往共享盘根下写，失败信息还不直观。
+    """
+    st = Step("农场目录")
+    if skip:
+        st.log("按 --skip-farm 跳过")
+        return st
+    raw = (os.environ.get("HALL_FARM_ROOT") or "").strip()
+    if not raw:
+        st.log(
+            "未设 HALL_FARM_ROOT —— 单机跑不设也行（用 farm_agent --local 直接跑套件）；"
+            "多机跑批必须设，指向共享盘上的农场目录，如 \\\\192.168.0.4\\hall-farm"
+        )
+        return st
+
+    root = Path(raw)
+    created: list[str] = []
+    failed: list[str] = []
+    for sub in ("tasks", "done", "results", "logs"):
+        target = root / sub
+        if target.is_dir():
+            continue
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            created.append(sub)
+        except OSError as exc:
+            failed.append(f"{sub}（{exc}）")
+    if failed:
+        st.fail(f"农场子目录建不出来：{'; '.join(failed)}")
+        st.log(f"农场根：{root}（节点写不进去多半是共享盘权限/凭据没配）")
+        return st
+    st.log(f"农场根 {root}：{'新建 ' + ', '.join(created) if created else '四个子目录齐全'}")
+    return st
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="测试机一次性环境铺设")
     parser.add_argument("--installer-dir", default="")
@@ -548,8 +656,9 @@ def main() -> int:
     parser.add_argument("--skip-venv", action="store_true")
     parser.add_argument("--skip-schtask", action="store_true")
     parser.add_argument("--skip-selftest", action="store_true")
-    parser.add_argument("--no-download", action="store_true", help="不下载安装包，只用本地已有的")
     parser.add_argument("--skip-share", action="store_true", help="不尝试连接共享盘")
+    parser.add_argument("--skip-farm", action="store_true", help="不检查/创建农场目录结构")
+    parser.add_argument("--no-download", action="store_true", help="不下载安装包，只用本地已有的")
     args = parser.parse_args()
 
     node = args.node_id.strip() or node_id()
@@ -578,7 +687,9 @@ def main() -> int:
     run(step_venv(args.skip_venv))
     run(step_fixtures(installer_dir))
     run(step_write_local_config(installer_dir, node))
+    run(step_node_env_template())
     run(step_share_login(args.skip_share))
+    run(step_farm_root(args.skip_farm))
     run(step_fetch_packages(allow_download=not args.no_download))
     run(step_schtask(args.skip_schtask))
     run(step_selftest(args.skip_selftest))

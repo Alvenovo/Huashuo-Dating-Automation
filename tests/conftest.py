@@ -5,7 +5,7 @@ import shutil
 
 import pytest
 
-from hall_auto.awake import keep_awake
+from hall_auto.awake import keep_awake_for_process, session_lost, session_lost_detail
 from hall_auto.config import load_config
 from hall_auto.dpi import is_interactive_session, machine_profile, node_id
 from hall_auto.evidence import (
@@ -105,13 +105,18 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(scope="session", autouse=True)
 def _env_precheck(request):
-    """跑批前环境预检：非交互式会话直接中止；跑批期间保持屏幕常亮。
+    """跑批前环境预检：非交互式会话直接中止；跑批期间保持屏幕常亮并巡检交互态。
 
     非交互式（锁屏 / 息屏 / RDP 断开）会让抓屏拿黑屏、点击无落点，跑下去全是假失败 ——
     直接中止比产出 20 份垃圾报告强。
 
     **屏幕常亮**：组长 2026-09-18 确认测试机无人碰屏，靠脚本自己保证不息屏。
-    用 SetThreadExecutionState（进程级，退出自动失效），不动系统电源计划。
+    用 SetThreadExecutionState（进程级），不动系统电源计划。**常亮持续到进程退出**
+    （不在 fixture teardown 时恢复：teardown 到进程退出之间那一段足够长套件中途息屏）。
+
+    **中途丢失交互态也中止**：开跑时是交互态不代表跑完还是 —— RDP 断连 / 远程锁屏
+    会让后半程全变假失败。巡检线程发现翻转就标记，每个用例结束时查一次，
+    标记了就中止并写清原因（见 `_session_guard`）。
 
     **缩放不做门禁**：脚本走 Per-Monitor Aware 物理像素坐标（本机真实 150% 下全套跑通），
     非 100% 不影响正确性，只在报告页头记录环境画像供多机分组。
@@ -125,10 +130,33 @@ def _env_precheck(request):
             "请保持屏幕解锁常亮、在本地交互会话里跑；确认无碍可加 --skip-env-check 跳过预检。",
             returncode=3,
         )
-    with keep_awake() as awake:
-        if not awake:
-            print("\n[电源] 屏幕常亮设置未生效（SetThreadExecutionState 调用失败），跑批期间屏幕可能息屏")
+    started = keep_awake_for_process()
+    if not started:
+        print("\n[电源] 屏幕常亮设置未生效（SetThreadExecutionState 调用失败），跑批期间屏幕可能息屏")
+    yield
+    # 常亮与巡检线程随进程退出由 atexit 收尾，这里不恢复（理由见 awake.py 模块头）
+    detail = session_lost_detail()
+    if detail:
+        print(f"\n[会话] ⚠ {detail}")
+
+
+@pytest.fixture(autouse=True)
+def _session_guard(request):
+    """跑批中途丢失交互态 → 立刻中止，别继续产出不可信的结果。
+
+    只有开跑时的预检是**不够**的：长套件跑几十分钟，中途 RDP 断开 / 锁屏后
+    抓屏变黑、点击无落点，后面所有用例都会以「元素找不到」失败 ——
+    这类假失败会污染整份兼容性结论，比直接中止更糟。
+    """
+    if request.config.getoption("--skip-env-check"):
         yield
+        return
+    yield
+    if session_lost():
+        pytest.exit(
+            f"跑批中途 {session_lost_detail()}",
+            returncode=3,
+        )
 
 
 @pytest.fixture(scope="session")

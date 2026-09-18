@@ -109,18 +109,146 @@ def install_baseline_clean(cfg: Config) -> InstalledProduct:
     return install_setup(cfg, resolve_setup(cfg, cfg.baseline_setup))
 
 
-def reset_before_run(cfg: Config, *, allow_download: bool = True) -> dict:
+class ResetBlocked(RuntimeError):
+    """复位被拒绝执行（不可逆操作的保护闸）。"""
+
+
+def reset_allowed() -> bool:
+    """复位是否被允许卸载已装的大厅。门禁与环境变量/命令行开关同口径。
+
+    **为什么复位要单独一道门禁**：pytest 的 `--allow-install` 只拦用例，
+    拦不住复位 —— 复位是在用例之外先把大厅卸掉。没有这道闸时，
+    在办公机上跑一次 `reset_machine.py` 会真把大厅卸了，且没有任何提示。
+    """
+    return os.environ.get("HALL_ALLOW_INSTALL") == "1"
+
+
+def check_packages_available(cfg: Config, *, allow_download: bool = True) -> tuple[bool, list[dict]]:
+    """**只读**探测「三个包都能拿到吗」，不下载、不拷贝、不改任何东西。
+
+    探测顺序与 `ensure_package` 一致但不落盘：本地 → 缓存 → 共享盘。
+    共享盘那步只做可达性 + `is_file()`，不做拷贝 —— 目的是判断"万一卸了能不能装上"。
+
+    返回 (是否全都能拿到, 每个包的探测结果)。
+
+    **为什么卸载前必须先跑这个**：先把大厅卸了、再把包拉下来，一旦包拉不到，
+    机器就停在「大厅被卸掉且装不回来」的状态 —— 对跑批是最坏的结果。
+    正确的顺序是「先确认能拿到包，再决定卸不卸」。
+    """
+    from hall_auto.fetch import cache_dir, share_dirs, share_reachable
+
+    results: list[dict] = []
+    shares = share_dirs(cfg)
+    reachable_shares: list = []
+    for directory in shares:
+        ok, why = share_reachable(directory)
+        if ok:
+            reachable_shares.append(directory)
+        results.append({"share": str(directory), "reachable": ok, "why": why})
+
+    if not cfg.installer_dir.is_dir():
+        results.append({
+            "note": f"installer_dir 不存在：{cfg.installer_dir}",
+            "hint": "多机跑批时机器上没人拷包，属正常；但每个包都得能从缓存/共享盘/下载拿到",
+        })
+
+    names = configured_filenames(cfg)
+    all_ok = True
+    for name in names:
+        local = cfg.installer_dir / name
+        if local.is_file():
+            results.append({"filename": name, "available": True, "source": "local"})
+            continue
+        cached = cache_dir(cfg) / name
+        if cached.is_file():
+            results.append({"filename": name, "available": True, "source": "cache"})
+            continue
+        hit = next((d for d in reachable_shares if (d / name).is_file()), None)
+        if hit is not None:
+            results.append({"filename": name, "available": True, "source": "share", "url": str(hit)})
+            continue
+        if allow_download:
+            # 只有**配置里明确给了地址**才算"能拿到"。默认 CDN 模板（dlcdnets.asus.com）
+            # 只是个猜测 —— 组长已两次确认没有官方地址，那些 URL 实际全是 404。
+            # 把"猜的地址"当可用，就会把大厅卸掉然后装不回来，正是要防的最坏结果。
+            template = str(((cfg.raw or {}).get("download") or {}).get("url_template") or "").strip()
+            from hall_auto.fetch import package_url
+
+            url = package_url(cfg, name) if template else ""
+            results.append({
+                "filename": name,
+                "available": bool(template),
+                "source": "download" if template else "none",
+                "url": url,
+                "error": "" if template else (
+                    "本地、缓存、共享盘都没有，且下载地址未配置（download.url_template 为空）"
+                    "——没有可用的获取路径，拒绝卸载"
+                ),
+                "hint": "" if template else "先补包：放到 installer_dir、或接通共享盘、或让组长给下载地址",
+            })
+            if not template:
+                all_ok = False
+            continue
+        results.append({
+            "filename": name,
+            "available": False,
+            "source": "none",
+            "error": "本地、缓存、共享盘都没有，且本轮禁止下载",
+        })
+        all_ok = False
+    return all_ok, results
+
+
+def reset_before_run(
+    cfg: Config,
+    *,
+    allow_download: bool = True,
+    allow_uninstall: bool = False,
+    require_packages: bool = True,
+) -> dict:
     """跑批前的机器复位：检测已装的大厅，有就卸掉，并把要用的包备齐。
 
     组长 2026-09-18 要求：「不论装没装对应大厅，都先检测，有检测到就先删掉，重新下载」。
-    这个函数就是那句话的落地。
+    这个函数就是那句话的落地。**卸载是不可逆的，所以顺序很关键**：
+
+      1. 先**只读**探测三个包能不能拿到（本地 → 缓存 → 共享盘 → 下载）
+      2. 拿不到 → **拒绝卸载**，报 `ResetBlocked`，机器保持原样
+      3. 拿得到 → 才真卸
+
+    早先的版本是「先卸再取包」，一旦包取不到，机器就停在"大厅被卸掉且装不回来"，
+    对跑批是最坏结果。顺序反了。
+
+    `allow_uninstall=False`（默认）时，检测到已装大厅也**不卸**，只报告 ——
+    办公机上误跑一次就少一个大厅。要真卸必须显式给 `allow_uninstall=True`
+    或设 `HALL_ALLOW_INSTALL=1`（与 pytest 门禁同口径）。
 
     返回复位报告（写进证据），不改任何配置。
     """
     import time as _time
 
-    report: dict = {"started_at": _time.strftime("%Y-%m-%dT%H:%M:%S"), "steps": []}
+    report: dict = {
+        "started_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "installer_dir": str(cfg.installer_dir),
+        "steps": [],
+    }
 
+    # ---- 第 1 步（只读）：包能不能拿到？拿不到就别动现有安装 ----
+    if require_packages:
+        packs_ok, pack_results = check_packages_available(cfg, allow_download=allow_download)
+        report["precheck"] = pack_results
+        report["packages_precheck_ok"] = packs_ok
+        if not packs_ok:
+            missing = [p.get("filename") for p in pack_results if p.get("available") is False]
+            report["ok"] = False
+            report["blocked"] = True
+            report["finished_at"] = _time.strftime("%Y-%m-%dT%H:%M:%S")
+            raise ResetBlocked(
+                "安装包拿不到，拒绝卸载已装大厅（否则机器会停在卸了装不回来的状态）。"
+                f"缺失：{', '.join(m for m in missing if m)}。"
+                f"请先补齐包：把包放到 {cfg.installer_dir}，或接通共享盘，或给出下载地址。"
+            )
+
+    # ---- 第 2 步：检测已装的大厅 ----
     existing = read_installed()
     if existing is None:
         report["steps"].append({"step": "detect", "found": False, "detail": "未检测到已安装的大厅"})
@@ -132,16 +260,33 @@ def reset_before_run(cfg: Config, *, allow_download: bool = True) -> dict:
             "display_version": existing.display_version,
             "install_dir": str(existing.install_dir),
         })
-        stop_product(cfg.timeouts.process_stop_sec)
-        uninstall_exe = Path(existing.uninstall_string.strip().strip('"'))
-        _run_nsis(uninstall_exe, cfg.timeouts.uninstall_sec)
-        _wait_until(
-            lambda: read_installed() is None,
-            cfg.timeouts.version_settle_sec,
-            "等待卸载完成（复位）",
-        )
-        report["steps"].append({"step": "uninstall", "ok": True})
+        if not allow_uninstall:
+            # 门禁未开：只报告，不卸载。**绝不因为"脚本本来就要卸"就默认卸**。
+            report["steps"].append({
+                "step": "uninstall",
+                "ok": True,
+                "skipped": True,
+                "detail": (
+                    "已装大厅但未开卸载闸：加 --allow-uninstall 或设 HALL_ALLOW_INSTALL=1 才会卸。"
+                    "（办公机上误跑一次就少一个大厅，所以默认不卸。）"
+                ),
+            })
+        else:
+            stop_product(cfg.timeouts.process_stop_sec)
+            uninstall_exe = Path(existing.uninstall_string.strip().strip('"'))
+            _run_nsis(uninstall_exe, cfg.timeouts.uninstall_sec)
+            _wait_until(
+                lambda: read_installed() is None,
+                cfg.timeouts.version_settle_sec,
+                "等待卸载完成（复位）",
+            )
+            report["steps"].append({"step": "uninstall", "ok": True})
 
+    # ---- 第 3 步：真正把包备齐（此时已确认有路可走）----
+    #
+    # 注意：**不创建 installer_dir**。早先的版本会 mkdir 出配置里那个复制来的假路径
+    # （别人机器上的 C:/Users/xxx/...），建出一个空壳目录，报告还显示 ok —— 假绿。
+    # 拿不到包就该失败，不该造一个空目录把失败藏起来。
     fetched: list[dict] = []
     for name in configured_filenames(cfg):
         try:
@@ -153,7 +298,12 @@ def reset_before_run(cfg: Config, *, allow_download: bool = True) -> dict:
         except Exception as exc:
             fetched.append({"filename": name, "source": "failed", "error": str(exc)})
     report["packages"] = fetched
-    report["ok"] = all(p.get("source") != "failed" for p in fetched)
+    failed = [p["filename"] for p in fetched if p.get("source") == "failed"]
+    if failed:
+        report["ok"] = False
+        report["error"] = f"安装包获取失败：{', '.join(failed)}"
+    else:
+        report["ok"] = True
     report["finished_at"] = _time.strftime("%Y-%m-%dT%H:%M:%S")
     return report
 

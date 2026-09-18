@@ -40,6 +40,7 @@ FIELDS = [
     "webview2_version",
     "hall_installed",
     "hall_version",
+    "ms_session",
     "seven_zip",
     "ocr_zh",
     "is_admin",
@@ -48,55 +49,29 @@ FIELDS = [
 
 
 def _webview2() -> tuple[str, str]:
-    """WebView2 运行时是否安装 + 版本。大厅首页就是 WebView2，缺了初始化会很慢或失败。"""
-    import winreg
+    """WebView2 运行时是否安装 + 版本。
 
-    keys = [
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
-    ]
-    for hive, key_path in keys:
-        try:
-            with winreg.OpenKey(hive, key_path) as key:
-                version, _ = winreg.QueryValueEx(key, "pv")
-                if str(version).strip():
-                    return "yes", str(version)
-        except OSError:
-            continue
-    return "no", ""
+    实现已下沉到 `hall_auto.profile`（单一权威），这里只做薄包装，
+    免得跟 `dpi.machine_profile()` 的字段口径漂成两份。
+    """
+    from hall_auto.profile import webview2_installed, webview2_version
+
+    version = webview2_version()
+    return ("yes" if webview2_installed() else "no"), version
 
 
 def _hall_installed() -> tuple[str, str]:
-    import winreg
+    """注册表里已装大厅的 (是否安装, 版本)。实现同样在 `hall_auto.profile`。"""
+    from hall_auto.profile import hall_installed_version
 
-    for hive, key_path in (
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\AsusMemberCenter"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AsusMemberCenter"),
-    ):
-        try:
-            with winreg.OpenKey(hive, key_path) as key:
-                version, _ = winreg.QueryValueEx(key, "DisplayVersion")
-                return "yes", str(version).strip()
-        except OSError:
-            continue
-    return "no", ""
+    version = hall_installed_version()
+    return ("yes" if version else "no"), version
 
 
 def _ocr_zh() -> str:
-    try:
-        proc = subprocess.run(
-            [
-                "powershell", "-NoProfile", "-Command",
-                "[Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime]"
-                "::AvailableRecognizerLanguages | ForEach-Object { $_.LanguageTag }",
-            ],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
-        tags = [t.strip() for t in (proc.stdout or "").splitlines() if t.strip()]
-        return "yes" if any(t.lower().startswith("zh") for t in tags) else "no"
-    except Exception:
-        return "unknown"
+    from hall_auto.profile import ocr_has_chinese
+
+    return ocr_has_chinese()
 
 
 def collect() -> dict:
@@ -129,6 +104,7 @@ def collect() -> dict:
         "webview2_version": wv2_ver,
         "hall_installed": hall,
         "hall_version": hall_ver,
+        "ms_session": profile.get("ms_session", "unknown"),
         "seven_zip": "yes" if Path("C:/Program Files/7-Zip/7z.exe").is_file() else "no",
         "ocr_zh": _ocr_zh(),
         "is_admin": admin,
