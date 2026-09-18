@@ -5,7 +5,9 @@ import shutil
 
 import pytest
 
+from hall_auto.awake import keep_awake
 from hall_auto.config import load_config
+from hall_auto.dpi import is_interactive_session, machine_profile, node_id
 from hall_auto.evidence import (
     MODE_ALL,
     MODE_FAILURE,
@@ -37,13 +39,62 @@ def pytest_addoption(parser):
         default=30,
         help="证据保留天数，跑批时自动删除更早的 run 目录；0=不清理",
     )
+    parser.addoption(
+        "--skip-env-check",
+        action="store_true",
+        default=False,
+        help="跳过跑批前的环境预检（交互式会话）。仅调试用，正式跑批不要加。",
+    )
+    # 多机分片：把用例按序号取模摊到多台机器上。不用 pytest-xdist —— 它只做单机多进程，
+    # 跨不了机器，而这套用例有全局机器状态（装/卸、注册表、前台窗口），同机多进程也会互踩。
+    parser.addoption(
+        "--shard-id",
+        type=int,
+        default=1,
+        help="本节点承担的分片序号（从 1 开始），配合 --shard-count 使用",
+    )
+    parser.addoption(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="总的分片数；>1 时本节点只跑属于自己分片的用例",
+    )
+
+
+def pytest_report_header(config):
+    """跑批前打印本机环境画像，多机汇总时能直接看出是哪台、什么环境跑的。"""
+    profile = machine_profile()
+    lines = [
+        f"节点: {profile['node']}  系统: {profile['os']}  Python {profile['python']}({profile['python_bits']}位)",
+        f"显示: {profile['screen']}  缩放: {profile['scale_percent']}%  显示器数: {profile['monitors']}  DPI感知: {profile['dpi_awareness']}",
+    ]
+    if not is_interactive_session():
+        lines.append("会话检查: 阻断 — 非交互式会话（锁屏/息屏/RDP 断开），抓屏与点击会失效")
+    return lines
 
 
 def _allow_install(config) -> bool:
     return bool(config.getoption("--allow-install")) or os.environ.get("HALL_ALLOW_INSTALL") == "1"
 
 
+def _shard_selection(config) -> tuple[int, int]:
+    shard = max(1, config.getoption("--shard-id"))
+    count = max(1, config.getoption("--shard-count"))
+    return min(shard, count), count
+
+
 def pytest_collection_modifyitems(config, items):
+    # 分片：按「收集顺序序号」取模。收集顺序在同样的 pytest 版本 + 同样的路径下是稳定的，
+    # 所以多台机器上用同一份参数能切出互不重叠、且合起来不重不漏的集合。
+    shard, count = _shard_selection(config)
+    if count > 1:
+        kept, dropped = [], []
+        for idx, item in enumerate(items):
+            (kept if idx % count == shard - 1 else dropped).append(item)
+        if dropped:
+            items[:] = kept
+        print(f"\n[分片] 本节点跑分片 {shard}/{count}：{len(kept)} 条用例（其余 {len(dropped)} 条归别的分片）")
+
     if _allow_install(config):
         return
     skip = pytest.mark.skip(reason="破坏性安装未开启：加 --allow-install 或 HALL_ALLOW_INSTALL=1")
@@ -52,9 +103,49 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _env_precheck(request):
+    """跑批前环境预检：非交互式会话直接中止；跑批期间保持屏幕常亮。
+
+    非交互式（锁屏 / 息屏 / RDP 断开）会让抓屏拿黑屏、点击无落点，跑下去全是假失败 ——
+    直接中止比产出 20 份垃圾报告强。
+
+    **屏幕常亮**：组长 2026-09-18 确认测试机无人碰屏，靠脚本自己保证不息屏。
+    用 SetThreadExecutionState（进程级，退出自动失效），不动系统电源计划。
+
+    **缩放不做门禁**：脚本走 Per-Monitor Aware 物理像素坐标（本机真实 150% 下全套跑通），
+    非 100% 不影响正确性，只在报告页头记录环境画像供多机分组。
+    """
+    if request.config.getoption("--skip-env-check"):
+        yield
+        return
+    if not is_interactive_session():
+        pytest.exit(
+            "非交互式会话（锁屏/息屏/RDP 断开），抓屏与点击会失效。"
+            "请保持屏幕解锁常亮、在本地交互会话里跑；确认无碍可加 --skip-env-check 跳过预检。",
+            returncode=3,
+        )
+    with keep_awake() as awake:
+        if not awake:
+            print("\n[电源] 屏幕常亮设置未生效（SetThreadExecutionState 调用失败），跑批期间屏幕可能息屏")
+        yield
+
+
 @pytest.fixture(scope="session")
 def cfg():
     return load_config()
+
+
+@pytest.fixture(scope="session")
+def node() -> str:
+    """本机节点标识，多机汇总时用于区分是哪台机器跑的。"""
+    return node_id()
+
+
+@pytest.fixture(scope="session")
+def machine() -> dict:
+    """本机环境画像（OS / 缩放 / 分辨率 / Python 位数）。断言里的兼容性差异可以引用它。"""
+    return machine_profile()
 
 
 @pytest.fixture(scope="session")

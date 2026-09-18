@@ -1,0 +1,33 @@
+# 测试机清单（多机跑批用）
+#
+# 用途：登记参与跑批的每台测试机的环境与分配，供「按维度分组看结论」用。
+# 这份文件是**人工维护**的台账；每台机器可跑 `tools/bootstrap_machine.py` 自动产出环境画像
+# （reports/bootstrap/bootstrap_<node>_*.json），把关键字段填进来即可。
+#
+# 不写密码 / 测试号 / 邮箱。node_id 默认取主机名，也可在 bootstrap 时用 --node-id 指定。
+#
+# 字段说明：
+#   node_id        节点标识（与 config.local.yaml 的 node_id、证据目录前缀一致）
+#   role           承担的角色：ui（功能主流程）/ install（P0 安装层，破坏性）/ security（P2 安全验证）
+#   os             系统版本（用于兼容性分组）
+#   screen         分辨率
+#   scale          显示缩放（默认统一 100%，见 bootstrap）
+#   webview2       是否已装 WebView2 运行时（yes/no）
+#   ms_session     是否有缓存的微软登录会话（yes/no，决定 SSO 用例跑或 skip）
+#   note           备注
+
+machines:
+  - node_id: ""          # 例：TEST-PC-01
+    role: ui
+    os: ""
+    screen: ""
+    scale: 100
+    webview2: ""
+    ms_session: ""
+    note: ""
+
+# 跑批分片建议（见项目知识库/运行手册.md 与《会话交接.md》）：
+#   - 只读类（P0 launch / P1-A 检测 / P1-C 主题 / P2 安全）：全并行，不碰服务端
+#   - 真装卸类（P1-A 装/卸、WB 行 25）：跨机限流，同一时刻并发不超过 5 台（打厂商 CDN + 大厅服务端）
+#   - 登录类（P1-B）：多机登录不会踢，可并行；账号够就能全开
+#   - 人工类（-m manual）：永不进多机农场

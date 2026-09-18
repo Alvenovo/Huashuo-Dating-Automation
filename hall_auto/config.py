@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,6 +110,7 @@ class Config:
     fixture_apps: FixtureApps
     update_fixture: UpdateFixture
     security: SecuritySettings
+    node_id: str
     raw: dict
 
     @property
@@ -253,5 +255,10 @@ def load_config(path: Path | None = None) -> Config:
             manifest=str(security_raw.get("manifest") or ""),
             manifest_scope=str(security_raw.get("manifest_scope") or "signable"),
         ),
+        # 节点标识：多机跑批时区分是哪台机器。优先 HALL_NODE_ID，其次 config，最后主机名。
+        node_id=os.environ.get("HALL_NODE_ID")
+        or str(data.get("node_id") or "")
+        or platform.node()
+        or "unknown-node",
         raw=data,
     )

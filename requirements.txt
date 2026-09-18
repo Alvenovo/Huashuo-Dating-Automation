@@ -1,5 +1,8 @@
+# 干净机器直接 pip install -r 就能跑；pywin32 是直接依赖（hall_auto/login.py 用 win32gui/win32process），
+# 不能靠 pywinauto 的传递依赖兜着。
 pytest>=8.0
 pyyaml>=6.0
 pillow>=10.0
 pywinauto>=0.6.8
+pywin32>=306
 
