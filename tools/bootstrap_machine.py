@@ -1,16 +1,30 @@
 """每台机器的一次性环境铺设（bootstrap）。
 
-用途：把一台裸的测试机变成「能跑本套 UI 自动化」的节点机。幂等，可重复执行。
+用途：把一台裸的测试机变成「能跑本套 UI 自动化」的节点机。**幂等，可重复执行。**
 
-做的事（按序）：
-  1. 环境自检：OS / 交互式会话 / Python 位数 / 7-Zip / 中文 OCR 语言包 / 管理员权限
-  2. 建 .venv 并装 requirements.txt
-  3. 校验夹具（大厅安装包 / 7z 夹具包 / 内部安全工具）是否就位，逐个查 SHA256
-  4. 生成该机自己的 config.local.yaml（路径 / 夹具 / node_id）
-  5. 连共享盘（配了 `package_share.dirs` 才做；凭据走 HALL_SHARE_USER/PASSWORD）
-  6. 准备安装包：本地 → 共享盘 → 下载（组长 2026-09-18 要求）
-  7. 建提权计划任务（装/卸用例需要）
-  8. 跑 tests/unit 自检
+## 核心原则：先检测、缺什么才装什么
+
+20 台机器环境**不一样**，有的可能已经有 Python、有大厅、有 7-Zip。
+所以每一步都先问「这个已经有了吗」，有了就跳过，没有才动手。
+**重跑本脚本不应该产生任何多余的安装动作，也不该碰网络。**
+
+各步骤的检测口径：
+
+| 步骤 | 检测什么 | 已有则 |
+| --- | --- | --- |
+| 1 环境自检 | OS / 交互式会话 / Python 位数 / 7-Zip / OCR 语言包 | 只报告，不改 |
+| 2 虚拟环境与依赖 | venv 在否；`requirements.txt` 哈希 + 关键包能否 import | 跳过 pip |
+| 3 夹具校验 | 逐个查 SHA256 | 只报告 |
+| 4 生成本机配置 | 逐字段 setdefault，只覆盖机器绑定项 | 保留原有 |
+| 5 连共享盘 | 先探测可达性 | 已达则不连 |
+| 6 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
+| 7 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
+| 8 自检 | 跑 tests/unit | 可 `--skip-selftest` |
+
+第 2 步的标记文件是 `.venv/.deps_ok`：装成功后写入 requirements.txt 的 SHA256，
+下次哈希一致且关键包都能 import 就跳过。标记只用于"快速跳过"，
+**不能单独作为依据**——标记可能被手工删或 venv 被清理，
+所以标记命中后仍会实际 import 校验一遍。
 
 注：**不修改显示缩放**。脚本走 Per-Monitor Aware 物理像素坐标，非 100% 不影响正确性
 （本机真实 150% 下 P0/P1/P2 全部套件实测跑通），缩放只作为环境事实记录进画像。
@@ -22,8 +36,8 @@
 选项：
     --installer-dir PATH   华硕大厅安装包目录（默认沿用现有 config.local.yaml 或内置默认）
     --node-id ID           本机节点标识（默认主机名）
-    --skip-venv            不重建虚拟环境
-    --skip-schtask         不建计划任务
+    --skip-venv            不检查虚拟环境与依赖
+    --skip-schtask         不检查/建计划任务
     --skip-selftest        不跑 tests/unit 自检
     --no-download          不下载安装包，只用本地已有的
     --skip-share           不尝试连接共享盘
@@ -60,6 +74,52 @@ REQUIRED_FILES = {
 }
 
 SELFTEST_MARKER = "unit"
+
+# 依赖装好后写的标记文件，内容 = requirements.txt 的 SHA256。
+# 下次 bootstrap 先比哈希，一致就直接跳过 pip（秒级）；不一致才走 pip + 校验。
+DEPS_MARKER_NAME = ".deps_ok"
+
+# 依赖齐不齐的快速校验项：import 名 -> 分发名（报错信息用）
+DEPS_PROBE = (
+    ("pytest", "pytest"),
+    ("pywinauto", "pywinauto"),
+    ("win32gui", "pywin32"),
+    ("PIL", "Pillow"),
+    ("yaml", "PyYAML"),
+)
+
+
+def _req_digest(req: Path) -> str:
+    """requirements.txt 的内容摘要；文件不存在返回空串。"""
+    try:
+        return hashlib.sha256(req.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _deps_probe(py: Path) -> tuple[bool, str]:
+    """在不装任何东西的前提下，确认关键依赖都能 import。
+
+    返回 (是否齐全, 说明)。只起一个 Python 进程，约 1~2 秒。
+    为什么不能只看标记文件：标记可能被手工删、venv 可能被人为清理过，
+    标记只说明"上次装成功过"，不代表现在还在。
+    """
+    code = ";".join(f"import {mod}" for mod, _ in DEPS_PROBE)
+    try:
+        proc = subprocess.run(
+            [str(py), "-c", code],
+            capture_output=True, text=True, check=False, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"校验进程起不来：{exc}"
+    if proc.returncode == 0:
+        return True, "关键依赖均可 import"
+    err = (proc.stderr or proc.stdout or "").strip().splitlines()
+    tail = err[-1] if err else f"rc={proc.returncode}"
+    missing = [dist for mod, dist in DEPS_PROBE if f"No module named '{mod}'" in (proc.stderr or "")]
+    if missing:
+        return False, f"缺 {', '.join(missing)}"
+    return False, tail[:200]
 
 
 class Step:
@@ -156,20 +216,55 @@ def step_env_check(node: str) -> Step:
 
 
 def step_venv(skip: bool) -> Step:
+    """虚拟环境与依赖：**先检测、缺什么才装什么**。
+
+    跳过条件（任一条满足即跳过 pip）：
+      1. `--skip-venv` 且 venv 已就位 —— 显式要求跳过
+      2. venv 在 + 标记文件哈希与 requirements.txt 一致 + 关键依赖都能 import
+    第 2 条是默认路径：本机铺过一次后，重跑 bootstrap 不该再碰网络。
+    """
     st = Step("虚拟环境与依赖")
     venv = REPO_ROOT / ".venv"
     py = venv / "Scripts" / "python.exe"
+    req = REPO_ROOT / "requirements.txt"
+    marker = venv / DEPS_MARKER_NAME
+
     if skip and py.is_file():
         st.log(f"按 --skip-venv 跳过（沿用 {py}）")
         return st
+
+    # ---- 检测 1：venv 是否存在 ----
     if not py.is_file():
         base = sys.executable
-        st.log(f"创建虚拟环境：{base} -m venv .venv")
+        st.log(f"未检测到虚拟环境，创建：{base} -m venv .venv")
         proc = subprocess.run([base, "-m", "venv", str(venv)], capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             st.fail(f"建 venv 失败 rc={proc.returncode}: {(proc.stderr or '')[:300]}")
             return st
-    req = REPO_ROOT / "requirements.txt"
+    else:
+        st.log(f"虚拟环境已在：{py}")
+
+    # ---- 检测 2：依赖是否齐全（先比哈希，再实际 import 校验）----
+    want = _req_digest(req)
+    if py.is_file() and want:
+        recorded = ""
+        try:
+            recorded = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            recorded = ""
+        if recorded == want:
+            ok, why = _deps_probe(py)
+            if ok:
+                st.log(f"依赖已就绪（requirements.txt 未变 + {why}），跳过安装")
+                _log_installed(py, st)
+                return st
+            st.log(f"标记说装过，但实测不齐（{why}）——重装")
+        elif recorded:
+            st.log("requirements.txt 有变动，重装依赖")
+        else:
+            st.log("无依赖标记（首次铺设或标记被清），按需安装")
+
+    # ---- 需要装：pip 本身幂等，已装的包会跳过 ----
     st.log(f"装依赖：{req.name}")
     proc = subprocess.run(
         [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", str(req)],
@@ -178,11 +273,27 @@ def step_venv(skip: bool) -> Step:
     if proc.returncode != 0:
         st.fail(f"pip install 失败 rc={proc.returncode}: {(proc.stderr or '')[-400:]}")
         return st
+
+    # ---- 装完复核，通过了才写标记（避免"装失败也被记为就绪"）----
+    ok, why = _deps_probe(py)
+    if not ok:
+        st.fail(f"pip 已跑完但依赖仍不齐：{why}")
+        return st
+    try:
+        marker.write_text(want, encoding="utf-8")
+        st.log(f"依赖安装完成，已记录标记 {marker.name}（{why}）")
+    except OSError as exc:
+        st.log(f"依赖装好了，但写标记失败（下次会重装）：{exc}")
+    _log_installed(py, st)
+    return st
+
+
+def _log_installed(py: Path, st: Step) -> None:
+    """把关键包版本打进日志，便于多机汇总时比对环境是否一致。"""
     proc = subprocess.run([str(py), "-m", "pip", "list"], capture_output=True, text=True, check=False)
     for line in (proc.stdout or "").splitlines():
         if line.lower().startswith(("pytest ", "pywinauto ", "pywin32 ", "pillow ", "pyyaml ")):
             st.log(f"  {line.strip()}")
-    return st
 
 
 def step_fixtures(installer_dir: Path) -> Step:
@@ -351,7 +462,26 @@ def step_write_local_config(installer_dir: Path, node: str) -> Step:
     return st
 
 
+def _task_action(task: str) -> str:
+    """读计划任务的动作命令行；不存在或读不到返回空串。
+
+    `schtasks /Query /XML` 比 `/FO LIST` 好解析，且能拿到完整命令行。
+    """
+    proc = subprocess.run(
+        f'schtasks /Query /TN {task} /XML',
+        shell=True, capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout or ""
+
+
 def step_schtask(skip: bool) -> Step:
+    """提权计划任务：**已存在且指向同一脚本就跳过**，不无脑重建。
+
+    重建的代价不是"多花几秒"，是**触发时间被重置**——如果正好在跑批，
+    重建会把任务状态抹掉。所以默认只检测，不覆盖。
+    """
     st = Step("提权计划任务")
     if skip:
         st.log("按 --skip-schtask 跳过")
@@ -361,6 +491,18 @@ def step_schtask(skip: bool) -> Step:
         return st
     task = "HallAutoP1"
     script = REPO_ROOT / "run_p1_apps.ps1"
+
+    # ---- 检测：任务已存在且动作指向本仓库的脚本 ----
+    xml = _task_action(task)
+    if xml:
+        # 只认「这个任务的 Command/Arguments 里出现了本仓库的脚本路径」
+        if script.name in xml and str(REPO_ROOT) in xml.replace("&amp;", "&"):
+            st.log(f"任务 {task} 已存在且指向本仓库脚本，跳过（覆盖会重置触发时间）")
+            st.log(f"触发：MSYS_NO_PATHCONV=1 schtasks /Run /TN {task}")
+            st.log(f"要强制重建：先 schtasks /Delete /TN {task} /F 再重跑本脚本")
+            return st
+        st.log(f"任务 {task} 已存在但指向别的脚本，将覆盖重建")
+
     cmd = (
         f'schtasks /Create /TN {task} /SC ONCE /ST 00:00 /RL HIGHEST /F '
         f'/TR "powershell -NoProfile -ExecutionPolicy Bypass -File {script}"'
