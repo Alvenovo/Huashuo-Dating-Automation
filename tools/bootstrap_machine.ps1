@@ -11,9 +11,11 @@ param(
     [string]$InstallerDir = "",
     [string]$NodeId = "",
     [switch]$SkipVenv,
-    [switch]$SkipScale,
     [switch]$SkipSchtask,
-    [switch]$SkipSelftest
+    [switch]$SkipSelftest,
+    [switch]$SkipShare,
+    [switch]$SkipFarm,
+    [switch]$NoDownload
 )
 
 $repo = Split-Path -Parent $PSScriptRoot
@@ -27,9 +29,11 @@ $argv = @("$repo\tools\bootstrap_machine.py")
 if ($InstallerDir) { $argv += @("--installer-dir", $InstallerDir) }
 if ($NodeId) { $argv += @("--node-id", $NodeId) }
 if ($SkipVenv) { $argv += "--skip-venv" }
-if ($SkipScale) { $argv += "--skip-scale" }
 if ($SkipSchtask) { $argv += "--skip-schtask" }
 if ($SkipSelftest) { $argv += "--skip-selftest" }
+if ($SkipShare) { $argv += "--skip-share" }
+if ($SkipFarm) { $argv += "--skip-farm" }
+if ($NoDownload) { $argv += "--no-download" }
 
 Write-Host "bootstrap: repo=$repo python=$py"
 & $py -X utf8 @argv
