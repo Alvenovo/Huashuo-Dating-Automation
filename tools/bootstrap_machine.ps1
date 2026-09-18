@@ -1,16 +1,19 @@
 # One-shot machine bootstrap wrapper. ASCII only on purpose:
 # PowerShell 5.1 misreads BOM-less UTF-8 as ANSI and collapses lines.
+# (Keep it that way -- the real installer dir may contain non-ASCII characters,
+#  but it is passed through as an opaque string, so this file never needs them.)
 #
 # Runs tools\bootstrap_machine.py with the repo's venv python (falls back to system python
 # when the venv does not exist yet, which is the normal case on a fresh machine).
 #
-# Usage (elevation recommended; step 6 needs admin):
+# Usage (elevation recommended; steps 4 and 10 need admin):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\bootstrap_machine.ps1
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\bootstrap_machine.ps1 -InstallerDir "D:\Test\华硕大厅"
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\bootstrap_machine.ps1 -InstallerDir "D:\Test\hall"
 param(
     [string]$InstallerDir = "",
     [string]$NodeId = "",
     [switch]$SkipVenv,
+    [switch]$SkipSevenZip,
     [switch]$SkipSchtask,
     [switch]$SkipSelftest,
     [switch]$SkipShare,
@@ -29,6 +32,7 @@ $argv = @("$repo\tools\bootstrap_machine.py")
 if ($InstallerDir) { $argv += @("--installer-dir", $InstallerDir) }
 if ($NodeId) { $argv += @("--node-id", $NodeId) }
 if ($SkipVenv) { $argv += "--skip-venv" }
+if ($SkipSevenZip) { $argv += "--skip-seven-zip" }
 if ($SkipSchtask) { $argv += "--skip-schtask" }
 if ($SkipSelftest) { $argv += "--skip-selftest" }
 if ($SkipShare) { $argv += "--skip-share" }

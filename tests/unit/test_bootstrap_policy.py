@@ -239,3 +239,155 @@ def test_task_action_returns_empty_when_query_fails(bm):
     """查询失败（任务不存在 / 权限不足）返回空串，不抛异常。"""
     with mock.patch.object(bm.subprocess, "run", return_value=_fake_run(returncode=1, stderr="找不到")):
         assert bm._task_action("NoSuchTask") == ""
+
+
+# ---------------- 7-Zip 自动安装 ----------------
+#
+# 这条策略的由来：原实现只在环境自检里"检测"7-Zip，缺了就让测试人员自己去官网下载。
+# 但钉住包本来就在 installer_dir/fixtures/7z2602-x64.exe（reset_fixture.py 早就用它静默装了），
+# 包在手边还让人跑一趟官网没有道理。改成缺了自动装。
+#
+# 三条边界必须钉死：
+#   1. 已装 -> 一个安装动作都不许有（幂等，不能每台机器白装一遍）
+#   2. 非管理员 -> 不调安装器（会弹 UAC 把脚本卡死），且**不算失败**
+#   3. 装不上 -> **不算失败**（只影响 P2 套件，不能把整台机器的铺设判死）
+
+
+def _installer_that_creates(target: Path):
+    """假的静默安装器：被调用时"装上"7z.exe，模拟真实安装效果。"""
+
+    def _run(argv, **kwargs):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"fake 7z.exe")
+        return _fake_run()
+
+    return _run
+
+
+def test_seven_zip_skips_install_when_already_present(bm, tmp_path):
+    """已装 -> 跳过，**不执行任何安装动作**。"""
+    exe = tmp_path / "7z.exe"
+    exe.write_bytes(b"already here")
+    with mock.patch.object(bm, "SEVEN_ZIP_EXE", exe), \
+         mock.patch.object(bm.subprocess, "run") as run:
+        st = bm.step_seven_zip(tmp_path, allow_download=True)
+
+    assert st.ok
+    assert any("已就位" in line for line in st.detail)
+    assert not run.called, "已装就不该再调安装器"
+
+
+def test_seven_zip_installs_from_local_fixture(bm, tmp_path):
+    """未装 + 本地有钉住包 -> 静默安装，并确认 7z.exe 出现。"""
+    exe = tmp_path / "prog" / "7z.exe"          # 目标位置（一开始不存在）
+    fixture = tmp_path / "fixtures" / "7z2602-x64.exe"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"x")
+    real_sha = bm.SEVEN_ZIP_FIXTURE_SHA256
+    with mock.patch.object(bm, "SEVEN_ZIP_EXE", exe), \
+         mock.patch.object(bm, "SEVEN_ZIP_FIXTURE_SHA256", bm.sha256_of(fixture)), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch.object(bm.subprocess, "run", side_effect=_installer_that_creates(exe)) as run:
+        st = bm.step_seven_zip(tmp_path, allow_download=True)
+
+    assert st.ok
+    assert exe.is_file(), "装完 7z.exe 应存在"
+    assert run.called
+    argv = run.call_args_list[0][0][0]
+    assert argv[0].endswith("7z2602-x64.exe") and argv[1] == "/S", f"应走静默安装：{argv}"
+    assert bm.SEVEN_ZIP_FIXTURE_SHA256 == real_sha  # 别把常量改了忘了还原
+
+
+def test_seven_zip_needs_admin_and_does_not_fail(bm, tmp_path):
+    """非管理员 -> 不调安装器（否则弹 UAC 卡死），且**不算失败**。"""
+    exe = tmp_path / "prog" / "7z.exe"
+    fixture = tmp_path / "fixtures" / "7z2602-x64.exe"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"x")
+    with mock.patch.object(bm, "SEVEN_ZIP_EXE", exe), \
+         mock.patch.object(bm, "is_admin", return_value=False), \
+         mock.patch.object(bm.subprocess, "run") as run:
+        st = bm.step_seven_zip(tmp_path, allow_download=True)
+
+    assert st.ok is True, "只影响 P2，不该把整台机器判死"
+    assert not run.called, "非管理员不能调安装器"
+    assert any("管理员" in line for line in st.detail)
+
+
+def test_seven_zip_no_download_skips_missing_fixture(bm, tmp_path):
+    """钉住包不在本地 + --no-download -> 不下载、不失败。"""
+    exe = tmp_path / "prog" / "7z.exe"
+    with mock.patch.object(bm, "SEVEN_ZIP_EXE", exe), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch.object(bm.subprocess, "run") as run:
+        st = bm.step_seven_zip(tmp_path, allow_download=False)
+
+    assert st.ok is True
+    assert not run.called
+    assert any("--no-download" in line for line in st.detail)
+
+
+def test_seven_zip_downloads_fixture_when_missing(bm, tmp_path):
+    """本地没有 + 允许下载 -> 从官方源取钉住包再装。"""
+    exe = tmp_path / "prog" / "7z.exe"
+    fixture = tmp_path / "fixtures" / "7z2602-x64.exe"
+
+    def _fake_download(url, dest, timeout_sec, retries):
+        assert url == bm.SEVEN_ZIP_URL
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest).write_bytes(b"x")
+
+    with mock.patch.object(bm, "SEVEN_ZIP_EXE", exe), \
+         mock.patch.object(bm, "SEVEN_ZIP_FIXTURE_SHA256", "deadbeef"), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch("hall_auto.fetch._download", side_effect=_fake_download) as dl, \
+         mock.patch.object(bm.subprocess, "run", side_effect=_installer_that_creates(exe)):
+        st = bm.step_seven_zip(tmp_path, allow_download=True)
+
+    assert dl.called, "本地没有就该去官方源取"
+    assert fixture.is_file()
+    assert any("官方源" in line for line in st.detail)
+
+
+def test_seven_zip_rejects_fixture_with_wrong_sha(bm, tmp_path):
+    """钉住包被换过（sha256 不符）-> 不用它安装，且不失败。"""
+    exe = tmp_path / "prog" / "7z.exe"
+    fixture = tmp_path / "fixtures" / "7z2602-x64.exe"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"tampered")
+    with mock.patch.object(bm, "SEVEN_ZIP_EXE", exe), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch.object(bm.subprocess, "run") as run:
+        st = bm.step_seven_zip(tmp_path, allow_download=False)
+
+    assert st.ok is True
+    assert not run.called, "摘要不符的包不能拿去装"
+    assert any("sha256 不符" in line for line in st.detail)
+
+
+def test_seven_zip_timeout_does_not_fail(bm, tmp_path):
+    """安装器跑了但 7z.exe 一直没出现 -> 只提示，不算失败。"""
+    exe = tmp_path / "prog" / "7z.exe"
+    fixture = tmp_path / "fixtures" / "7z2602-x64.exe"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"x")
+    # 第一次 time() 算 deadline，之后直接越过，让等待循环只走一轮。
+    with mock.patch.object(bm, "SEVEN_ZIP_EXE", exe), \
+         mock.patch.object(bm, "SEVEN_ZIP_FIXTURE_SHA256", bm.sha256_of(fixture)), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run()), \
+         mock.patch.object(bm.time, "time", side_effect=[0, 10_000]), \
+         mock.patch.object(bm.time, "sleep"):
+        st = bm.step_seven_zip(tmp_path, allow_download=False)
+
+    assert st.ok is True, "装不上只影响 P2，不该把整台机器判死"
+    assert any("未见" in line for line in st.detail)
+
+
+def test_seven_zip_skip_flag(bm, tmp_path):
+    """--skip-seven-zip 直接跳过，不检测也不装。"""
+    with mock.patch.object(bm.subprocess, "run") as run:
+        st = bm.step_seven_zip(tmp_path, allow_download=True, skip=True)
+    assert st.ok
+    assert not run.called
+    assert any("--skip-seven-zip" in line for line in st.detail)

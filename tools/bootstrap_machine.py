@@ -15,11 +15,21 @@
 | 1 环境自检 | OS / 交互式会话 / Python 位数 / 7-Zip / OCR 语言包 | 只报告，不改 |
 | 2 虚拟环境与依赖 | venv 在否；`requirements.txt` 哈希 + 关键包能否 import | 跳过 pip |
 | 3 夹具校验 | 逐个查 SHA256 | 只报告 |
-| 4 生成本机配置 | 逐字段 setdefault，只覆盖机器绑定项 | 保留原有 |
-| 5 连共享盘 | 先探测可达性 | 已达则不连 |
-| 6 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
-| 7 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
-| 8 自检 | 跑 tests/unit | 可 `--skip-selftest` |
+| 4 **7-Zip** | `C:/Program Files/7-Zip/7z.exe` 在否 | 跳过（不重复安装） |
+| 5 生成本机配置 | 逐字段 setdefault，只覆盖机器绑定项 | 保留原有 |
+| 6 生成节点凭据模板 | `farm_node.env` 在否 | 只报键名，绝不覆盖 |
+| 7 连共享盘 | 先探测可达性 | 已达则不连 |
+| 8 农场目录 | `tasks/ done/ results/ logs/` 齐否 | 齐则跳过 |
+| 9 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
+| 10 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
+| 11 自检 | 跑 tests/unit | 可 `--skip-selftest` |
+
+第 4 步为什么是**装**而不是**只检测**：`hall_auto/security.py` 的 P2 安全验证要用
+`7z x` 解包待检安装包。这个钉住包本来就在 `installer_dir/fixtures/7z2602-x64.exe`
+（`tools/reset_fixture.py` 早就用它静默装了），没理由再让人去官网手动下一趟。
+装的是**钉住的 26.02 而非最新版** —— 它同时是 P1-A「更新夹具」的起点
+（大厅目录里的 7-Zip 比它新，更新列表里才永远有它可更新）。
+装不上**不算铺设失败**：只影响 P2，且 P2 还要内部安全工具才能跑。
 
 第 2 步的标记文件是 `.venv/.deps_ok`：装成功后写入 requirements.txt 的 SHA256，
 下次哈希一致且关键包都能 import 就跳过。标记只用于"快速跳过"，
@@ -37,6 +47,7 @@
     --installer-dir PATH   华硕大厅安装包目录（默认沿用现有 config.local.yaml 或内置默认）
     --node-id ID           本机节点标识（默认主机名）
     --skip-venv            不检查虚拟环境与依赖
+    --skip-seven-zip       不检查/自动安装 7-Zip
     --skip-schtask         不检查/建计划任务
     --skip-selftest        不跑 tests/unit 自检
     --no-download          不下载安装包，只用本地已有的
@@ -55,6 +66,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from shutil import which
@@ -72,6 +84,13 @@ REQUIRED_FILES = {
     # 相对 installer_dir 的相对路径 -> 说明
     "7z2602-x64.exe": "7-Zip 更新夹具包（fixtures/ 下，路径见下）",
 }
+
+# 7-Zip 安装位置（`hall_auto/config.py` 的 security.seven_zip 默认值，两处必须一致）。
+SEVEN_ZIP_EXE = Path("C:/Program Files/7-Zip/7z.exe")
+
+# 钉住的 7-Zip 26.02：官方包固定摘要（与 step_fixtures / config.yaml 钉的是同一个包）。
+SEVEN_ZIP_FIXTURE_SHA256 = "6745fa76dc2ea031596d8678f6f6b99c3c1b435b4164a63485adbbc7b8d82ef0"
+SEVEN_ZIP_URL = "https://www.7-zip.org/a/7z2602-x64.exe"
 
 # 节点本地凭据文件的名字（仓库根下，已在 .gitignore）。
 # 与 hall_auto/env_pack.NODE_ENV_FILENAME 是同一条约定，这里 import 过来免得抄错。
@@ -203,11 +222,13 @@ def step_env_check(node: str) -> Step:
         st.fail("当前非交互式会话（锁屏/息屏/RDP 断开），跑批会批量失败；请保持本地解锁桌面")
     if not is_admin():
         st.log("当前非管理员：第 6 步建计划任务会失败，P0 安装层与 P1-A 真装真卸也跑不了")
-    seven_zip = Path("C:/Program Files/7-Zip/7z.exe")
+    seven_zip = SEVEN_ZIP_EXE
     if seven_zip.is_file():
         st.log(f"7-Zip 就位：{seven_zip}")
     else:
-        st.fail(f"缺 7-Zip：{seven_zip}（P2 安全验证解包要用，装完后重跑本脚本）")
+        # 这里**不判 fail**：下一步「7-Zip」会尝试自动装。装不上也只影响 P2 套件，
+        # 不该把整台机器的铺设判死（P2 还要内部安全工具，多数机器本来就不跑）。
+        st.log(f"未装 7-Zip（{seven_zip}）—— 下一步会尝试自动安装")
     # 中文 OCR 语言包（tools/ocr_text.ps1 兜底路用到）
     try:
         proc = subprocess.run(
@@ -324,14 +345,15 @@ def step_fixtures(installer_dir: Path) -> Step:
     seven_zip = installer_dir / "fixtures" / "7z2602-x64.exe"
     if seven_zip.is_file():
         digest = sha256_of(seven_zip)
-        # 官方 26.02 包的固定摘要（config.yaml 里也钉着，两处必须一致）
-        expected = "6745fa76dc2ea031596d8678f6f6b99c3c1b435b4164a63485adbbc7b8d82ef0"
-        if digest == expected:
+        if digest == SEVEN_ZIP_FIXTURE_SHA256:
             st.log(f"7-Zip 更新夹具包 OK（sha256 {digest[:16]}…）")
         else:
-            st.fail(f"7-Zip 夹具包 sha256 不符：期望 {expected[:16]}… 实际 {digest[:16]}…（本地包被换过）")
+            st.fail(
+                f"7-Zip 夹具包 sha256 不符：期望 {SEVEN_ZIP_FIXTURE_SHA256[:16]}… "
+                f"实际 {digest[:16]}…（本地包被换过）"
+            )
     else:
-        st.log(f"缺 7-Zip 更新夹具包：{seven_zip}（P1-A 更新用例要，可从 https://www.7-zip.org/a/7z2602-x64.exe 下）")
+        st.log(f"暂无 7-Zip 更新夹具包：{seven_zip}（下一步会按需从 {SEVEN_ZIP_URL} 取）")
     tools_dir = installer_dir / "fixtures" / "security_tools"
     wanted = ["CheckAppV.exe", "SignCheck_v2.ps1"]
     missing = [n for n in wanted if not (tools_dir / n).is_file()]
@@ -339,6 +361,80 @@ def step_fixtures(installer_dir: Path) -> Step:
         st.log(f"内部安全工具缺 {missing}（{tools_dir}）—— 仅 P2 安全验证受影响，会 skip")
     else:
         st.log(f"内部安全工具就位：{tools_dir}")
+    return st
+
+
+def step_seven_zip(installer_dir: Path, allow_download: bool, skip: bool = False) -> Step:
+    """确保 7-Zip 可用：缺了就自动装（本地钉住包优先，其次官方源）。
+
+    为什么这一步是"装"而不是"只检测、缺了让人去下"：
+    `hall_auto/security.py::extract_package` 用 `7z x` 解包待检安装包，
+    而那个钉住包本来就在 `installer_dir/fixtures/7z2602-x64.exe`
+    （`tools/reset_fixture.py` 早就用它静默装了）。既然包在手边，就不该让人再跑一趟官网。
+
+    装的是**钉住的 26.02，不是最新版**：它同时是 P1-A「更新夹具」的起点
+    （大厅目录里的 7-Zip 比它新，更新列表里才永远有它可更新）。
+    装最新版会让 `test_update_fixture_via_hall` 的起点断言失配、用例转 skip。
+
+    装不上**不算铺设失败**：只影响 P2 套件，而 P2 还要内部安全工具才能跑。
+    """
+    st = Step("7-Zip")
+    if skip:
+        st.log("按 --skip-seven-zip 跳过")
+        return st
+    if SEVEN_ZIP_EXE.is_file():
+        st.log(f"已就位：{SEVEN_ZIP_EXE}（未安装任何东西）")
+        return st
+
+    if not is_admin():
+        # 装到 C:\\Program Files 需要管理员；非提权直接调安装器会弹 UAC 把脚本卡死。
+        st.log(
+            f"未装 7-Zip 且当前非管理员 —— 装到 {SEVEN_ZIP_EXE.parent} 需要管理员，跳过自动安装。"
+            "以管理员重跑本脚本即可自动装；仅 P2 安全验证受影响（会 skip）"
+        )
+        return st
+
+    installer = installer_dir / "fixtures" / "7z2602-x64.exe"
+    if not installer.is_file():
+        if not allow_download:
+            st.log(f"钉住包不在本地（{installer}），--no-download 下不下载；仅 P2 安全验证受影响（会 skip）")
+            return st
+        try:
+            installer.parent.mkdir(parents=True, exist_ok=True)
+            # 复用 fetch 的下载：带 .part 原子改名 + 递增重试，比这里重写一份稳。
+            from hall_auto.fetch import _download
+
+            _download(SEVEN_ZIP_URL, installer, timeout_sec=60, retries=3)
+            st.log(f"已从官方源取到钉住包：{SEVEN_ZIP_URL}")
+        except Exception as exc:
+            st.log(f"钉住包取不到（{exc}）；仅 P2 安全验证受影响（会 skip），其余套件不受影响")
+            return st
+
+    digest = sha256_of(installer)
+    if digest != SEVEN_ZIP_FIXTURE_SHA256:
+        st.log(
+            f"钉住包 sha256 不符（期望 {SEVEN_ZIP_FIXTURE_SHA256[:16]}… 实际 {digest[:16]}…），"
+            "不用它安装；仅 P2 安全验证受影响（会 skip）"
+        )
+        return st
+
+    st.log(f"未装 7-Zip，静默安装钉住版本 26.02：{installer}")
+    try:
+        proc = subprocess.run([str(installer), "/S"], capture_output=True, check=False, timeout=180)
+    except subprocess.SubprocessError as exc:
+        st.log(f"安装器起不来（{exc}）；仅 P2 安全验证受影响（会 skip）")
+        return st
+
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if SEVEN_ZIP_EXE.is_file():
+            st.log(f"安装完成：{SEVEN_ZIP_EXE}")
+            return st
+        time.sleep(2)
+    st.log(
+        f"装完 120s 未见 {SEVEN_ZIP_EXE}（安装器 rc={proc.returncode}）；"
+        "仅 P2 安全验证受影响（会 skip），其余套件不受影响"
+    )
     return st
 
 
@@ -654,6 +750,7 @@ def main() -> int:
     parser.add_argument("--installer-dir", default="")
     parser.add_argument("--node-id", default="")
     parser.add_argument("--skip-venv", action="store_true")
+    parser.add_argument("--skip-seven-zip", action="store_true", help="不检查/自动安装 7-Zip")
     parser.add_argument("--skip-schtask", action="store_true")
     parser.add_argument("--skip-selftest", action="store_true")
     parser.add_argument("--skip-share", action="store_true", help="不尝试连接共享盘")
@@ -686,6 +783,7 @@ def main() -> int:
     run(step_env_check(node))
     run(step_venv(args.skip_venv))
     run(step_fixtures(installer_dir))
+    run(step_seven_zip(installer_dir, allow_download=not args.no_download, skip=args.skip_seven_zip))
     run(step_write_local_config(installer_dir, node))
     run(step_node_env_template())
     run(step_share_login(args.skip_share))
