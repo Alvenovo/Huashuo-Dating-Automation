@@ -14,6 +14,7 @@ from pathlib import Path
 from PIL import Image
 
 from hall_auto.config import REPO_ROOT
+from hall_auto.dpi import machine_profile, node_id
 from hall_auto.screen import grab_virtual_screen
 
 EVIDENCE_ROOT = REPO_ROOT / "reports" / "evidence"
@@ -27,9 +28,15 @@ OUTCOME_FAILED = "failed"
 OUTCOME_SKIPPED = "skipped"
 
 
-def new_run_dir(root: Path = EVIDENCE_ROOT) -> Path:
+def new_run_dir(root: Path = EVIDENCE_ROOT, node: str | None = None) -> Path:
+    """多机并行时目录带节点前缀，避免 20 台回传撞名（同日同时分）。
+
+    形如 `R12_2026-09-18_1030`；单机场景前缀仍会带（来自主机名），便于事后追溯是哪台跑的。
+    """
     root.mkdir(parents=True, exist_ok=True)
-    base = root / datetime.now().strftime("%Y-%m-%d_%H%M")
+    prefix = _safe_name(node or node_id(), limit=24)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    base = root / f"{prefix}_{stamp}"
     cand, n = base, 1
     while cand.exists():
         n += 1
@@ -131,7 +138,9 @@ class EvidenceSession:
         total_s = round(sum(r.duration_s for r in self.records), 2)
         summary = {
             "run": self.run_dir.name,
+            "node": node_id(),
             "machine": platform.node(),
+            "profile": machine_profile(),
             "mode": self.mode,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
             "total": len(self.records),
@@ -265,6 +274,19 @@ def _render_html(summary: dict, run_dir: Path | None = None) -> str:
             f'<td>{img}</td></tr>'
         )
     body_rows = "\n".join(rows) or '<tr><td colspan="5" class="noimg">本轮无用例</td></tr>'
+    profile = summary.get("profile") or {}
+    node = summary.get("node") or summary.get("machine") or "unknown"
+    env_line = " &nbsp;·&nbsp; ".join(
+        part
+        for part in (
+            f"节点: <b>{html.escape(str(node))}</b>",
+            f"系统: {html.escape(str(profile.get('os', '')))}" if profile.get("os") else "",
+            f"缩放: {profile.get('scale_percent', '?')}%",
+            f"分辨率: {html.escape(str(profile.get('screen', '')))}" if profile.get("screen") else "",
+            f"Python: {html.escape(str(profile.get('python', '')))}" if profile.get("python") else "",
+        )
+        if part
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -277,7 +299,8 @@ def _render_html(summary: dict, run_dir: Path | None = None) -> str:
 <div class="wrap">
   <header class="top">
     <h1>华硕大厅自动化 · 证据汇总报告</h1>
-    <div class="meta">Run: <b>{html.escape(summary["run"])}</b> &nbsp;·&nbsp; 机器: {html.escape(summary["machine"])} &nbsp;·&nbsp; 总耗时: {summary["duration_s"]}s &nbsp;·&nbsp; 采集策略: {html.escape(summary["mode"])}</div>
+    <div class="meta">Run: <b>{html.escape(summary["run"])}</b> &nbsp;·&nbsp; 总耗时: {summary["duration_s"]}s &nbsp;·&nbsp; 采集策略: {html.escape(summary["mode"])}</div>
+    <div class="meta" style="margin-top:4px">{env_line}</div>
     <div class="stats">
       <div class="stat"><div class="n">{summary["total"]}</div><div class="l">用例总数</div></div>
       <div class="stat pass"><div class="n">{summary["passed"]}</div><div class="l">通过</div></div>

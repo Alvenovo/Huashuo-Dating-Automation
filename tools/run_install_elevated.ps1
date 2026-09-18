@@ -1,6 +1,7 @@
 # Runs the install layer (P0-01/P0-02) and logs pytest output as raw UTF-8 bytes.
 # ASCII only on purpose: PowerShell 5.1 misreads BOM-less UTF-8 as ANSI and collapses lines.
-$repo = "C:\Users\admin\Desktop\Huashuo-Dating-Automation"
+# Repo root comes from this script's own location, so the same file works on every machine.
+$repo = Split-Path -Parent $PSScriptRoot
 $log = "$repo\reports\install_run.log"
 $trace = "$repo\reports\install_trace.log"
 try {
