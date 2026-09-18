@@ -171,7 +171,12 @@ def run_suite(
     log_path: Path,
     *,
     task_env: dict[str, str] | None = None,
-) -> int:
+) -> tuple[int, dict[str, bool]]:
+    """跑一个套件。返回 (退出码, 本轮凭据状态)。
+
+    凭据状态一并返回，是因为调用方写回执时要用它 —— 再算一遍 `build_suite_env`
+    没有意义（同参数必得同结果），还会多读一次节点凭据文件。
+    """
     py = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
     if not py.is_file():
         py = Path(sys.executable)
@@ -192,7 +197,7 @@ def run_suite(
         )
         fh.flush()
         proc = subprocess.run(argv, cwd=str(REPO_ROOT), env=env, stdout=fh, stderr=subprocess.STDOUT, check=False)
-    return proc.returncode
+    return proc.returncode, creds
 
 
 def newest_run_dir() -> Path | None:
@@ -216,7 +221,7 @@ def main() -> int:
 
     if args.local:
         log = REPO_ROOT / "reports" / "farm" / f"local_{args.local}.log"
-        rc = run_suite(args.local, args.shard_id, args.shard_count, log)
+        rc, _creds = run_suite(args.local, args.shard_id, args.shard_count, log)
         print(f"套件 {args.local} 退出码 {rc}，日志 {log}")
         return rc
 
@@ -251,12 +256,13 @@ def main() -> int:
         print(f"取到任务 {task_id}")
         log = root / "logs" / f"{node}_{task_id}.log"
         results: list[dict] = []
+        creds: dict[str, bool] = {}
         for entry in task.get("suites") or []:
             name = str(entry.get("name") or "")
             sid = int(entry.get("shard_id") or 1)
             scount = int(entry.get("shard_count") or 1)
             print(f"  跑 {name}（分片 {sid}/{scount}）")
-            rc = run_suite(name, sid, scount, log, task_env=task_env)
+            rc, creds = run_suite(name, sid, scount, log, task_env=task_env)
             run_dir = newest_run_dir()
             results.append({"suite": name, "shard_id": sid, "shard_count": scount, "exit_code": rc,
                             "run_dir": run_dir.name if run_dir else None})
@@ -272,13 +278,13 @@ def main() -> int:
 
         # 凭据状态写进回执：报告里能区分「这台没配凭据 → 一片 skip」和「用例真跳过」。
         # 不写的话，汇总表上只有一堆黄色，看不出根因是环境没铺好。
-        suite_env, _notes = build_suite_env(task_env=task_env, node_env_path=NODE_ENV_PATH)
+        # creds 直接取自最后一个套件的 run_suite 结果（同参数合成必然同结果，不重算）。
         summary = {
             "task_id": task_id,
             "node": node,
             "profile": machine_profile(),
             "interactive": is_interactive_session(),
-            "credentials": credential_status(suite_env),
+            "credentials": creds,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
             "results": results,
         }

@@ -15,13 +15,11 @@ from hall_auto import profile
 def test_webview2_version_reads_pv():
     with mock.patch.object(profile, "_read_reg", return_value="153.0.4234.32"):
         assert profile.webview2_version() == "153.0.4234.32"
-        assert profile.webview2_installed() is True
 
 
 def test_webview2_missing_returns_empty():
     with mock.patch.object(profile, "_read_reg", return_value=""):
         assert profile.webview2_version() == ""
-        assert profile.webview2_installed() is False
 
 
 def test_webview2_falls_back_to_user_hive():

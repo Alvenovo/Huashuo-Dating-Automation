@@ -54,10 +54,10 @@ def _webview2() -> tuple[str, str]:
     实现已下沉到 `hall_auto.profile`（单一权威），这里只做薄包装，
     免得跟 `dpi.machine_profile()` 的字段口径漂成两份。
     """
-    from hall_auto.profile import webview2_installed, webview2_version
+    from hall_auto.profile import webview2_version
 
     version = webview2_version()
-    return ("yes" if webview2_installed() else "no"), version
+    return ("yes" if version else "no"), version
 
 
 def _hall_installed() -> tuple[str, str]:

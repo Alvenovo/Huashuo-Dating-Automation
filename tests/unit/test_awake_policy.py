@@ -3,12 +3,11 @@
 组长 2026-09-18 确认测试机无人碰屏，脚本必须自己保证不息屏 —— 息屏后抓屏全黑，
 点击无落点，产出的是假失败。这里钉住 API 用法与还原行为、巡检中止策略。
 
-## 为什么 keep_awake() 不再自己还原
+## 还原为什么在 atexit
 
 pytest 的 session fixture teardown 之后到进程真正退出之间还有一段
 （报告生成、证据落盘、agent 回传）。原来在 teardown 就还原，长套件中间那一空档
 足够息屏。改成：常亮持续到进程退出，由 `atexit` 统一还原。
-`keep_awake()` 仍保留给"短命用法"（单跑一条用例），只是它自己不调还原。
 """
 
 from __future__ import annotations
@@ -35,27 +34,6 @@ def test_stop_resets_to_continuous_only():
     assert call.call_args.args[0] == awake.ES_CONTINUOUS
 
 
-def test_context_manager_does_not_restore_immediately():
-    """keep_awake() 退出**不**立刻还原 —— 还原交给进程退出时的 atexit。
-
-    这是刻意的行为改变：teardown 就还原会让长套件中途息屏。
-    """
-    with mock.patch.object(awake.ctypes.windll.kernel32, "SetThreadExecutionState", return_value=1) as call:
-        with awake.keep_awake():
-            assert call.call_count == 1
-    assert call.call_count == 1, "退出上下文不该调还原（还原在 atexit）"
-
-
-def test_context_manager_does_not_restore_on_exception():
-    with mock.patch.object(awake.ctypes.windll.kernel32, "SetThreadExecutionState", return_value=1) as call:
-        try:
-            with awake.keep_awake():
-                raise RuntimeError("用例炸了")
-        except RuntimeError:
-            pass
-    assert call.call_count == 1, "异常路径同样交给 atexit 兜底"
-
-
 def test_atexit_handler_restores():
     """atexit 处理器必须真调还原（这是唯一的还原点）。"""
     with mock.patch.object(awake.ctypes.windll.kernel32, "SetThreadExecutionState", return_value=1) as call:
@@ -70,16 +48,6 @@ def test_start_failure_is_reported_not_raised():
         awake.ctypes.windll.kernel32, "SetThreadExecutionState", side_effect=OSError("no such api")
     ):
         assert awake.keep_awake_start() is False
-
-
-def test_context_manager_no_stop_when_start_failed():
-    """启动就没成功时，退出上下文不该报错（还原交给 atexit，不需要在这里判断）。"""
-    with mock.patch.object(
-        awake.ctypes.windll.kernel32, "SetThreadExecutionState", side_effect=OSError("no such api")
-    ) as call:
-        with awake.keep_awake() as started:
-            assert started is False
-    assert call.call_count == 1
 
 
 def test_session_lost_starts_clean_and_records():
@@ -129,13 +97,3 @@ def test_keep_awake_for_process_is_idempotent():
         awake._watch_thread = None
         awake._watch_stop = awake.threading.Event()
         awake._watch_armed = False
-
-
-def test_interactive_session_is_cached():
-    """交互态探测带缓存：巡检线程每秒调一次，不该每秒真枚举一次窗口。"""
-    awake._interactive_cache_value = None
-    with mock.patch("hall_auto.dpi.is_interactive_session", return_value=True) as probe:
-        assert awake.is_interactive_session() is True
-        assert awake.is_interactive_session() is True
-    assert probe.call_count == 1, "缓存期内不该重复探测"
-    awake._interactive_cache_value = None

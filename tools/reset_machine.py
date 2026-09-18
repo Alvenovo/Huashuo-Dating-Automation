@@ -66,8 +66,11 @@ def dry_run_report(cfg, *, allow_download: bool = True) -> dict:
 
     **包预检结果要显示出来**，因为它是"能不能卸"的前置条件：包拿不到时，
     真跑会拒绝卸载。预演里先看到，比真跑时吃一个 ResetBlocked 强。
+
+    每个包的取用动作（本地 / 缓存 / 共享盘 / 下载）**直接用预检结果** ——
+    `check_packages_available` 已经逐包探过，这里不再重探一遍共享盘
+    （UNC 不可达时每次探测最多 5s 超时，重复探会白等）。
     """
-    from hall_auto.fetch import share_dirs, share_reachable
     from hall_auto.installer import check_packages_available, reset_allowed
 
     existing = read_installed()
@@ -101,20 +104,31 @@ def dry_run_report(cfg, *, allow_download: bool = True) -> dict:
             "uninstall_string": existing.uninstall_string,
         })
 
-    shares = share_dirs(cfg)
-    share_state: list[dict] = []
-    for d in shares:
-        ok, why = share_reachable(d)
-        share_state.append({"dir": str(d), "reachable": ok, "why": why})
-
-    for name in configured_filenames(cfg):
-        local = cfg.installer_dir / name
-        if local.is_file():
-            lines.append({"action": "use-local", "filename": name})
-        elif any(s["reachable"] for s in share_state):
-            lines.append({"action": "copy-from-share", "filename": name})
+    # 共享盘状态从预检结果里取，不再自己探一遍网络。
+    share_state = [
+        {"dir": r["share"], "reachable": bool(r.get("reachable")), "why": r.get("why", "")}
+        for r in pack_results if "share" in r
+    ]
+    source_action = {
+        "local": "use-local",
+        "cache": "use-cache",
+        "share": "copy-from-share",
+        "download": "download",
+    }
+    for r in pack_results:
+        name = r.get("filename")
+        if not name:
+            continue
+        action = source_action.get(str(r.get("source") or ""))
+        if action:
+            lines.append({"action": action, "filename": name})
         else:
-            lines.append({"action": "download", "filename": name})
+            # 没有可用来源：老实说"拿不到"，不要显示成 download 装作有路可走。
+            lines.append({
+                "action": "blocked",
+                "filename": name,
+                "why": r.get("error") or "本地 / 缓存 / 共享盘都没有可用来源",
+            })
     return {
         "dry_run": True,
         "plan": lines,
@@ -170,12 +184,16 @@ def main() -> int:
                     say(f"  卸载 {line['display_name']} {line['display_version']} @ {line['install_dir']}")
                 elif act == "use-local":
                     say(f"  用本地包 {line['filename']}")
+                elif act == "use-cache":
+                    say(f"  用缓存包 {line['filename']}")
                 elif act == "copy-from-share":
                     say(f"  从共享盘取 {line['filename']}")
                 elif act == "download":
                     say(f"  下载 {line['filename']}")
                 elif act == "blocked":
-                    say(f"  [阻断] {line['why']}")
+                    # 两种 blocked：整轮被拦（只有 why）／单个包没来源（有 filename + why）
+                    what = f"{line['filename']} " if line.get("filename") else ""
+                    say(f"  [阻断] {what}{line.get('why', '')}")
                 elif act == "skip-uninstall":
                     say(f"  {line['why']}")
             say("")

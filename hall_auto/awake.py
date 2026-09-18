@@ -10,20 +10,17 @@
 
 ## 用法
 
-    with keep_awake():
-        run_suites()
-
-或（推荐，见下）由 conftest 的 session 级 fixture 调 `keep_awake_for_process()`，
+由 conftest 的 session 级 fixture 调 `keep_awake_for_process()`（推荐），
 **常亮持续到进程退出**，并在跑批期间巡检交互态；一旦发现 RDP 断连/锁屏就标记，
 由 pytest 侧中止（否则后半程全是黑屏假失败）。
 
 或手工控制：
 
-    token = keep_awake_start()
+    keep_awake_start()
     try:
         ...
     finally:
-        keep_awake_stop(token)
+        keep_awake_stop()
 
 `ES_CONTINUOUS` 让状态持续到下一次调用，不是"续一次 60 秒"那个老写法。
 
@@ -42,19 +39,15 @@ import atexit
 import ctypes
 import threading
 import time
-from contextlib import contextmanager
 
 # SetThreadExecutionState 的位标志
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001  # 阻止系统睡眠
 ES_DISPLAY_REQUIRED = 0x00000002  # 阻止显示器关闭（息屏）
 
-# 巡检线程的续命/巡检间隔（秒）。1 秒级的检测足够及时发现 RDP 断连，
+# 巡检线程的续命/巡检间隔（秒）。秒级检测足够及时发现 RDP 断连，
 # 又不会让 CPU 忙起来。
 _REFRESH_SEC = 5
-
-# 交互态探测结果的缓存时长（秒）。巡检线程会调它，没必要每次都真枚举窗口。
-_INTERACTIVE_CACHE_SEC = 1.0
 
 _watch_thread: threading.Thread | None = None
 _watch_stop = threading.Event()
@@ -63,8 +56,6 @@ _watch_stop = threading.Event()
 _watch_armed = False
 _session_lock = threading.Lock()
 _session_lost_at: float | None = None
-_interactive_cache_at = 0.0
-_interactive_cache_value: bool | None = None
 
 
 def keep_awake_start() -> bool:
@@ -87,29 +78,6 @@ def keep_awake_stop() -> bool:
         return False
 
 
-@contextmanager
-def keep_awake():
-    """跑批期间保持屏幕常亮，**整个进程生命周期内持续生效**。
-
-    注意这里**不在退出时恢复**：`SetThreadExecutionState` 的作用域是调用它的线程，
-    pytest 的 session fixture teardown 之后到进程真正退出之间，如果直接恢复，
-    长套件（P0 装机那类几十分钟的）中间空档就会息屏。改用：
-    - 开始时常亮一次
-    - 期间由巡检线程每 `_REFRESH_SEC` 续一次（顺带兼作交互态巡检）
-    - 进程退出时由 atexit 统一恢复
-
-    进程被强杀时（kill -9 / 任务管理器结束）atexit 不跑，但**那也不需要担心** ——
-    系统在调用进程终止时本来就自动清掉这些标志，这也是这个 API 相对改电源计划的优势。
-    """
-    started = keep_awake_start()
-    try:
-        yield started
-    finally:
-        # 刻意不从"一次调用一次恢复"的角度处理：真实恢复在 atexit。
-        # 但如果是**嵌套/短命**用法（比如单跑一条用例），进程退出时 atexit 仍会兜住。
-        pass
-
-
 def keep_awake_for_process() -> bool:
     """常亮一直到进程退出（atexit 恢复）。配合巡检线程用。
 
@@ -127,6 +95,8 @@ def keep_awake_for_process() -> bool:
 
     def _watch() -> None:
         """定期续常亮，并记录交互态翻转（RDP 断连 / 锁屏）。"""
+        from hall_auto.dpi import is_interactive_session
+
         while not _watch_stop.wait(_REFRESH_SEC):
             keep_awake_start()  # ES_CONTINUOUS 已是持续态，这里续一次防被别的进程冲刷
             if not is_interactive_session():
@@ -168,23 +138,3 @@ def session_lost_detail() -> str:
             "此后抓屏会拿到黑屏、点击无落点，用例结果不可信。"
             "测试机请保持本地桌面解锁、不要用 RDP 连接（或断开前先停跑批）。"
         )
-
-
-def is_interactive_session() -> bool:
-    """当前是否交互式桌面会话。带缓存，避免高频调用时反复枚举窗口。
-
-    判定沿用 dpi.py 的口径（有前台窗口 + 窗口有标题），这里只加一层短缓存：
-    巡检线程每秒调一次，没必要每秒真枚举一次。
-    """
-    global _interactive_cache_at, _interactive_cache_value
-
-    now = time.time()
-    if _interactive_cache_value is not None and now - _interactive_cache_at < _INTERACTIVE_CACHE_SEC:
-        return _interactive_cache_value
-
-    from hall_auto.dpi import is_interactive_session as _probe
-
-    value = _probe()
-    _interactive_cache_value = value
-    _interactive_cache_at = now
-    return value

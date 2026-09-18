@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 
 # WebView2 运行时的 EdgeUpdate 产品码。三个位置都查：
 # 系统级 32 位视图、系统级 64 位视图、当前用户级（用户级安装是合法形态）。
@@ -73,10 +75,6 @@ def webview2_version() -> str:
     )
 
 
-def webview2_installed() -> bool:
-    return bool(webview2_version())
-
-
 def hall_installed_version() -> str:
     """注册表里已装大厅的 DisplayVersion；没装返回空串。
 
@@ -102,25 +100,20 @@ def ms_login_session() -> str:
     local = os.environ.get("LOCALAPPDATA") or ""
     if not local:
         return "unknown"
-    from pathlib import Path
 
     candidates = (
         Path(local) / "Microsoft" / "OneAuth",
         Path(local) / "Microsoft" / "IdentityCache",
         Path(local) / "Microsoft" / "TokenBroker" / "Cache",
     )
-    found_any = False
     for base in candidates:
         try:
-            if not base.is_dir():
-                continue
-            found_any = True
-            if any(base.iterdir()):
+            if base.is_dir() and any(base.iterdir()):
                 return "yes"
         except OSError:
             continue
-    # 连目录都没有 → 明确 no；目录存在但空 → 也是 no
-    return "no" if found_any or os.environ.get("LOCALAPPDATA") else "unknown"
+    # 能判定且没找到条目（目录不存在或存在但空）→ no。真拿不到路径时上面已返回 unknown。
+    return "no"
 
 
 def ocr_has_chinese() -> str:
@@ -128,8 +121,6 @@ def ocr_has_chinese() -> str:
 
     返回 "yes" / "no" / "unknown"。跑 PowerShell 探测，约 1~2 秒。
     """
-    import subprocess
-
     try:
         proc = subprocess.run(
             [
@@ -151,11 +142,13 @@ def compat_facts() -> dict:
     刻意不复用 `product.read_installed()`：那个要 import win32 相关模块，
     而画像采集希望在**还没建 venv 的裸机**上也能跑（bootstrap 第 1 步就会调）。
     """
+    wv2 = webview2_version()
+    hall = hall_installed_version()
     return {
-        "webview2": "yes" if webview2_installed() else "no",
-        "webview2_version": webview2_version(),
-        "hall_installed": "yes" if hall_installed_version() else "no",
-        "hall_version": hall_installed_version(),
+        "webview2": "yes" if wv2 else "no",
+        "webview2_version": wv2,
+        "hall_installed": "yes" if hall else "no",
+        "hall_version": hall,
         "ms_session": ms_login_session(),
         "ocr_zh": ocr_has_chinese(),
     }
