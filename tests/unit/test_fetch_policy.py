@@ -345,3 +345,101 @@ def test_share_dirs_tries_multiple_in_order(cfg_share, tmp_path):
     assert res is not None
     assert res.source == "share"
 
+
+
+# ---------------- 包名带子路径（fixtures/xxx）----------------
+#
+# 2026-09-18 踩到的真 bug：`update_fixture.package` 是 `fixtures/7z2602-x64.exe`，
+# 带一层子目录。`ensure_from_share` 只建了 `_cache/`，没建 `_cache/fixtures/`，
+# 于是 `_copy_from_share` 里 `part.open("wb")` 直接 FileNotFoundError。
+# 表现极具迷惑性：**共享盘上明明有这个文件，却报"从共享盘拷贝失败"**。
+# 本机一直走"本地已有"分支，所以这个洞在真实多机场景才会暴露。
+
+
+def test_share_copy_creates_nested_cache_dir(cfg_share, tmp_path):
+    """包名带子路径 -> 缓存的子目录要自动建出来。"""
+    share = tmp_path / "share"
+    (share / "fixtures").mkdir(parents=True)
+    payload = b"nested-fixture"
+    (share / "fixtures" / "7z2602-x64.exe").write_bytes(payload)
+
+    with mock.patch.object(fetch, "share_dirs", return_value=[share]):
+        res = fetch.ensure_from_share(cfg_share, "fixtures/7z2602-x64.exe")
+
+    assert res is not None, "带子路径的包必须能从共享盘取到"
+    assert res.source == "share"
+    assert res.path.read_bytes() == payload
+    assert res.path.parent.name == "fixtures"
+
+
+def test_download_creates_nested_cache_dir(cfg_share):
+    """下载同理：目标带子路径时父目录要自己建，别等 open() 才炸。"""
+    dest = fetch.cache_dir(cfg_share) / "fixtures" / "7z2602-x64.exe"
+
+    def _fake_urlopen(req, timeout=None):
+        class _Resp:
+            def read(self, n=-1):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return _Resp()
+
+    with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+        fetch._download("http://example.invalid/x", dest, timeout_sec=1, retries=1)
+
+    assert dest.parent.is_dir()
+    assert dest.is_file()
+
+
+# ---------------- 包名带子路径（fixtures/xxx）----------------
+#
+# 2026-09-18 踩到的真 bug：`update_fixture.package` 是 `fixtures/7z2602-x64.exe`，
+# 带一层子目录。`ensure_from_share` 只建了 `_cache/`，没建 `_cache/fixtures/`，
+# 于是 `_copy_from_share` 里 `part.open("wb")` 直接 FileNotFoundError。
+# 表现极具迷惑性：**共享盘上明明有这个文件，却报"从共享盘拷贝失败"**。
+# 本机一直走"本地已有"分支，所以这个洞在真实多机场景才会暴露。
+
+
+def test_share_copy_creates_nested_cache_dir(cfg_share, tmp_path):
+    """包名带子路径 -> 缓存的子目录要自动建出来。"""
+    share = tmp_path / "share"
+    (share / "fixtures").mkdir(parents=True)
+    payload = b"nested-fixture"
+    (share / "fixtures" / "7z2602-x64.exe").write_bytes(payload)
+
+    with mock.patch.object(fetch, "share_dirs", return_value=[share]):
+        res = fetch.ensure_from_share(cfg_share, "fixtures/7z2602-x64.exe")
+
+    assert res is not None, "带子路径的包必须能从共享盘取到"
+    assert res.source == "share"
+    assert res.path.read_bytes() == payload
+    assert res.path.parent.name == "fixtures"
+
+
+def test_download_creates_nested_cache_dir(cfg_share):
+    """下载同理：目标带子路径时父目录要自己建，别等 open() 才炸。"""
+    dest = fetch.cache_dir(cfg_share) / "fixtures" / "7z2602-x64.exe"
+
+    def _fake_urlopen(req, timeout=None):
+        class _Resp:
+            def read(self, n=-1):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return _Resp()
+
+    with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+        fetch._download("http://example.invalid/x", dest, timeout_sec=1, retries=1)
+
+    assert dest.parent.is_dir()
+    assert dest.is_file()

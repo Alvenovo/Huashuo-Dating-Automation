@@ -200,9 +200,16 @@ def share_reachable(directory: Path, timeout_sec: int = SHARE_PROBE_SEC) -> tupl
 
 
 def _copy_from_share(src: Path, dest: Path) -> None:
-    """从共享盘拷到本地缓存。走 .part 再原子改名（与下载同一套约定）。"""
+    """从共享盘拷到本地缓存。走 .part 再原子改名（与下载同一套约定）。
+
+    **必须自己建 dest 的父目录**：包名可能带子路径（如 `fixtures/7z2602-x64.exe`），
+    缓存里对应的是 `_cache/fixtures/...`，而调用方只建了 `_cache`。
+    不建的话 `part.open("wb")` 直接 `FileNotFoundError` —— 表现是
+    "共享盘明明有这个文件，却报拷贝失败"，极具迷惑性。
+    """
     part = dest.with_suffix(dest.suffix + ".part")
     try:
+        part.parent.mkdir(parents=True, exist_ok=True)
         with src.open("rb") as fh_in, part.open("wb") as fh_out:
             while True:
                 chunk = fh_in.read(SHARE_COPY_CHUNK)
@@ -256,8 +263,15 @@ def ensure_from_share(cfg: Config, filename: str) -> FetchResult | None:
 
 
 def _download(url: str, dest: Path, timeout_sec: int, retries: int) -> None:
-    """下到 dest.part，成功后原子改名。失败重试，重试间隔递增。"""
+    """下到 dest.part，成功后原子改名。失败重试，重试间隔递增。
+
+    与 `_copy_from_share` 同理：包名可能带子路径，父目录要自己建。
+    """
     part = dest.with_suffix(dest.suffix + ".part")
+    try:
+        part.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FetchError(f"缓存目录不可写 {part.parent}：{exc}") from exc
     last: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
