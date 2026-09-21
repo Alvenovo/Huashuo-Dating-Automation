@@ -33,6 +33,12 @@
 **探测失败不拦路** —— 探测有偏差（代理、DNS、防火墙策略），装不装得上最终由 pip 说了算；
 硬拦会把"本来能装的机器"判死，比不探更糟。
 
+第 1 步还会查一样**容易被漏掉**的东西：「整包拷贝」带过来的老机器痕迹。
+手册给的无网路线是把整个目录拷到新机器，而 `config.local.yaml`（被 gitignore）
+会跟着走 —— 于是 `installer_dir` 可能指向 `C:/Users/<老用户名>/...`，
+`node_id` 也可能还是老机器名。前者会让取包失败、**且报错长得像"共享盘坏了"**。
+这里只**报警不改值**：静默把 800MB 的落点换掉比让它失败更吓人。
+
 第 4 步为什么是**装**而不是**只检测**：`hall_auto/security.py` 的 P2 安全验证要用
 `7z x` 解包待检安装包。这个钉住包本来就在 `installer_dir/fixtures/7z2602-x64.exe`
 （`tools/reset_fixture.py` 早就用它静默装了），没理由再让人去官网手动下一趟。
@@ -321,7 +327,49 @@ def _load_existing_local_config() -> dict:
 # ---------------- 各步骤 ----------------
 
 
-def step_env_check(node: str, installer_dir: Path | None = None) -> Step:
+def _foreign_profile_owner(installer_dir: Path) -> str:
+    """`installer_dir` 落在**别的用户**的 profile 下就返回那个用户名，否则空串。
+
+    为什么要这条检查（2026-09-21 发现）：手册给的无网路线是「整包拷贝」，
+    而整包拷贝会带上被 `.gitignore` 的 `config.local.yaml`。可 `main()` 取
+    `installer_dir` 的优先级是 `--installer-dir` > **已有 config** > 默认值 ——
+    于是新机器会继承老机器的 `C:/Users/<老用户名>/...`，而新机器上压根没这个用户。
+    取包时要么在 `C:\\Users\\` 下建出幽灵目录（要管理员），要么直接权限失败，
+    **而报错长得像"共享盘坏了"**，一线会往完全错的方向查。
+
+    只认 `C:/Users/<name>/...` 这种能一眼看出"不是本机"的形态；
+    `C:/Users/Public/...`（本脚本的默认值）和当前用户自己的目录都不算。
+    """
+    parts = installer_dir.as_posix().split("/")
+    if len(parts) >= 3 and parts[1].lower() == "users":
+        owner = parts[2].strip()
+        current = Path.home().name
+        if owner and owner.lower() not in (current.lower(), "public"):
+            return owner
+    return ""
+
+
+def _stale_node_hint(config_node: str, node: str) -> str:
+    """`config.local.yaml` 里的 `node_id` 与本机节点名不一致时给一句提示，否则空串。
+
+    同样是整包拷贝的痕迹。目前**没有代码读 `cfg.node_id`**（全仓只有
+    `hall_auto/config.py` 写它、没人读），所以现在无害；但它是隐患：
+    真正决定节点身份的是 `hall_auto/dpi.node_id()`（环境变量 > 主机名），
+    两套标识一旦哪天被接起来，拷过来的机器就会冒用老机器的名字回传证据，
+    正是 `dpi.node_id` 的注释里说要避免的「20 台回传撞名」。
+    所以不自动改（`-NodeId` 设过的值必须保住），只提示。
+    """
+    config_node = (config_node or "").strip()
+    if config_node and config_node != node:
+        return (
+            f"config.local.yaml 里的 node_id 是 {config_node}，与本机节点名 {node} 不一致"
+            " —— 这是「整包拷贝」带过来的痕迹。当前没有代码读这个字段，属隐患；"
+            "建议删掉 config.local.yaml 里那一行再重跑（除非你是故意用 -NodeId 指定的）"
+        )
+    return ""
+
+
+def step_env_check(node: str, installer_dir: Path | None = None, config_node_id: str = "") -> Step:
     st = Step("环境自检")
     profile = machine_profile()
     st.log(f"节点 {node} / {profile['os']} / Python {profile['python']}({profile['python_bits']}位)")
@@ -374,6 +422,20 @@ def step_env_check(node: str, installer_dir: Path | None = None) -> Step:
             )
         else:
             st.log(f"磁盘剩余 {free:.1f} GB（{where}），够用")
+        # 「整包拷贝」带过来的老机器痕迹。放在磁盘检查之后：这一条同样会把
+        # "路径不对"伪装成"共享盘坏了"，是同一类误导。
+        owner = _foreign_profile_owner(target)
+        if owner:
+            st.log(
+                f"⚠️ installer_dir 指向别的用户目录（{owner}）：{target}\n"
+                f"    像是从别的机器整包拷过来的（config.local.yaml 也被带过来了）。"
+                f"本机没有 {owner} 这个用户，取包会在 C:\\Users\\ 下建幽灵目录或权限失败。\n"
+                f'    处理：加 -InstallerDir "C:/Users/Public/Desktop/Test/华硕大厅" 重跑，'
+                f"或删掉 config.local.yaml 再跑"
+            )
+    hint = _stale_node_hint(config_node_id, node)
+    if hint:
+        st.log(f"⚠️ {hint}")
     return st
 
 
@@ -1138,7 +1200,7 @@ def main() -> int:
             say(f"    {line}")
         say("")
 
-    run(step_env_check(node, installer_dir))
+    run(step_env_check(node, installer_dir, str(existing.get("node_id") or "")))
     run(step_venv(args.skip_venv))
     run(step_fixtures(installer_dir))
     run(step_seven_zip(installer_dir, allow_download=not args.no_download, skip=args.skip_seven_zip))

@@ -931,7 +931,7 @@ def test_free_gb_bad_path_is_negative_not_crash(bm, monkeypatch):
     assert "盘符不存在" in why
 
 
-def _fake_env_check(bm, installer_dir, free_gb: float):
+def _fake_env_check(bm, installer_dir, free_gb: float, config_node_id: str = ""):
     """跑一遍 step_env_check，把外部依赖全打成假的，只看磁盘那几行。"""
     with mock.patch.object(bm, "machine_profile", return_value={
         "os": "Windows 11", "python": "3.12.10", "python_bits": 64,
@@ -943,7 +943,7 @@ def _fake_env_check(bm, installer_dir, free_gb: float):
          mock.patch.object(bm, "SEVEN_ZIP_EXE", REPO_ROOT / "不存在.exe"), \
          mock.patch.object(bm, "_free_gb", return_value=(free_gb, "")), \
          mock.patch.object(bm.subprocess, "run", return_value=_fake_run()):
-        return bm.step_env_check("TESTNODE", installer_dir)
+        return bm.step_env_check("TESTNODE", installer_dir, config_node_id)
 
 
 def test_env_check_warns_when_disk_is_tight(bm, tmp_path):
@@ -973,6 +973,66 @@ def test_env_check_disk_failure_is_log_not_fail(bm, tmp_path):
          mock.patch.object(bm.subprocess, "run", return_value=_fake_run()):
         st = bm.step_env_check("TESTNODE", tmp_path)
     assert any("磁盘空间检测跳过" in line for line in st.detail), st.detail
+
+
+# ---------------- 「整包拷贝」带过来的老机器痕迹 ----------------
+#
+# 起因（2026-09-21）：用户问「git 可以不下吗」。可以 —— 但换的那条路（把整个目录拷到
+# 新机器）会带上被 gitignore 的 `config.local.yaml`，而 `main()` 取 installer_dir 的
+# 优先级是 `--installer-dir` > **已有 config** > 默认值。于是新机器继承了老机器的
+# `C:/Users/<老用户名>/...`，取包必然失败，**而报错长得像"共享盘坏了"**。
+# 只报警不改值：静默把 800MB 的落点换掉，比让它失败更吓人。
+
+
+def test_foreign_profile_owner_detects_other_user(bm):
+    """`C:/Users/<别人>/...` 要能认出来 —— 这是整包拷贝最典型的痕迹。"""
+    assert bm._foreign_profile_owner(Path("C:/Users/asus/Desktop/Test/华硕大厅")) == "asus"
+
+
+def test_foreign_profile_owner_ignores_public_and_current_user(bm):
+    """`Public`（脚本自己的默认值）和当前用户自己的目录都不算"外来的"。"""
+    assert bm._foreign_profile_owner(Path("C:/Users/Public/Desktop/Test/华硕大厅")) == ""
+    assert bm._foreign_profile_owner(Path.home() / "Desktop" / "Test" / "华硕大厅") == ""
+
+
+def test_foreign_profile_owner_ignores_non_profile_paths(bm):
+    """别的盘、别的位置认不出来就别瞎报 —— 只认一眼能看出"不是本机"的形态。"""
+    assert bm._foreign_profile_owner(Path("D:/Test/华硕大厅")) == ""
+    assert bm._foreign_profile_owner(Path("C:/ProgramData/Test/华硕大厅")) == ""
+
+
+def test_env_check_warns_on_foreign_installer_dir(bm):
+    """核心：发现老机器痕迹要**说人话**，并给出两条明确处理办法。"""
+    st = _fake_env_check(bm, Path("C:/Users/asus/Desktop/Test/华硕大厅"), free_gb=50.0)
+    joined = "\n".join(st.detail)
+    assert "installer_dir 指向别的用户目录（asus）" in joined, joined
+    assert "-InstallerDir" in joined, joined
+    assert "删掉 config.local.yaml" in joined, joined
+
+
+def test_env_check_silent_on_normal_installer_dir(bm, tmp_path):
+    """正常路径（当前用户 / Public）不该冒出这条警告 —— 狼来了就没人看了。"""
+    st = _fake_env_check(bm, Path("C:/Users/Public/Desktop/Test/华硕大厅"), free_gb=50.0)
+    assert not any("别的用户目录" in line for line in st.detail), st.detail
+
+
+def test_stale_node_hint_flags_mismatch(bm):
+    """config 里的 node_id 与本机节点名不一致时要点出来。"""
+    hint = bm._stale_node_hint("LAPTOP-OLD", "R01")
+    assert "LAPTOP-OLD" in hint and "R01" in hint, hint
+
+
+def test_stale_node_hint_silent_when_matching_or_absent(bm):
+    """一致、或压根没写，都不该提示。"""
+    assert bm._stale_node_hint("R01", "R01") == ""
+    assert bm._stale_node_hint("", "R01") == ""
+    assert bm._stale_node_hint(None, "R01") == ""
+
+
+def test_env_check_logs_stale_node_hint(bm, tmp_path):
+    """这条提示要真的从 step_env_check 里出来，不能只是函数写好了没人调。"""
+    st = _fake_env_check(bm, tmp_path, free_gb=50.0, config_node_id="LAPTOP-OLD")
+    assert any("LAPTOP-OLD" in line for line in st.detail), st.detail
 
 
 def test_pip_probe_target_prefers_index_url_over_proxy(bm, monkeypatch):
