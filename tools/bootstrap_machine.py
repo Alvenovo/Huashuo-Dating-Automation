@@ -364,26 +364,84 @@ def step_fixtures(installer_dir: Path) -> Step:
     return st
 
 
+def _ensure_seven_zip_fixture(installer_dir: Path, allow_download: bool, st: Step) -> Path | None:
+    """确保钉住包 `fixtures/7z2602-x64.exe` 在手，返回它的路径（拿不到返回 None）。
+
+    **为什么这件事要跟"本机装没装 7-Zip"分开**：
+    这个包有两个身份 —— ① 7-Zip 的安装源 ② P1-A「更新夹具」的起点包
+    （`reset_fixture.py` 靠它把 7-Zip 压回 26.02，大厅更新列表里才有东西可更新）。
+    早先只在"7-Zip 没装"时才去取它，于是**已经装了 7-Zip 的机器永远拿不到夹具包**，
+    `test_update_fixture_via_hall` 直接失败。两个身份各自都需要它，所以无条件确保。
+    """
+    installer = installer_dir / "fixtures" / "7z2602-x64.exe"
+    if installer.is_file():
+        digest = sha256_of(installer)
+        if digest == SEVEN_ZIP_FIXTURE_SHA256:
+            return installer
+        st.log(
+            f"钉住包 sha256 不符（期望 {SEVEN_ZIP_FIXTURE_SHA256[:16]}… 实际 {digest[:16]}…），"
+            "当作没有，重新取一份"
+        )
+        try:
+            installer.unlink()
+        except OSError as exc:
+            st.log(f"删不掉坏包（{exc}），放弃重取")
+            return None
+
+    if not allow_download:
+        st.log(f"钉住包不在本地（{installer}），--no-download 下不取；P1-A 更新用例会失败")
+        return None
+
+    try:
+        installer.parent.mkdir(parents=True, exist_ok=True)
+        # 复用 fetch 的下载：带 .part 原子改名 + 递增重试，比这里重写一份稳。
+        from hall_auto.fetch import _download
+
+        _download(SEVEN_ZIP_URL, installer, timeout_sec=60, retries=3)
+    except Exception as exc:
+        st.log(
+            f"钉住包取不到（{exc}）。若测试机没有外网，把它放到共享盘的 fixtures/ 子目录下"
+            f"（`<共享>\\fixtures\\7z2602-x64.exe`）即可让所有节点走局域网拿到；"
+            "P1-A 更新用例需要它"
+        )
+        return None
+
+    digest = sha256_of(installer)
+    if digest != SEVEN_ZIP_FIXTURE_SHA256:
+        st.log(f"刚取到的包 sha256 不符（{digest[:16]}…），不用它")
+        return None
+    st.log(f"已取到钉住包：{installer}")
+    return installer
+
+
 def step_seven_zip(installer_dir: Path, allow_download: bool, skip: bool = False) -> Step:
-    """确保 7-Zip 可用：缺了就自动装（本地钉住包优先，其次官方源）。
+    """确保 7-Zip 可用，并确保钉住夹具包在手。
 
-    为什么这一步是"装"而不是"只检测、缺了让人去下"：
-    `hall_auto/security.py::extract_package` 用 `7z x` 解包待检安装包，
-    而那个钉住包本来就在 `installer_dir/fixtures/7z2602-x64.exe`
-    （`tools/reset_fixture.py` 早就用它静默装了）。既然包在手边，就不该让人再跑一趟官网。
+    两件事，顺序有讲究：
+      1. **先确保钉住包**（`fixtures/7z2602-x64.exe`）—— 它同时是安装源和 P1-A 更新夹具，
+         与本机装没装 7-Zip 无关，所以无条件确保。
+      2. **再按需安装 7-Zip** —— 已装就跳过，一个安装动作都不做。
 
-    装的是**钉住的 26.02，不是最新版**：它同时是 P1-A「更新夹具」的起点
-    （大厅目录里的 7-Zip 比它新，更新列表里才永远有它可更新）。
+    为什么 7-Zip 要自动装（而不是"只检测、缺了让人去下"）：
+    `hall_auto/security.py::extract_package` 用 `7z x` 解包待检安装包。
+    装的是**钉住的 26.02，不是最新版** —— 它同时是 P1-A 更新夹具的起点，
     装最新版会让 `test_update_fixture_via_hall` 的起点断言失配、用例转 skip。
 
-    装不上**不算铺设失败**：只影响 P2 套件，而 P2 还要内部安全工具才能跑。
+    拿不到包 / 装不上**都不算铺设失败**：只影响 P2（解包）和 P1-A 的更新用例。
     """
     st = Step("7-Zip")
     if skip:
         st.log("按 --skip-seven-zip 跳过")
         return st
+
+    fixture = _ensure_seven_zip_fixture(installer_dir, allow_download, st)
+
     if SEVEN_ZIP_EXE.is_file():
         st.log(f"已就位：{SEVEN_ZIP_EXE}（未安装任何东西）")
+        return st
+
+    if fixture is None:
+        st.log("没有钉住包，装不了 7-Zip；仅 P2 安全验证受影响（会 skip）")
         return st
 
     if not is_admin():
@@ -394,33 +452,9 @@ def step_seven_zip(installer_dir: Path, allow_download: bool, skip: bool = False
         )
         return st
 
-    installer = installer_dir / "fixtures" / "7z2602-x64.exe"
-    if not installer.is_file():
-        if not allow_download:
-            st.log(f"钉住包不在本地（{installer}），--no-download 下不下载；仅 P2 安全验证受影响（会 skip）")
-            return st
-        try:
-            installer.parent.mkdir(parents=True, exist_ok=True)
-            # 复用 fetch 的下载：带 .part 原子改名 + 递增重试，比这里重写一份稳。
-            from hall_auto.fetch import _download
-
-            _download(SEVEN_ZIP_URL, installer, timeout_sec=60, retries=3)
-            st.log(f"已从官方源取到钉住包：{SEVEN_ZIP_URL}")
-        except Exception as exc:
-            st.log(f"钉住包取不到（{exc}）；仅 P2 安全验证受影响（会 skip），其余套件不受影响")
-            return st
-
-    digest = sha256_of(installer)
-    if digest != SEVEN_ZIP_FIXTURE_SHA256:
-        st.log(
-            f"钉住包 sha256 不符（期望 {SEVEN_ZIP_FIXTURE_SHA256[:16]}… 实际 {digest[:16]}…），"
-            "不用它安装；仅 P2 安全验证受影响（会 skip）"
-        )
-        return st
-
-    st.log(f"未装 7-Zip，静默安装钉住版本 26.02：{installer}")
+    st.log(f"未装 7-Zip，静默安装钉住版本 26.02：{fixture}")
     try:
-        proc = subprocess.run([str(installer), "/S"], capture_output=True, check=False, timeout=180)
+        proc = subprocess.run([str(fixture), "/S"], capture_output=True, check=False, timeout=180)
     except subprocess.SubprocessError as exc:
         st.log(f"安装器起不来（{exc}）；仅 P2 安全验证受影响（会 skip）")
         return st
@@ -438,11 +472,34 @@ def step_seven_zip(installer_dir: Path, allow_download: bool, skip: bool = False
     return st
 
 
+def _unc_target(raw: str) -> str:
+    """把 UNC 路径（`\\\\host\\share\\sub`）裁成 `net use` 要的前两段 `\\\\host\\share`。
+
+    非 UNC（本地盘符 / 相对路径）返回空串。
+    **必须先判前缀**：`C:/hall-farm` 单纯按反斜杠切也切得出两段，
+    会得到 `\\\\C:\\hall-farm` 这种垃圾目标。早先这个函数只被 `package_share.dirs`
+    的值调用（配置里保证是 UNC）所以没暴露，现在 `HALL_FARM_ROOT` 可能是本地目录，
+    不挡住就会拿本地路径去 `net use`。
+    """
+    text = str(raw).replace("/", "\\")
+    if not text.startswith("\\\\"):
+        return ""
+    parts = [p for p in text.split("\\") if p]
+    if len(parts) < 2:
+        return ""
+    return f"\\\\{parts[0]}\\{parts[1]}"
+
+
 def step_share_login(skip: bool) -> Step:
     """连上共享盘（如需凭据）。
 
     每台测试机都要连一次共享盘，否则 `fetch.py` 走共享盘那一步会因凭据缺失而失败。
     用 `net use ... /persistent:yes` 建立持久连接，重启后自动重连。
+
+    **两个来源都要连**：安装包共享（`package_share.dirs`，只读）和
+    农场共享（`HALL_FARM_ROOT`，读写）。早先只连前者，农场的 UNC 靠
+    "同一台服务器已经认证过了"这个**隐含前提**兜着 —— 隐含的前提会在换机器、
+    换服务器、或加了 `--skip-share` 时突然不成立，所以这里显式连一次。
 
     凭据**只走环境变量**（红线：不落盘、不进 git）：
         HALL_SHARE_USER      共享盘账号（如 hallshare）
@@ -464,34 +521,37 @@ def step_share_login(skip: bool) -> Step:
         st.log(f"读配置跳过：{exc}")
         return st
 
-    dirs = share_dirs(cfg)
-    if not dirs:
-        st.log("未配置共享盘（package_share.dirs 为空），跳过")
+    wanted: list[str] = [str(d) for d in share_dirs(cfg)]
+    farm = (os.environ.get("HALL_FARM_ROOT") or "").strip()
+    if farm.replace("/", "\\").startswith("\\\\"):
+        wanted.append(farm)
+
+    if not wanted:
+        st.log("未配置共享盘（package_share.dirs 为空）且未设 HALL_FARM_ROOT，跳过")
         return st
 
     user = (os.environ.get("HALL_SHARE_USER") or "").strip()
     password = os.environ.get("HALL_SHARE_PASSWORD") or ""
 
-    for d in dirs:
-        ok, why = share_reachable(d)
+    for d in wanted:
+        ok, why = share_reachable(Path(d))
         if ok:
             st.log(f"{d}: 已可达（无需再连）")
             continue
         if not user or not password:
             st.log(f"{d}: 当前不可达（{why}），且未设 HALL_SHARE_USER/PASSWORD，无法自动连接")
             continue
-        # UNC 形式：\\host\share，取前两段作为 net use 的目标
-        parts = [p for p in str(d).replace("/", "\\").split("\\") if p]
-        if len(parts) < 2:
+        target = _unc_target(d)
+        if not target:
             st.log(f"{d}: 路径格式不像 UNC（\\\\host\\share），跳过")
             continue
-        target = f"\\\\{parts[0]}\\{parts[1]}"
         cmd = ["net", "use", target, password, f"/user:{user}", "/persistent:yes"]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
-            st.log(f"{target}: 连接失败 rc={proc.returncode} {(proc.stdout or proc.stderr or '').strip()[:160]}")
+            detail = (proc.stdout or proc.stderr or "").strip()[:160]
+            st.log(f"{target}: 连接失败 rc={proc.returncode} {detail}")
             continue
-        ok2, why2 = share_reachable(d)
+        ok2, why2 = share_reachable(Path(d))
         st.log(f"{target}: 已连接（{'可达' if ok2 else f'仍不可达：{why2}'}）")
     return st
 
@@ -526,11 +586,19 @@ def step_fetch_packages(allow_download: bool) -> Step:
         st.log("配置里没有声明安装包（baseline_setup / latest_setup 都为空）")
         return st
 
+    # 夹具包（update_fixture.package）拿不到只影响 P1-A 的更新用例，
+    # 不该把整台机器的铺设判死 —— 它已经在第 4 步尝试取过一次了。
+    fixture_name = str(getattr(cfg.update_fixture, "package", "") or "")
+
     for name in names:
         try:
             res = ensure_package(cfg, name, allow_download=allow_download)
         except Exception as exc:
-            st.fail(f"{name} 获取失败：{exc}")
+            if name == fixture_name:
+                st.log(f"{name}: 拿不到（{exc}）—— 仅 P1-A 更新用例受影响，其余套件不受影响")
+                st.log("  补救：把它放到共享盘的 fixtures/ 子目录下，节点就能走局域网取到")
+            else:
+                st.fail(f"{name} 获取失败：{exc}")
             continue
         tag = {"local": "本地", "cache": "缓存", "share": "共享盘", "download": "已下载"}.get(
             res.source, res.source
