@@ -19,3 +19,5 @@ myappstore_*_Setup.exe
 # Obsidian 工作区状态（打开的标签/光标位置），纯本机 UI 状态，每次开都变
 **/.obsidian/workspace.json
 **/.obsidian/workspace-mobile.json
+# 学习库手机版：由 .workbuddy-ai/tools/build_mobile_html.py 生成，属可重建产物
+学习库-手机版.html
