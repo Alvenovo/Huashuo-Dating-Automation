@@ -38,9 +38,24 @@ from hall_auto.suites import SUITES, get_suite  # noqa: E402
 
 
 def farm_root() -> Path:
+    """农场目录：环境变量 > config.local.yaml > 硬退出。
+
+    控制机通常就是办公机或包源机，也可能跑过 bootstrap 因此配置里有 farm_root。
+    环境变量优先是为了临时切到别的农场做验证。
+    """
     raw = os.environ.get("HALL_FARM_ROOT", "").strip()
     if not raw:
-        raise SystemExit("未设 HALL_FARM_ROOT，例：$env:HALL_FARM_ROOT='\\\\SHARE\\qa\\hall-farm'")
+        try:
+            from hall_auto.config import load_config
+
+            raw = str(load_config().farm_root or "").strip()
+        except Exception:
+            raw = ""
+    if not raw:
+        raise SystemExit(
+            "未设 HALL_FARM_ROOT，config.local.yaml 里也没有 farm_root。\n"
+            "例：$env:HALL_FARM_ROOT='\\\\SHARE\\qa\\hall-farm'"
+        )
     return Path(raw)
 
 

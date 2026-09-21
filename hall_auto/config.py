@@ -111,6 +111,11 @@ class Config:
     update_fixture: UpdateFixture
     security: SecuritySettings
     node_id: str
+    # 多机跑批的任务中转站（共享盘上的农场目录，含 tasks/ done/ results/ logs/）。
+    # 环境变量 HALL_FARM_ROOT 优先，其次 config.local.yaml 的 farm_root（bootstrap 会写）。
+    # 落到配置里是为了消灭「每开一个新窗口都要重设环境变量」这个坑 ——
+    # 忘了设的表现是 farm_agent 直接退出、一个任务都取不到，且看不出原因。
+    farm_root: str
     raw: dict
 
     @property
@@ -260,5 +265,10 @@ def load_config(path: Path | None = None) -> Config:
         or str(data.get("node_id") or "")
         or platform.node()
         or "unknown-node",
+        # 环境变量优先（临时切换农场用），其次配置（bootstrap 写的常驻值）。
+        # 两边都为空是合法的 —— 单机 `farm_agent --local` 不需要农场目录，
+        # 真要跑多机时由 farm_agent / farm_control 自己报错退出。
+        farm_root=os.environ.get("HALL_FARM_ROOT")
+        or str(data.get("farm_root") or ""),
         raw=data,
     )

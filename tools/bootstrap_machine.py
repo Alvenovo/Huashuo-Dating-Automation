@@ -19,10 +19,11 @@
 | 5 生成本机配置 | 逐字段 setdefault，只覆盖机器绑定项 | 保留原有 |
 | 6 生成节点凭据模板 | `farm_node.env` 在否 | 只报键名，绝不覆盖 |
 | 7 连共享盘 | 先探测可达性 | 已达则不连 |
-| 8 农场目录 | `tasks/ done/ results/ logs/` 齐否 | 齐则跳过 |
-| 9 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
-| 10 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
-| 11 自检 | 跑 tests/unit | 可 `--skip-selftest` |
+| 8 **安全工具** | `fixtures/security_tools/` 关键文件在否 | 一个字节都不拷 |
+| 9 农场目录 | `tasks/ done/ results/ logs/` 齐否 | 齐则跳过 |
+| 10 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
+| 11 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
+| 12 自检 | 跑 tests/unit | 可 `--skip-selftest` |
 
 第 4 步为什么是**装**而不是**只检测**：`hall_auto/security.py` 的 P2 安全验证要用
 `7z x` 解包待检安装包。这个钉住包本来就在 `installer_dir/fixtures/7z2602-x64.exe`
@@ -30,6 +31,11 @@
 装的是**钉住的 26.02 而非最新版** —— 它同时是 P1-A「更新夹具」的起点
 （大厅目录里的 7-Zip 比它新，更新列表里才永远有它可更新）。
 装不上**不算铺设失败**：只影响 P2，且 P2 还要内部安全工具才能跑。
+
+第 8 步为什么从共享盘备而不是让人拷：内部安全工具按红线**不进公开仓库**，
+于是每台新机器只能人肉拷一份，`security` 套件必然 skip。但共享盘不是 git 仓库 ——
+包源机上放一次，所有节点自动取到，「N 台拷 N 次」压成「1 台拷 1 次」。
+**必须在第 7 步之后**：没认证过共享盘就取不到。
 
 第 2 步的标记文件是 `.venv/.deps_ok`：装成功后写入 requirements.txt 的 SHA256，
 下次哈希一致且关键包都能 import 就跳过。标记只用于"快速跳过"，
@@ -48,6 +54,7 @@
     --node-id ID           本机节点标识（默认主机名）
     --skip-venv            不检查虚拟环境与依赖
     --skip-seven-zip       不检查/自动安装 7-Zip
+    --skip-security-tools  不从共享盘准备 P2 内部安全工具
     --skip-schtask         不检查/建计划任务
     --skip-selftest        不跑 tests/unit 自检
     --no-download          不下载安装包，只用本地已有的
@@ -95,6 +102,12 @@ SEVEN_ZIP_URL = "https://www.7-zip.org/a/7z2602-x64.exe"
 # 节点本地凭据文件的名字（仓库根下，已在 .gitignore）。
 # 与 hall_auto/env_pack.NODE_ENV_FILENAME 是同一条约定，这里 import 过来免得抄错。
 from hall_auto.env_pack import NODE_ENV_FILENAME  # noqa: E402
+
+# P2 内部安全工具在共享盘上的相对目录（相对共享根）与本机落地位置。
+# 与 `step_write_local_config` 写的 `security.tools_dir` 必须指向同一个地方，否则白拷。
+SECURITY_TOOLS_REL_DIR = "fixtures/security_tools"
+# 缺任一关键文件就认为这份工具不完整（`hall_auto/security.py::security_tools` 也是这么判的）。
+SECURITY_TOOLS_REQUIRED = ("CheckAppV.exe", "SignCheck_v2.ps1")
 
 # bootstrap 时提示"哪些凭据还没配"用的建议清单（**只列键名，不涉及值**）。
 SUGGESTED_NODE_ENV = (
@@ -624,6 +637,11 @@ def step_write_local_config(installer_dir: Path, node: str) -> Step:
     security = existing.setdefault("security", {})
     security["tools_dir"] = (installer_dir / "fixtures" / "security_tools").as_posix()
     existing.setdefault("node_id", node)
+    # 农场目录也落盘：节点机因此**不必每次开新窗口重设 HALL_FARM_ROOT**。
+    # 只在本次设了环境变量时覆盖 —— 没设就保留上一轮写进去的值（否则重跑一次会把配置擦掉）。
+    farm = (os.environ.get("HALL_FARM_ROOT") or "").strip()
+    if farm:
+        existing["farm_root"] = farm
     try:
         import yaml
 
@@ -634,8 +652,71 @@ def step_write_local_config(installer_dir: Path, node: str) -> Step:
         )
         path.write_text(header + yaml.safe_dump(existing, allow_unicode=True, sort_keys=False), encoding="utf-8")
         st.log(f"已写入 {path}（node_id={existing.get('node_id')}）")
+        if farm:
+            st.log(f"farm_root 已落盘：{farm}（farm_agent / farm_control 会自动读，不必再设环境变量）")
+        else:
+            st.log(
+                "未设 HALL_FARM_ROOT，config.local.yaml 里也没写 farm_root —— "
+                "单机跑不受影响；多机跑批要设一次（跑过之后就会落盘）"
+            )
     except Exception as exc:
         st.fail(f"写 config.local.yaml 失败：{exc}")
+    return st
+
+
+def step_security_tools(installer_dir: Path, skip: bool = False) -> Step:
+    """把 P2 的内部安全工具从共享盘备到本机。
+
+    为什么需要这一步：`step_write_local_config` 把 `security.tools_dir` 指向
+    `<installer_dir>/fixtures/security_tools`，但**此前从没人往里放东西** ——
+    内部工具（CheckAppV / SignAppsV / SignCheck_v2）按红线不进公开仓库，
+    只能人肉拷，于是每台新机器的 `security` 套件必然 skip（报告上一片黄）。
+
+    共享盘**不是** git 仓库，放它完全合规：包源机上放一次，所有节点自动取到，
+    把「N 台机器拷 N 次」压成「1 台机器拷 1 次」。
+
+    本机已有完整工具 -> 一个字节都不拷（幂等）。
+    共享盘上没有 / 不可达 / 拷完仍缺关键文件 -> **只提示不判失败**：
+    只影响 P2，其余套件（launch / apps / login / settings）不受影响。
+    """
+    st = Step("安全工具")
+    if skip:
+        st.log("按 --skip-security-tools 跳过")
+        return st
+
+    dest = installer_dir / "fixtures" / "security_tools"
+    if all((dest / name).is_file() for name in SECURITY_TOOLS_REQUIRED):
+        st.log(f"已就位：{dest}（未做任何拷贝）")
+        return st
+
+    try:
+        from hall_auto.config import load_config
+        from hall_auto.fetch import copy_tree_from_share
+
+        cfg = load_config()
+    except Exception as exc:
+        st.log(f"读配置失败，跳过安全工具准备：{exc}")
+        return st
+
+    try:
+        count, why = copy_tree_from_share(cfg, SECURITY_TOOLS_REL_DIR, dest)
+    except Exception as exc:
+        st.log(f"从共享盘取安全工具失败（{exc}）—— 仅 P2 受影响（会 skip）")
+        return st
+
+    if not count:
+        st.log(f"共享盘上没有 {SECURITY_TOOLS_REL_DIR}（{why}）—— 仅 P2 受影响（会 skip）")
+        st.log(
+            f"补救：在包源机把内部安全工具拷到共享盘的 {SECURITY_TOOLS_REL_DIR}/ 下"
+            "（`<共享>\\fixtures\\security_tools\\`），所有节点即自动取到"
+        )
+        return st
+
+    missing = [name for name in SECURITY_TOOLS_REQUIRED if not (dest / name).is_file()]
+    if missing:
+        st.log(f"已拷 {count} 个文件，但缺关键文件 {missing} —— 仅 P2 受影响（会 skip）")
+        return st
+    st.log(f"已从共享盘备好 {count} 个文件 -> {dest}")
     return st
 
 
@@ -789,7 +870,8 @@ def step_farm_root(skip: bool) -> Step:
     if not raw:
         st.log(
             "未设 HALL_FARM_ROOT —— 单机跑不设也行（用 farm_agent --local 直接跑套件）；"
-            "多机跑批必须设，指向共享盘上的农场目录，如 \\\\192.168.0.4\\hall-farm"
+            "多机跑批必须设，指向共享盘上的农场目录，如 \\\\LAPTOP-VS5F7HF4\\hall-farm"
+            "（写机器名别写 IP，DHCP 换 IP 后会报「系统错误 67 找不到网络名」）"
         )
         return st
 
@@ -819,6 +901,9 @@ def main() -> int:
     parser.add_argument("--node-id", default="")
     parser.add_argument("--skip-venv", action="store_true")
     parser.add_argument("--skip-seven-zip", action="store_true", help="不检查/自动安装 7-Zip")
+    parser.add_argument(
+        "--skip-security-tools", action="store_true", help="不从共享盘准备 P2 内部安全工具"
+    )
     parser.add_argument("--skip-schtask", action="store_true")
     parser.add_argument("--skip-selftest", action="store_true")
     parser.add_argument("--skip-share", action="store_true", help="不尝试连接共享盘")
@@ -855,6 +940,8 @@ def main() -> int:
     run(step_write_local_config(installer_dir, node))
     run(step_node_env_template())
     run(step_share_login(args.skip_share))
+    # 必须在 step_share_login 之后：安全工具是从共享盘取的，没认证过就取不到。
+    run(step_security_tools(installer_dir, skip=args.skip_security_tools))
     run(step_farm_root(args.skip_farm))
     run(step_fetch_packages(allow_download=not args.no_download))
     run(step_schtask(args.skip_schtask))

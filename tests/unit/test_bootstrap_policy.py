@@ -560,3 +560,157 @@ def test_share_login_skip_flag(bm):
     assert st.ok
     assert not run.called
     assert any("--skip-share" in line for line in st.detail)
+
+
+# ---------------- 内部安全工具（P2）：从共享盘自动备 ----------------
+#
+# 此前 `step_write_local_config` 把 `security.tools_dir` 指向
+# `<installer_dir>/fixtures/security_tools`，但**从来没人往里放东西** ——
+# 内部工具按红线不进公开仓库，只能人肉拷，于是每台新机器的 `security` 套件必然 skip。
+# 共享盘不是 git 仓库，放它合规：包源机放一次，所有节点自动取。
+
+
+def _security_tools_on_share(bm, share: Path, complete: bool = True) -> None:
+    """在共享盘上摆一份内部安全工具（`fixtures/security_tools/`）。"""
+    tools = share / bm.SECURITY_TOOLS_REL_DIR
+    tools.mkdir(parents=True, exist_ok=True)
+    for name in bm.SECURITY_TOOLS_REQUIRED:
+        (tools / name).write_bytes(b"fake-tool")
+    if complete:
+        (tools / "SignAppsV.exe").write_bytes(b"extra")
+
+
+def _patch_security_tools(bm, share: Path):
+    """把「共享盘指向 tmp」和「load_config 返回假 cfg」一起打上。"""
+    return (
+        mock.patch("hall_auto.config.load_config", return_value=mock.Mock()),
+        mock.patch("hall_auto.fetch.share_dirs", return_value=[share]),
+        mock.patch("hall_auto.fetch.share_reachable", return_value=(True, "")),
+    )
+
+
+def test_security_tools_pulls_from_share(bm, tmp_path):
+    """共享盘上有 -> 整目录拷到 `<installer_dir>/fixtures/security_tools`。"""
+    share = tmp_path / "share"
+    _security_tools_on_share(bm, share)
+    installer = tmp_path / "installer"
+    installer.mkdir()
+
+    p1, p2, p3 = _patch_security_tools(bm, share)
+    with p1, p2, p3:
+        st = bm.step_security_tools(installer)
+
+    dest = installer / "fixtures" / "security_tools"
+    assert st.ok, st.detail
+    assert (dest / "CheckAppV.exe").is_file()
+    assert (dest / "SignCheck_v2.ps1").is_file()
+    assert any("已从共享盘备好" in line for line in st.detail)
+
+
+def test_security_tools_skips_when_already_present(bm, tmp_path):
+    """本机已有完整工具 -> 一个字节都不拷（幂等，重跑 bootstrap 不该有副作用）。"""
+    share = tmp_path / "share"
+    _security_tools_on_share(bm, share)
+    installer = tmp_path / "installer"
+    dest = installer / "fixtures" / "security_tools"
+    dest.mkdir(parents=True)
+    for name in bm.SECURITY_TOOLS_REQUIRED:
+        (dest / name).write_bytes(b"already-here")
+
+    with mock.patch("hall_auto.fetch.copy_tree_from_share") as copy:
+        st = bm.step_security_tools(installer)
+
+    assert st.ok
+    assert not copy.called, "已就位就不该再走拷贝路径"
+    assert any("已就位" in line for line in st.detail)
+
+
+def test_security_tools_absent_on_share_is_log_not_fail(bm, tmp_path):
+    """共享盘上没有这份工具 -> **只提示不判失败**（只影响 P2，不该让整台机器铺设判死）。"""
+    share = tmp_path / "share"
+    share.mkdir()
+    installer = tmp_path / "installer"
+    installer.mkdir()
+
+    p1, p2, p3 = _patch_security_tools(bm, share)
+    with p1, p2, p3:
+        st = bm.step_security_tools(installer)
+
+    assert st.ok, "安全工具缺失不能算铺设失败"
+    assert any("仅 P2 受影响" in line for line in st.detail)
+    assert any("补救" in line for line in st.detail), "要告诉人怎么补"
+
+
+def test_security_tools_partial_copy_is_log_not_fail(bm, tmp_path):
+    """拷到了文件但缺关键文件 -> 同样只提示。半份工具比没有更危险（会误判成已配好）。"""
+    share = tmp_path / "share"
+    _security_tools_on_share(bm, share)
+    # 只留一个非关键文件，关键文件删掉
+    tools = share / bm.SECURITY_TOOLS_REL_DIR
+    for name in bm.SECURITY_TOOLS_REQUIRED:
+        (tools / name).unlink()
+    (tools / "SignAppsV.exe").write_bytes(b"only-this")
+
+    installer = tmp_path / "installer"
+    installer.mkdir()
+
+    p1, p2, p3 = _patch_security_tools(bm, share)
+    with p1, p2, p3:
+        st = bm.step_security_tools(installer)
+
+    assert st.ok
+    assert any("缺关键文件" in line for line in st.detail)
+
+
+def test_security_tools_skip_flag(bm, tmp_path):
+    """--skip-security-tools 直接跳过，不碰网络。"""
+    with mock.patch("hall_auto.fetch.copy_tree_from_share") as copy:
+        st = bm.step_security_tools(tmp_path, skip=True)
+    assert st.ok
+    assert not copy.called
+    assert any("--skip-security-tools" in line for line in st.detail)
+
+
+def test_security_tools_rel_dir_matches_local_layout(bm):
+    """共享盘上的相对目录必须与 `step_write_local_config` 写进配置的落地路径同源。
+
+    这两处一旦不一致，bootstrap 会把工具拷到一个 `security.tools_dir` 不认的地方，
+    表现是"拷成功了但 P2 还是 skip"，比不拷更难查。
+    """
+    assert bm.SECURITY_TOOLS_REL_DIR == "fixtures/security_tools"
+    assert bm.SECURITY_TOOLS_REQUIRED == ("CheckAppV.exe", "SignCheck_v2.ps1")
+
+
+# ---------------- farm_root 落盘（免去每次开窗口重设环境变量）----------------
+#
+# 节点机不设 `HALL_FARM_ROOT` 时 farm_agent 直接退出、一个任务都取不到。
+# 以前每个新窗口都得重设一次，忘了就是"节点在跑但没任务"。
+# 现在 bootstrap 把它写进 config.local.yaml，farm_agent / farm_control 自动读。
+
+
+def test_write_local_config_persists_farm_root(bm, tmp_path, monkeypatch):
+    """设了 HALL_FARM_ROOT -> 要落进 config.local.yaml 的 farm_root。"""
+    monkeypatch.setenv("HALL_FARM_ROOT", "//LAPTOP-VS5F7HF4/hall-farm")
+    with mock.patch.object(bm, "REPO_ROOT", tmp_path):
+        st = bm.step_write_local_config(tmp_path / "installer", "R01")
+
+    assert st.ok, st.detail
+    text = (tmp_path / "config.local.yaml").read_text(encoding="utf-8")
+    assert "farm_root" in text
+    assert "LAPTOP-VS5F7HF4/hall-farm" in text
+    assert any("farm_root 已落盘" in line for line in st.detail)
+
+
+def test_write_local_config_keeps_farm_root_when_env_absent(bm, tmp_path, monkeypatch):
+    """**幂等保护**：本次没设环境变量时，不能把上一轮写进去的 farm_root 擦掉。"""
+    monkeypatch.delenv("HALL_FARM_ROOT", raising=False)
+    (tmp_path / "config.local.yaml").write_text(
+        "farm_root: //LAPTOP-VS5F7HF4/hall-farm\n", encoding="utf-8"
+    )
+    with mock.patch.object(bm, "REPO_ROOT", tmp_path):
+        st = bm.step_write_local_config(tmp_path / "installer", "R01")
+
+    assert st.ok, st.detail
+    text = (tmp_path / "config.local.yaml").read_text(encoding="utf-8")
+    assert "//LAPTOP-VS5F7HF4/hall-farm" in text, "重跑 bootstrap 不该擦掉已落盘的农场目录"
+

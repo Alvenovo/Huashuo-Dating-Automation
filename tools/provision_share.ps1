@@ -19,6 +19,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\provision_share.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\provision_share.ps1 -SkipPackages
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\provision_share.ps1 -ShareUser "hallshare" -SharePassword "xxx"
+#   $env:HALL_SHARE_PASSWORD="xxx"; ...\provision_share.ps1        # password via env (preferred)
 #
 # Exit codes: 0 = ok, 2 = not elevated, 1 = something failed.
 param(
@@ -32,6 +33,15 @@ param(
     [switch]$SkipFirewall,
     [switch]$SkipVerify
 )
+
+# -SharePassword may be omitted when HALL_SHARE_PASSWORD is set -- the same env var the
+# nodes already use for `net use`. Passwords must never be written to a file, so the env
+# var is the canonical channel and the parameter is only for one-off manual runs.
+# Without this, forgetting the parameter surfaces as "RESULT: NO_SHARE_ACCOUNT", which
+# reads like "the account is missing" rather than "you forgot to pass the password".
+if (-not $SharePassword -and $env:HALL_SHARE_PASSWORD) {
+    $SharePassword = $env:HALL_SHARE_PASSWORD
+}
 
 # Cmdlets that quietly return nothing (Get-SmbShare / Get-LocalUser / Get-NetFirewallRule)
 # are the normal "does this exist?" probe, so their non-terminating errors must not abort

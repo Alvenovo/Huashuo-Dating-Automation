@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import tempfile
 import time
 import urllib.error
@@ -154,7 +155,7 @@ def share_dirs(cfg: Config) -> list[Path]:
     例：
         package_share:
           dirs:
-            - "//192.168.0.4/hall-packages"
+            - "//LAPTOP-VS5F7HF4/hall-packages"
             - "//LAPTOP-VS5F7HF4/hall-packages"
     """
     env = os.environ.get("HALL_PACKAGE_SHARE", "").strip()
@@ -260,6 +261,55 @@ def ensure_from_share(cfg: Config, filename: str) -> FetchResult | None:
             url=str(candidate),
         )
     return None
+
+
+def copy_tree_from_share(cfg: Config, rel_dir: str, dest_dir: Path) -> tuple[int, str]:
+    """把共享盘上的**整个子目录**拷到本地。返回 (拷贝文件数, 说明)。
+
+    与 `ensure_from_share` 的分工：那个只管单个安装包文件；这里是**目录型资源**，
+    目前唯一的用途是 P2 的内部安全工具（`fixtures/security_tools/`）。
+
+    为什么需要它：内部安全工具按红线**不进公开仓库**，于是每台新机器都只能靠人拷。
+    但共享盘不是 git 仓库 —— 包源机上放一次，所有节点就能自动取到，
+    把「N 台机器拷 N 次」压成「1 台机器拷 1 次」。
+
+    不做 sha 校验（目录内容不是单一文件）：由调用方按"关键文件在不在"判定完整性，
+    所以这里**允许部分拷入**，但把数量返给调用方。共享盘没配 / 不可达 / 没这个目录
+    -> `(0, 原因)`，**不抛错**（共享盘挂了不该让整台机器的铺设失败）。
+    """
+    rel = rel_dir.strip().strip("/\\").replace("\\", "/")
+    if not rel:
+        return 0, "相对目录为空"
+    for directory in share_dirs(cfg):
+        ok, _why = share_reachable(directory)
+        if not ok:
+            continue
+        src = directory.joinpath(*rel.split("/"))
+        try:
+            if not src.is_dir():
+                continue
+            files = [f for f in src.rglob("*") if f.is_file()]
+        except OSError:
+            continue  # 中途断了，换下一个共享盘
+        if not files:
+            continue
+        copied = 0
+        for item in files:
+            target = Path(dest_dir) / item.relative_to(src)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # 内部工具在共享盘上是**只读**的（copy2 会把只读位带过来），
+                # 直接覆盖已有的只读文件会 WinError 5。先解锁再删。
+                if target.exists():
+                    target.chmod(0o777)
+                    target.unlink()
+                shutil.copy2(item, target)
+                target.chmod(0o777)
+            except OSError as exc:
+                raise FetchError(f"从共享盘拷贝 {item} 失败：{exc}") from exc
+            copied += 1
+        return copied, f"{src} -> {dest_dir}"
+    return 0, "共享盘未配置 / 不可达 / 没有该目录"
 
 
 def _download(url: str, dest: Path, timeout_sec: int, retries: int) -> None:

@@ -14,16 +14,21 @@ download:
   sha256: {}
 
 # 共享盘分发（没有官方下载地址时的主路）。2026-09-18 实测：本机建 hall-packages 共享，
-# 另一台机器用 `net use \\192.168.0.4\hall-packages /user:hallshare "<密码>"` 可访问。
+# 另一台机器用 `net use \\LAPTOP-VS5F7HF4\hall-packages /user:hallshare "<密码>"` 可访问。
 # 共享盘不可达会被静默跳过（自动降级到下载），绝不因为共享盘挂了让整轮跑批失败。
 # 环境变量 HALL_PACKAGE_SHARE 可临时覆盖（单机切换用，不必改配置）。
+#
+# ⚠️ **写机器名，不要写 IP**：本机 IP 由 DHCP 分配，会变。
+# 2026-09-18 实测就踩过：配的是 `//192.168.0.4/...`，机器重启后 IP 变成 192.168.0.8，
+# 于是所有节点报「找不到网络名（系统错误 67）」—— 看起来像共享没建，实际是 IP 过期。
+# 机器名（NetBIOS/LLMNR 解析）在同一局域网里是稳的。
 package_share:
   dirs:
-    - "//192.168.0.4/hall-packages"
-  # 例：
+    - "//LAPTOP-VS5F7HF4/hall-packages"
+  # 例（多共享盘做冗余，按顺序试，不可达的会被跳过）：
   # dirs:
-  #   - "//192.168.0.4/hall-packages"          # 本机当前实测可用的共享
-  #   - "//LAPTOP-VS5F7HF4/hall-packages"       # 机器名访问（IP 会变，机器名更稳）
+  #   - "//LAPTOP-VS5F7HF4/hall-packages"       # 机器名访问（推荐）
+  #   - "//192.168.0.8/hall-packages"           # 备用：本机当时 IP，会随 DHCP 变化
 
 display_name_contains: "华硕大厅"
 search_keyword: "qq"

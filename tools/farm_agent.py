@@ -79,11 +79,29 @@ NODE_ENV_PATH = REPO_ROOT / NODE_ENV_FILENAME
 
 
 def farm_root() -> Path:
+    """农场目录：环境变量 > config.local.yaml > 硬退出。
+
+    环境变量优先（临时切到别的农场），其次是 `config.local.yaml` 里的 `farm_root`
+    —— bootstrap 会把 `HALL_FARM_ROOT` 的值写进去，这样**节点机不用每次开新窗口重设**。
+
+    两边都没有时**必须硬退出**，不能给个默认值：静默用错目录的表现是
+    "节点在跑但一个任务都取不到"，从表面完全看不出根因。
+    """
     raw = os.environ.get("HALL_FARM_ROOT", "").strip()
     if not raw:
+        try:
+            from hall_auto.config import load_config
+
+            raw = str(load_config().farm_root or "").strip()
+        except Exception:
+            raw = ""
+    if not raw:
         raise SystemExit(
-            "未设 HALL_FARM_ROOT。它指向共享盘上的农场目录（含 tasks/ done/ results/ logs/）。\n"
-            "例：$env:HALL_FARM_ROOT='\\\\SHARE\\qa\\hall-farm'"
+            "未设 HALL_FARM_ROOT，config.local.yaml 里也没有 farm_root。\n"
+            "它指向共享盘上的农场目录（含 tasks/ done/ results/ logs/）。\n"
+            "例：$env:HALL_FARM_ROOT='\\\\SHARE\\qa\\hall-farm'\n"
+            '或在 config.local.yaml 写一行 farm_root: "//LAPTOP-VS5F7HF4/hall-farm"'
+            "（bootstrap 跑过一次就会自动写）"
         )
     return Path(raw)
 

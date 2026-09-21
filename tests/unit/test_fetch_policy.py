@@ -396,50 +396,79 @@ def test_download_creates_nested_cache_dir(cfg_share):
     assert dest.is_file()
 
 
-# ---------------- 包名带子路径（fixtures/xxx）----------------
+# ---------------- 目录型资源（内部安全工具）----------------
 #
-# 2026-09-18 踩到的真 bug：`update_fixture.package` 是 `fixtures/7z2602-x64.exe`，
-# 带一层子目录。`ensure_from_share` 只建了 `_cache/`，没建 `_cache/fixtures/`，
-# 于是 `_copy_from_share` 里 `part.open("wb")` 直接 FileNotFoundError。
-# 表现极具迷惑性：**共享盘上明明有这个文件，却报"从共享盘拷贝失败"**。
-# 本机一直走"本地已有"分支，所以这个洞在真实多机场景才会暴露。
+# `ensure_from_share` 只管**单个文件**。P2 的内部安全工具是一整个目录
+# （CheckAppV.exe / SignAppsV.exe / SignCheck_v2.ps1 / signcheck_v2.zip），
+# 按红线不进公开仓库，此前只能人肉拷到每台机器，导致 `security` 套件必然 skip。
+# 共享盘不是 git 仓库 -> 放一次，所有节点自动取。这组用例锁的就是这条路径。
 
 
-def test_share_copy_creates_nested_cache_dir(cfg_share, tmp_path):
-    """包名带子路径 -> 缓存的子目录要自动建出来。"""
+def test_copy_tree_from_share_copies_nested_files(cfg_share, tmp_path):
+    """整棵子树都要拷过来，且相对目录结构保持（工具按相对路径互相找）。"""
     share = tmp_path / "share"
-    (share / "fixtures").mkdir(parents=True)
-    payload = b"nested-fixture"
-    (share / "fixtures" / "7z2602-x64.exe").write_bytes(payload)
+    (share / "fixtures" / "security_tools" / "sub").mkdir(parents=True)
+    (share / "fixtures" / "security_tools" / "CheckAppV.exe").write_bytes(b"checkappv")
+    (share / "fixtures" / "security_tools" / "SignCheck_v2.ps1").write_text("x", encoding="utf-8")
+    (share / "fixtures" / "security_tools" / "sub" / "extra.dat").write_bytes(b"nested")
+
+    dest = tmp_path / "local" / "fixtures" / "security_tools"
+    with mock.patch.object(fetch, "share_dirs", return_value=[share]):
+        count, why = fetch.copy_tree_from_share(cfg_share, "fixtures/security_tools", dest)
+
+    assert count == 3, f"应拷 3 个文件，实际 {count}（{why}）"
+    assert (dest / "CheckAppV.exe").read_bytes() == b"checkappv"
+    assert (dest / "SignCheck_v2.ps1").is_file()
+    assert (dest / "sub" / "extra.dat").read_bytes() == b"nested"
+
+
+def test_copy_tree_from_share_returns_zero_when_dir_absent(cfg_share, tmp_path):
+    """共享盘上没有这个目录 -> 返回 0，**不抛错**（只影响 P2，不该让整台机器铺设失败）。"""
+    share = tmp_path / "share"
+    share.mkdir()
+
+    dest = tmp_path / "local" / "security_tools"
+    with mock.patch.object(fetch, "share_dirs", return_value=[share]):
+        count, why = fetch.copy_tree_from_share(cfg_share, "fixtures/security_tools", dest)
+
+    assert count == 0
+    assert why
+    assert not dest.exists(), "没取到东西就不该留个空目录假装成功"
+
+
+def test_copy_tree_from_share_unreachable_share_is_not_error(cfg_share, tmp_path):
+    """共享盘整个不可达 -> 同样返回 0 不抛错（与 ensure_from_share 的降级口径一致）。"""
+    dest = tmp_path / "local" / "security_tools"
+    with mock.patch.object(fetch, "share_dirs", return_value=[tmp_path / "nope"]):
+        count, _why = fetch.copy_tree_from_share(cfg_share, "fixtures/security_tools", dest)
+    assert count == 0
+
+
+def test_copy_tree_from_share_blank_rel_dir(cfg_share, tmp_path):
+    """相对目录为空 -> 直接返回 0，别去拷整个共享根。"""
+    count, why = fetch.copy_tree_from_share(cfg_share, "   ", tmp_path / "dest")
+    assert count == 0
+    assert "空" in why
+
+
+def test_copy_tree_from_share_overwrites_readonly_file(cfg_share, tmp_path):
+    """**回归锁**：内部工具在共享盘上是只读的（copy2 带只读位）。
+
+    上一轮拷了一半、这轮重跑时要覆盖已存在的只读文件 —— Windows 上直接覆盖会 WinError 5。
+    必须先解锁再删。不修的话表现是"重跑 bootstrap 时安全工具永远拷不全"。
+    """
+    share = tmp_path / "share"
+    (share / "tools").mkdir(parents=True)
+    (share / "tools" / "CheckAppV.exe").write_bytes(b"fresh")
+
+    dest = tmp_path / "local" / "tools"
+    dest.mkdir(parents=True)
+    stale = dest / "CheckAppV.exe"
+    stale.write_bytes(b"stale")
+    stale.chmod(0o444)  # 只读，模拟上一轮 copy2 留下的状态
 
     with mock.patch.object(fetch, "share_dirs", return_value=[share]):
-        res = fetch.ensure_from_share(cfg_share, "fixtures/7z2602-x64.exe")
+        count, _why = fetch.copy_tree_from_share(cfg_share, "tools", dest)
 
-    assert res is not None, "带子路径的包必须能从共享盘取到"
-    assert res.source == "share"
-    assert res.path.read_bytes() == payload
-    assert res.path.parent.name == "fixtures"
-
-
-def test_download_creates_nested_cache_dir(cfg_share):
-    """下载同理：目标带子路径时父目录要自己建，别等 open() 才炸。"""
-    dest = fetch.cache_dir(cfg_share) / "fixtures" / "7z2602-x64.exe"
-
-    def _fake_urlopen(req, timeout=None):
-        class _Resp:
-            def read(self, n=-1):
-                return b""
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        return _Resp()
-
-    with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
-        fetch._download("http://example.invalid/x", dest, timeout_sec=1, retries=1)
-
-    assert dest.parent.is_dir()
-    assert dest.is_file()
+    assert count == 1
+    assert stale.read_bytes() == b"fresh", "只读文件必须被覆盖，不能静默跳过"
