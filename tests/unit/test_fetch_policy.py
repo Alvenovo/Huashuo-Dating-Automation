@@ -198,6 +198,10 @@ def cfg_share(tmp_path):
     cfg_file.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
     with mock.patch.dict("os.environ", {"HALL_CONFIG": str(cfg_file)}, clear=False):
         from hall_auto.config import load_config
+        # 与 `cfg` 同理：本机/上一个用例残留的这两个变量会把缓存目录指到别处，
+        # 断言就会变成「比两个同样被污染的值」，假绿且难查。
+        os.environ.pop("HALL_PACKAGE_CACHE", None)
+        os.environ.pop("HALL_PACKAGE_SHARE", None)
         yield load_config(cfg_file)
 
 
@@ -544,3 +548,145 @@ def test_ensure_package_verifies_fixture_sha_from_share(cfg_fixture, tmp_path):
     with mock.patch.object(fetch, "share_dirs", return_value=[share]):
         with pytest.raises(fetch.FetchError):
             fetch.ensure_from_share(cfg_fixture, "fixtures/7z2602-x64.exe")
+
+
+# ---------------- 瞬时文件锁（2026-09-18 偶发失败的根因）----------------
+#
+# 背景：`test_ensure_from_share_copies_and_verifies` 曾在一次全量跑中偶发失败，
+# 报 `FetchError: 从共享盘拷贝失败`，根因当时没定位。
+# 2026-09-21 用「注入一次瞬时 PermissionError」复现出来：`_copy_from_share`
+# 一次都不重试，而 `_download` 有 3 次重试 —— 同一种瞬时错误，两条路径行为不一致。
+# Windows 上杀软实时保护 / 索引服务会在文件 close 后短暂持有句柄，rename 报 WinError 5/32，
+# 这是**正常的、暂时的**，退避重试就能过。下面把这组行为钉死。
+
+
+def test_is_transient_lock_recognises_winerror():
+    """WinError 5/32/33/1224 判为瞬时锁；文件不存在这类不是。"""
+    for code in (5, 32, 33, 1224):
+        exc = OSError(13, "boom")
+        exc.winerror = code
+        assert fetch._is_transient_lock(exc), code
+    missing = OSError(2, "no such file")
+    missing.winerror = 2
+    assert not fetch._is_transient_lock(missing)
+
+
+def test_atomic_replace_retries_transient_lock(cfg, tmp_path):
+    """**回归锁**：一次瞬时锁不该让改名失败。"""
+    part = tmp_path / "a.exe.part"
+    dest = tmp_path / "a.exe"
+    part.write_bytes(b"payload")
+    real = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Access is denied", str(dst))
+        return real(src, dst)
+
+    with mock.patch.object(os, "replace", side_effect=flaky), \
+         mock.patch.object(fetch.time, "sleep", lambda s: None):
+        fetch._atomic_replace(part, dest)
+    assert dest.read_bytes() == b"payload"
+    assert calls["n"] == 2
+
+
+def test_atomic_replace_does_not_retry_permanent_error(tmp_path):
+    """永久错误（文件不存在）不该被无脑重试 —— 否则真失败要白等好几秒。"""
+    part = tmp_path / "a.exe.part"
+    dest = tmp_path / "a.exe"
+    part.write_bytes(b"payload")
+    calls = {"n": 0}
+
+    def missing(src, dst):
+        calls["n"] += 1
+        raise FileNotFoundError(2, "No such file or directory", str(src))
+
+    with mock.patch.object(os, "replace", side_effect=missing):
+        with pytest.raises(FileNotFoundError):
+            fetch._atomic_replace(part, dest)
+    assert calls["n"] == 1
+
+
+def test_share_copy_survives_transient_lock(cfg_share, tmp_path):
+    """**回归锁**：共享盘拷贝撞上一次瞬时锁仍应成功取到包（2026-09-18 那次失败）。"""
+    share = tmp_path / "share"
+    share.mkdir()
+    payload = b"from-share"
+    (share / "a.exe").write_bytes(payload)
+    real = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Access is denied", str(dst))
+        return real(src, dst)
+
+    with mock.patch.object(fetch, "share_dirs", return_value=[share]), \
+         mock.patch.object(os, "replace", side_effect=flaky), \
+         mock.patch.object(fetch.time, "sleep", lambda s: None):
+        res = fetch.ensure_from_share(cfg_share, "a.exe")
+
+    assert res is not None, "一次瞬时锁就把整条取包链打死了（回归）"
+    assert res.source == "share"
+    assert res.path.read_bytes() == payload
+
+
+def test_share_copy_fails_loudly_when_lock_persists(cfg_share, tmp_path):
+    """锁一直不释放 -> 重试到底后仍报错，不静默给个坏结果；且不留 .part。"""
+    share = tmp_path / "share"
+    share.mkdir()
+    (share / "a.exe").write_bytes(b"from-share")
+    calls = {"n": 0}
+
+    def always_locked(src, dst):
+        calls["n"] += 1
+        raise PermissionError(13, "Access is denied", str(dst))
+
+    with mock.patch.object(fetch, "share_dirs", return_value=[share]), \
+         mock.patch.object(os, "replace", side_effect=always_locked), \
+         mock.patch.object(fetch.time, "sleep", lambda s: None):
+        with pytest.raises(fetch.FetchError, match="从共享盘拷贝失败"):
+            fetch.ensure_from_share(cfg_share, "a.exe")
+
+    assert calls["n"] == fetch.ATOMIC_REPLACE_ATTEMPTS, "改名重试次数应与常量一致"
+    cache = fetch.cache_dir(cfg_share)
+    assert not list(cache.rglob("*.part")), "失败后不该留 .part 残留"
+
+
+def test_download_also_survives_transient_lock(cfg, tmp_path):
+    """下载路径同样要能扛住瞬时锁 —— 两条路径行为必须一致。"""
+    dest = fetch.cache_dir(cfg) / "b.exe"
+    real = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Access is denied", str(dst))
+        return real(src, dst)
+
+    class _FakeResp:
+        def __init__(self):
+            self._sent = False
+
+        def read(self, n=-1):
+            if self._sent:
+                return b""
+            self._sent = True
+            return b"downloaded"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    # 每次 urlopen 都要拿到**新**对象：重试会再读一次，复用同一个会读到空流
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=lambda *a, **k: _FakeResp()), \
+         mock.patch.object(os, "replace", side_effect=flaky), \
+         mock.patch.object(fetch.time, "sleep", lambda s: None):
+        fetch._download("http://example.invalid/x.exe", dest, 5, 3)
+    assert dest.read_bytes() == b"downloaded"

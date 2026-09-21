@@ -157,6 +157,100 @@ def _verify(path: Path, expected: str) -> str:
 SHARE_PROBE_SEC = 5
 SHARE_COPY_CHUNK = 1 << 20
 
+# 共享盘拷贝的重试次数（只重试"读共享盘 + 写 .part"这段）。理由见 `_atomic_replace`。
+SHARE_COPY_RETRIES = 3
+
+# `.part` -> 正式名 的改名重试次数。改名自带瞬时锁重试，所以拷贝循环不用再套一层。
+ATOMIC_REPLACE_ATTEMPTS = 5
+
+# Windows「瞬时文件锁」的 winerror 码。这些不是错误状态，是别的进程**短暂**持有句柄：
+#   5    拒绝访问   —— 杀软实时保护扫刚 close 的文件、索引服务
+#   32   文件被占用 —— 同上，或另一进程正好在读
+#   33   文件被锁区间
+#   1224 文件有用户映射 —— 映射未撤干净
+_TRANSIENT_LOCK_WINERRORS = frozenset({5, 32, 33, 1224})
+
+
+def _is_transient_lock(exc: OSError) -> bool:
+    """这个 OSError 是不是「等一会儿就好」的瞬时锁。
+
+    注意：Windows 上 `OSError.winerror` **总是存在**，手工构造或非系统调用产生的
+    异常里它是 `None`。所以必须判 `is not None`，不能只判 `hasattr`。
+    """
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _TRANSIENT_LOCK_WINERRORS
+    # 没有 winerror：非 Windows（POSIX 只有 errno），用异常类型兜底
+    return isinstance(exc, PermissionError)
+
+
+def _atomic_replace(part: Path, dest: Path, attempts: int = ATOMIC_REPLACE_ATTEMPTS) -> None:
+    """把 `.part` 原子改名成正式名，对 Windows 瞬时锁退避重试。
+
+    **为什么必须重试**：Windows 上杀软实时保护会在文件 close 之后短暂持有句柄
+    （索引服务同理），此时 `os.replace` 报 WinError 5/32。这不是失败状态，
+    等几十毫秒就过去了。没有重试时，**一次瞬时锁 = 整条取包链硬失败**。
+
+    这正是 2026-09-18 那次 `test_ensure_from_share_copies_and_verifies` 偶发失败的根因：
+    下载路径（`_download`）对 OSError 有 3 次重试所以自愈，而共享盘拷贝一次都不重试，
+    两条路径对同一种瞬时错误的行为不一致。
+    """
+    delay = 0.05
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(part, dest)
+            return
+        except OSError as exc:
+            if not _is_transient_lock(exc) or attempt == attempts:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+
+
+def _copy_from_share(src: Path, dest: Path) -> None:
+    """从共享盘拷到本地缓存。走 .part 再原子改名（与下载同一套约定）。
+
+    **必须自己建 dest 的父目录**：包名可能带子路径（如 `fixtures/7z2602-x64.exe`），
+    缓存里对应的是 `_cache/fixtures/...`，而调用方只建了 `_cache`。
+    不建的话 `part.open("wb")` 直接 `FileNotFoundError` —— 表现是
+    "共享盘明明有这个文件，却报拷贝失败"，极具迷惑性。
+
+    **必须重试**（与 `_download` 对齐）：读共享盘可能撞上瞬时错误
+    （SMB 会话重建、UNC 短暂不可达），写 `.part` 可能撞上杀软扫到一半的句柄。
+    退避重试就能过；改名那一步由 `_atomic_replace` 自己重试，不在这里重拷一遍。
+    """
+    part = dest.with_suffix(dest.suffix + ".part")
+    try:
+        part.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FetchError(f"缓存目录不可写 {part.parent}：{exc}") from exc
+
+    last: Exception | None = None
+    for attempt in range(1, SHARE_COPY_RETRIES + 1):
+        try:
+            with src.open("rb") as fh_in, part.open("wb") as fh_out:
+                while True:
+                    chunk = fh_in.read(SHARE_COPY_CHUNK)
+                    if not chunk:
+                        break
+                    fh_out.write(chunk)
+                fh_out.flush()
+                os.fsync(fh_out.fileno())
+            break
+        except OSError as exc:
+            last = exc
+            part.unlink(missing_ok=True)
+            if attempt < SHARE_COPY_RETRIES:
+                time.sleep(min(0.2 * attempt, 1.0))
+    else:
+        raise FetchError(f"从共享盘拷贝失败 {src}：{last}") from last
+
+    try:
+        _atomic_replace(part, dest)
+    except OSError as exc:
+        part.unlink(missing_ok=True)
+        raise FetchError(f"从共享盘拷贝失败 {src}：{exc}") from exc
+
 
 def share_dirs(cfg: Config) -> list[Path]:
     """配置里声明的共享盘目录，按优先级排序。
@@ -210,31 +304,6 @@ def share_reachable(directory: Path, timeout_sec: int = SHARE_PROBE_SEC) -> tupl
     if thread.is_alive():
         return False, f"探测超时（{timeout_sec}s），判定不可达"
     return result["ok"], result["why"]
-
-
-def _copy_from_share(src: Path, dest: Path) -> None:
-    """从共享盘拷到本地缓存。走 .part 再原子改名（与下载同一套约定）。
-
-    **必须自己建 dest 的父目录**：包名可能带子路径（如 `fixtures/7z2602-x64.exe`），
-    缓存里对应的是 `_cache/fixtures/...`，而调用方只建了 `_cache`。
-    不建的话 `part.open("wb")` 直接 `FileNotFoundError` —— 表现是
-    "共享盘明明有这个文件，却报拷贝失败"，极具迷惑性。
-    """
-    part = dest.with_suffix(dest.suffix + ".part")
-    try:
-        part.parent.mkdir(parents=True, exist_ok=True)
-        with src.open("rb") as fh_in, part.open("wb") as fh_out:
-            while True:
-                chunk = fh_in.read(SHARE_COPY_CHUNK)
-                if not chunk:
-                    break
-                fh_out.write(chunk)
-            fh_out.flush()
-            os.fsync(fh_out.fileno())
-        os.replace(part, dest)
-    except OSError as exc:
-        part.unlink(missing_ok=True)
-        raise FetchError(f"从共享盘拷贝失败 {src}：{exc}") from exc
 
 
 def ensure_from_share(cfg: Config, filename: str) -> FetchResult | None:
@@ -352,7 +421,7 @@ def _download(url: str, dest: Path, timeout_sec: int, retries: int) -> None:
                     fh.write(chunk)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(part, dest)  # 同盘原子
+            _atomic_replace(part, dest)  # 同盘原子（内含瞬时锁重试）
             return
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last = exc
