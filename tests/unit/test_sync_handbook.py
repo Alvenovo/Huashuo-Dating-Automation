@@ -2,11 +2,13 @@
 
 存在的理由：桌面那份分发副本是**手工拷的**，仓库一改它就旧，而且**不会报错**。
 2026-09-21 真发生过 —— 桌面停在 09-18 的「10 步版」，仓库已经是「12 步版」，
-差了整整三轮修复（含 6 个硬阻断）。这里把三件事钉死：
+差了整整三轮修复（含 6 个硬阻断）。这里把四件事钉死：
 
   1. `--check` 能准确说出「一致 / 旧了」，且旧了时退出码为 1（能进 CI / 进清单）；
-  2. 覆盖前**必须留一份旧版备份** —— 万一对面手工批注过还能找回；
-  3. 目标不存在时直接建，不报错。
+  2. 覆盖前**必须留一份旧版备份** —— 万一对面手工批注过还能找回（且**第二次覆盖不覆盖留档**）；
+  3. 目标不存在时直接建，不报错；
+  4. **同步出去的是「发放版」** —— 凭据占位符用 `HALL_SHARE_PASSWORD` 现场替换；
+     没设变量时**报错退出，绝不静默降级成占位版**（见文件末「发放版」那一节）。
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ import sys
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.unit
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -401,3 +406,191 @@ def test_kb_tool_references_exist():
         "知识库引用了不存在的 tools 脚本（新机器照着敲会白跑一趟）：\n  "
         + "\n  ".join(missing)
     )
+
+
+# ---------------- 发放版：真密码从环境变量来 ----------------
+#
+# 2026-09-21 定：桌面那份要发出去的**只要发放版**（带真密码），不要占位版。
+# 而密码不能进 git —— 于是仓库存占位符、同步时用环境变量现场替换。
+#
+# 这一组用例钉住的是**最要命的那个静默失败**：忘了设环境变量时，
+# 脚本绝不能"悄悄地"把一份密码写着 `<共享盘密码>` 的文档落到桌面。
+# 那份发出去**看起来是好的**，一线要到 `net use` 报 401 才发现 —— 和本项目
+# 反复治的"假绿"是同一类病。
+
+_ENV_NAME = "HALL_SHARE_PASSWORD"
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_password(monkeypatch):
+    """测试期间清掉凭据环境变量 —— 本机 shell 真设了它也不能影响判定。
+
+    不清的话，「没设密码必须报错」那条会在开发机上随机失败，
+    而失败原因（本机正好设了变量）跟被测逻辑毫无关系。
+    """
+    monkeypatch.delenv(_ENV_NAME, raising=False)
+
+
+def _doc_with_placeholder(tmp_path: Path, name: str = "清单.md") -> Path:
+    src = tmp_path / name
+    src.write_text(
+        '# 清单\n\nnet use \\\\HOST\\share /user:hallshare "<共享盘密码>" /persistent:yes\n',
+        encoding="utf-8",
+    )
+    return src
+
+
+def test_password_env_name_matches_the_documented_one(sh_real):
+    """环境变量名钉死 —— 上面那个 autouse fixture 用的是字面量，别让它悄悄脱钩。"""
+    assert sh_real.PASSWORD_ENV == _ENV_NAME
+
+
+def test_placeholders_are_substituted(sh, monkeypatch, tmp_path, capsys):
+    src = _doc_with_placeholder(tmp_path)
+    monkeypatch.setattr(sh, "DOCS", [src])
+    monkeypatch.setenv(_ENV_NAME, "PW-EXAMPLE")
+
+    out = tmp_path / "out"
+    assert _run(sh, monkeypatch, "--to", str(out)) == 0
+    text = (out / "清单.md").read_text(encoding="utf-8")
+    assert "PW-EXAMPLE" in text
+    assert "<共享盘密码>" not in text
+    assert "发放版" in capsys.readouterr().out
+
+
+def test_refuses_to_write_when_password_missing(sh, monkeypatch, tmp_path, capsys):
+    """**核心**：没设密码时不许静默降级成占位版 —— 那份发出去就是废文档。"""
+    src = _doc_with_placeholder(tmp_path)
+    monkeypatch.setattr(sh, "DOCS", [src])
+
+    out = tmp_path / "out"
+    assert _run(sh, monkeypatch, "--to", str(out)) == 1
+    assert not (out / "清单.md").exists(), "没设密码却写出了文件 —— 正是要防的静默降级"
+    printed = capsys.readouterr().out
+    assert "[FAIL]" in printed
+    assert _ENV_NAME in printed, "报错必须点名要设哪个环境变量"
+    assert "--placeholder" in printed, "得告诉人怎么故意生成占位版"
+
+
+def test_check_also_refuses_without_password(sh, monkeypatch, tmp_path, capsys):
+    """`--check` 同样不能装一致 —— 它算不出发放版，就没资格说"最新"。"""
+    src = _doc_with_placeholder(tmp_path)
+    monkeypatch.setattr(sh, "DOCS", [src])
+
+    assert _run(sh, monkeypatch, "--to", str(tmp_path / "out"), "--check") == 1
+    assert "[FAIL]" in capsys.readouterr().out
+
+
+def test_placeholder_flag_allows_placeholder_output(sh, monkeypatch, tmp_path, capsys):
+    """`--placeholder` 是显式降级 —— 只给调试脚本本身用。"""
+    src = _doc_with_placeholder(tmp_path)
+    monkeypatch.setattr(sh, "DOCS", [src])
+
+    out = tmp_path / "out"
+    assert _run(sh, monkeypatch, "--to", str(out), "--placeholder") == 0
+    text = (out / "清单.md").read_text(encoding="utf-8")
+    assert "<共享盘密码>" in text
+    assert "发放版" not in text, "占位版不该挂「发放版」横幅 —— 那是自欺"
+
+
+def test_new_password_placeholder_is_never_substituted(sh, monkeypatch, tmp_path):
+    """**核心**：`<新密码>` 是"你自己想一个新的"，换成共享盘密码是**错的**。
+
+    它出现在改密流程 `net user hallshare "<新密码>"` 里。换成旧密码的话，
+    照抄那条命令会真的把共享盘密码设回原值 —— 错得还很隐蔽。
+    """
+    src = tmp_path / "手册.md"
+    src.write_text(
+        '# 手册\n\nnet user hallshare "<新密码>"\n\n$env:HALL_SHARE_PASSWORD = "<密码>"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sh, "DOCS", [src])
+    monkeypatch.setenv(_ENV_NAME, "PW-EXAMPLE")
+
+    out = tmp_path / "out"
+    assert _run(sh, monkeypatch, "--to", str(out)) == 0
+    text = (out / "手册.md").read_text(encoding="utf-8")
+    assert "<新密码>" in text, "改密占位符被替换了 —— 会把共享盘密码设成旧值"
+    assert text.count("PW-EXAMPLE") == 1, "只该替换那一个凭据占位符"
+
+
+def test_release_banner_is_added_under_the_title(sh, monkeypatch, tmp_path):
+    src = _doc_with_placeholder(tmp_path)
+    monkeypatch.setattr(sh, "DOCS", [src])
+    monkeypatch.setenv(_ENV_NAME, "PW-EXAMPLE")
+
+    out = tmp_path / "out"
+    _run(sh, monkeypatch, "--to", str(out))
+    lines = (out / "清单.md").read_text(encoding="utf-8").split("\n")
+    assert lines[0] == "# 清单", "标题必须还在第一行"
+    banner = "\n".join(lines[:4])
+    assert "发放版" in banner and "明文凭据" in banner
+    assert "不要 commit" in banner, "横幅要拦住误 commit —— 这是最实际的泄露路径"
+
+
+def test_unregistered_placeholder_blocks_the_release(sh, monkeypatch, tmp_path, capsys):
+    """有人加了新占位符却没登记进白名单 → 必须报错，不许原样发出去。"""
+    src = tmp_path / "清单.md"
+    src.write_text('# 清单\n\nnet use \\\\HOST\\share "<共享盘密码>" "<另一个密码>"\n', encoding="utf-8")
+    monkeypatch.setattr(sh, "DOCS", [src])
+    monkeypatch.setenv(_ENV_NAME, "PW-EXAMPLE")
+
+    out = tmp_path / "out"
+    assert _run(sh, monkeypatch, "--to", str(out)) == 1
+    assert not (out / "清单.md").exists()
+    printed = capsys.readouterr().out
+    assert "另一个密码" in printed, "要指名道姓说哪个占位符没登记"
+
+
+def test_real_docs_contain_only_registered_placeholders(sh_real):
+    """**仓库那两份**替换后不许残留凭据占位符（`<新密码>` 除外）。
+
+    这是"新增了一种占位符"的看门人：漏登记的话，发放版里它会**原样**发出去，
+    而发放版本身看不出来 —— 一线照抄那条命令就失败。
+    """
+    for doc in sh_real.DOCS:
+        text = doc.read_text(encoding="utf-8")
+        rendered = sh_real.render_release(text, "PW-EXAMPLE", doc.name)
+        leftover = sh_real.leftover_placeholders(rendered)
+        assert not leftover, (
+            f"{doc.name} 里有没登记的凭据占位符 {leftover} —— "
+            f"加进 sync_handbook.PASSWORD_PLACEHOLDERS，或者确认它不是凭据"
+        )
+
+
+def test_second_overwrite_keeps_the_first_backup(sh, monkeypatch, tmp_path, capsys):
+    """第二次覆盖不能把上一次的留档也覆盖掉 —— 那等于没有留档。
+
+    真机上就撞过：桌面已有 `新机操作清单-旧版备份.md`（更早那份手工版），
+    再同步一次会把**手工批注过的那份**抹掉。
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "源手册.md"
+
+    target.write_text("第一版\n", encoding="utf-8")
+    assert _run(sh, monkeypatch, "--to", str(out)) == 0
+    capsys.readouterr()
+    assert (out / "源手册-旧版备份.md").read_text(encoding="utf-8") == "第一版\n"
+
+    target.write_text("第二版\n", encoding="utf-8")
+    assert _run(sh, monkeypatch, "--to", str(out)) == 0
+    capsys.readouterr()
+
+    backups = sorted(p.name for p in out.glob("源手册-旧版备份*.md"))
+    assert len(backups) == 2, f"第二次覆盖没另存一份：{backups}"
+    assert (out / "源手册-旧版备份.md").read_text(encoding="utf-8") == "第一版\n", (
+        "第一次的留档被覆盖了"
+    )
+
+
+def test_plain_doc_without_placeholders_still_syncs(sh, monkeypatch, tmp_path):
+    """没有凭据占位符的文档照常同步 —— 发放版逻辑不该拦住无关文档。"""
+    src = tmp_path / "普通.md"
+    src.write_text("# 普通文档\n\n没有凭据。\n", encoding="utf-8")
+    monkeypatch.setattr(sh, "DOCS", [src])
+
+    out = tmp_path / "out"
+    assert _run(sh, monkeypatch, "--to", str(out)) == 0
+    assert (out / "普通.md").read_text(encoding="utf-8") == src.read_text(encoding="utf-8")
+
