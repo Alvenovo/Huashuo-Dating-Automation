@@ -50,6 +50,19 @@
     .\\.venv\\Scripts\\python.exe -X utf8 tools/farm_agent.py --once          # 有任务就跑一轮
     .\\.venv\\Scripts\\python.exe -X utf8 tools/farm_agent.py --loop         # 持续轮询
     .\\.venv\\Scripts\\python.exe -X utf8 tools/farm_agent.py --local launch # 不走共享盘，本机直接跑某套件
+
+## `--loop` 空闲时必须留痕（2026-09-21 修）
+
+空闲分支原来**一个字都不打**：启动打印两行，然后 30 秒一次静默轮询，屏幕上再也不动。
+首台真机 DESKTOP-DOHED68 就为此被当成"卡住 5 分钟不动"，实际它只是在正常空转。
+
+**更糟的是它和真故障长得一样**：UNC 一断，`Path.is_file()` 会把 `OSError` 吞成 `False`，
+`take_task` 一路走到"无任务" —— 节点在报平安，其实一个任务都取不到。
+所以现在每次空闲轮询都打一行心跳（带时间戳 + 它在等哪个文件），
+并额外探一次农场目录可达性；探不到就换成一段"节点活着但取不到任务"的排查指引。
+
+`--once` 同理：农场不可达时**不能**打「无任务，退出」再返回 0（那是假绿），
+改为返回 `3`。退出码约定：`0` 正常／`2` 任务被拒收／`3` 农场不可达。
 """
 
 from __future__ import annotations
@@ -187,6 +200,56 @@ def take_task(root: Path, node: str) -> tuple[dict | None, str]:
     return task, ""
 
 
+def prepare_farm(root: Path) -> str:
+    """确保农场目录可用：建齐四个子目录，再确认能取任务。`""` = 可用，否则一句原因。
+
+    **两件事为什么合成一件、而且每轮都做**：
+
+    1. 共享盘不通时 `mkdir` 会抛 `OSError`。原来这发生在 `main` 启动时，
+       `--loop` 刚起来就吐一段 Python traceback 退出，一线看到的是
+       `PermissionError: [WinError 5] 拒绝访问` —— **看着像权限问题，实际多半是包源机关了**。
+       改成"报告 + 继续轮询"之后，共享盘恢复了自己就好，不用守着机器重跑。
+    2. 空闲轮询也必须探可达性：UNC 断掉时 `Path.is_file()` 会把 `OSError` 吞成 `False`，
+       `take_task` 于是走到"无任务"那条路 —— 节点在报平安，实际一个任务都取不到。
+       这和"真的没任务"从表面看**一模一样**（本项目反复踩的"静默失败"）。
+
+    建目录是幂等的，代价是每轮 4 次 `mkdir`（已存在就返回），可以忽略。
+    """
+    try:
+        ensure_dirs(root)
+    except OSError as exc:
+        return f"连不上 / 建不出 {root}（{exc}）"
+    tasks_dir = root / "tasks"
+    if not tasks_dir.is_dir():
+        return f"{tasks_dir} 不存在"
+    return ""
+
+
+def farm_hint(root: Path) -> str:
+    """取不到任务时那段排查指引。`--once` 起不来和 `--loop` 空转共用一份，别写两遍。"""
+    return (
+        "         ⚠ 节点进程活着，但一个任务都取不到。逐条查：\n"
+        "           ① 包源机（共享盘宿主）是不是关了 —— 它是唯一的包来源；\n"
+        f"           ② 这台机器上手工连一次农场共享（见手册步骤 4）：net use {root}\n"
+        "           ③ 农场共享名 / 机器名写错了（IP 会变，一律用机器名）。"
+    )
+
+
+def idle_line(node: str, root: Path, poll_index: int, problem: str) -> str:
+    """空闲轮询要打印的那一行。**永不返回空串**。
+
+    留痕的理由见模块 docstring「`--loop` 空闲时必须留痕」：
+    没有它，现场无法区分"在正常等任务"和"UNC 卡死"，只能靠猜。
+    """
+    stamp = datetime.now().strftime("%H:%M:%S")
+    if problem:
+        return f"[{stamp}] 轮询 #{poll_index}：{problem}\n{farm_hint(root)}"
+    return (
+        f"[{stamp}] 轮询 #{poll_index}：无任务，{POLL_SECONDS} 秒后再查"
+        f"（等 {root / 'tasks' / (node + '.json')}）"
+    )
+
+
 def run_suite(
     suite_name: str,
     shard_id: int,
@@ -292,34 +355,48 @@ def main() -> int:
         return rc
 
     root = farm_root()
-    ensure_dirs(root)
 
     if not args.once and not args.loop:
         parser.error("需指定 --once / --loop / --local")
 
-    print(f"节点 {node} 农场目录 {root}")
+    print(f"节点 {node} 农场目录 {root}", flush=True)
+    # 把"它在等哪个文件"直接打出来：节点名和控制机 `dispatch --nodes` 对不上
+    # 是「一直无任务」的头号原因，写出来一眼就能核对，不用去翻 config / 环境变量。
+    print(f"等待任务文件 {root / 'tasks' / f'{node}.json'}", flush=True)
+    # flush 不能省：`--loop` 常驻，输出被重定向到文件/管道时是块缓冲的，
+    # 不 flush 就攒在缓冲区里 —— 又变回"看起来卡住"。
+    poll_index = 0
     while True:
+        problem = prepare_farm(root)
         task, reject = take_task(root, node)
         if task is None:
             if reject:
-                print(f"拒收任务：{reject}", file=sys.stderr)
+                print(f"拒收任务：{reject}", file=sys.stderr, flush=True)
                 if args.once:
                     return 2
                 time.sleep(POLL_SECONDS)
                 continue
             if args.once:
-                print("无任务，退出")
+                if problem:
+                    # 农场不可达 ≠ 无任务。打「无任务，退出」+ 返回 0 是**假绿**：
+                    # 一线会以为链路通了、只是没人投任务，实际包源机可能已经关了。
+                    print(f"农场不可达，没取到任务：{problem}", file=sys.stderr, flush=True)
+                    print(farm_hint(root), file=sys.stderr, flush=True)
+                    return 3
+                print("无任务，退出", flush=True)
                 return 0
+            poll_index += 1
+            print(idle_line(node, root, poll_index, problem), flush=True)
             time.sleep(POLL_SECONDS)
             continue
 
         if reject:
             # 非拒收的说明（如清理了残留占位）——打出来便于发现"上次没正常收尾"
-            print(f"[提示] {reject}")
+            print(f"[提示] {reject}", flush=True)
 
         task_id = str(task.get("task_id") or datetime.now().strftime("%Y%m%d_%H%M%S"))
         task_env = task.get("env") if isinstance(task.get("env"), dict) else {}
-        print(f"取到任务 {task_id}")
+        print(f"取到任务 {task_id}", flush=True)
         log = root / "logs" / f"{node}_{task_id}.log"
         results: list[dict] = []
         creds: dict[str, bool] = {}
@@ -327,14 +404,14 @@ def main() -> int:
             name = str(entry.get("name") or "")
             sid = int(entry.get("shard_id") or 1)
             scount = int(entry.get("shard_count") or 1)
-            print(f"  跑 {name}（分片 {sid}/{scount}）")
+            print(f"  跑 {name}（分片 {sid}/{scount}）", flush=True)
             before = evidence_snapshot()   # 先拍快照，避免没产出证据时错认上一轮的目录
             rc, creds = run_suite(name, sid, scount, log, task_env=task_env)
             run_dir = newest_run_dir(exclude=before)
             results.append({"suite": name, "shard_id": sid, "shard_count": scount, "exit_code": rc,
                             "run_dir": run_dir.name if run_dir else None})
             if run_dir is None:
-                print(f"  {name} 本轮没产出证据目录（rc={rc}），不猜测、不回传", file=sys.stderr)
+                print(f"  {name} 本轮没产出证据目录（rc={rc}），不猜测、不回传", file=sys.stderr, flush=True)
             else:
                 _write_node_env(run_dir, node, task_id, name, creds)
                 dest = root / "results" / node / run_dir.name
@@ -342,9 +419,9 @@ def main() -> int:
                     if dest.exists():
                         shutil.rmtree(dest, ignore_errors=True)
                     shutil.copytree(run_dir, dest)
-                    print(f"  证据已回传 {dest}")
+                    print(f"  证据已回传 {dest}", flush=True)
                 except OSError as exc:
-                    print(f"  证据回传失败：{exc}", file=sys.stderr)
+                    print(f"  证据回传失败：{exc}", file=sys.stderr, flush=True)
 
         # 凭据状态写进回执：报告里能区分「这台没配凭据 → 一片 skip」和「用例真跳过」。
         # 不写的话，汇总表上只有一堆黄色，看不出根因是环境没铺好。
@@ -361,7 +438,7 @@ def main() -> int:
         done_file = root / "done" / f"{node}_{task_id}.json"
         done_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         (root / "tasks" / f"{node}.json.running").unlink(missing_ok=True)
-        print(f"任务完成，结果 {done_file}")
+        print(f"任务完成，结果 {done_file}", flush=True)
 
         if args.once:
             return 0

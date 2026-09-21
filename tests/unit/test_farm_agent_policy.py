@@ -290,3 +290,109 @@ def test_evidence_name_matches_control_side():
 
     assert farm_agent.NODE_ENV_EVIDENCE_NAME == NODE_ENV_EVIDENCE_NAME
 
+
+# ---------------- 空闲轮询不许静默（"--loop 卡住了"这个假象） ----------------
+#
+# 2026-09-21 首台真机 DESKTOP-DOHED68：`--loop` 启动后打印两行，然后 5 分钟没动静，
+# 现场判定为"卡死"。实际空闲分支一个字都不打 —— 30 秒一次静默轮询，机器好得很。
+#
+# 更要命的是它和真故障**长得一样**：UNC 一断，`Path.is_file()` 把 OSError 吞成 False，
+# `take_task` 走到"无任务"，节点在报平安而其实一个任务都取不到。
+# 所以：① 每次空闲轮询必须留痕；② 农场探不到时必须吼出来，不能报"无任务"。
+
+
+def test_idle_line_never_blank(root):
+    """**核心回归锁**：空闲那一行不许是空串 —— 空白就是这次的 bug 本身。"""
+    assert farm_agent.idle_line("R01", root, 1, "").strip()
+    assert farm_agent.idle_line("R01", root, 7, "取不到农场").strip()
+
+
+def test_idle_line_shows_which_file_it_waits_for(root):
+    """要打出来它在等哪个文件 —— 节点名对不上是"一直无任务"的头号原因。"""
+    line = farm_agent.idle_line("R01", root, 1, "")
+    assert "无任务" in line
+    assert "R01.json" in line
+
+
+def test_idle_line_loud_when_farm_unreachable(root):
+    """农场不可达时不能只说"无任务"，要给出排查方向。"""
+    line = farm_agent.idle_line("R01", root, 3, "连不上 \\\\host\\hall-farm（系统错误 67）")
+    assert "连不上" in line
+    assert "一个任务都取不到" in line
+
+
+def test_prepare_farm_ok_when_dirs_exist(root):
+    assert farm_agent.prepare_farm(root) == ""
+
+
+def test_prepare_farm_creates_missing_dirs(tmp_path):
+    """目录不在就建出来（幂等）—— 节点第一次跑不必手工建。"""
+    assert farm_agent.prepare_farm(tmp_path / "fresh") == ""
+    assert (tmp_path / "fresh" / "tasks").is_dir()
+
+
+def test_prepare_farm_reports_oserror_without_raising(tmp_path):
+    """**关键**：共享盘不通时 `mkdir` 抛 `OSError`，必须变成一句原因，不许冒出 traceback。
+
+    原来这个 `mkdir` 发生在 `main` 启动时 → `--loop` 刚起来就崩，
+    一线看到的是 `PermissionError: [WinError 5] 拒绝访问` —— 看着像权限问题，
+    实际多半是包源机关了。实测（2026-09-21）：指向不存在的共享名就是这个栈。
+    """
+    blocker = tmp_path / "afile"
+    blocker.write_text("x", encoding="utf-8")   # 拿普通文件当父目录，mkdir 必抛 OSError
+    assert farm_agent.prepare_farm(blocker / "farm") != ""
+
+
+def test_loop_prints_heartbeat_while_idle(root, monkeypatch, capsys):
+    """端到端锁：`--loop` 空转 3 轮，屏幕上必须有 3 行心跳。
+
+    只测 `idle_line` 不够 —— 真正咬人的是"函数写对了但 main 里没调用"。
+    """
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+
+    ticks = {"n": 0}
+
+    def fake_sleep(_seconds):
+        ticks["n"] += 1
+        if ticks["n"] >= 3:
+            raise KeyboardInterrupt  # 用中断跳出无限循环，模拟人按 Ctrl+C
+
+    monkeypatch.setattr(farm_agent.time, "sleep", fake_sleep)
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--loop"])
+
+    with pytest.raises(KeyboardInterrupt):
+        farm_agent.main()
+
+    out = capsys.readouterr().out
+    assert out.count("轮询 #") == 3, "每轮空闲都要留痕，不许静默空转"
+    assert "R01.json" in out, "要打出来它在等哪个任务文件"
+
+
+def test_once_does_not_fake_green_when_farm_unreachable(tmp_path, monkeypatch, capsys):
+    """**假绿防护**：农场不可达时 `--once` 不许打「无任务，退出」再返回 0。
+
+    那样一线会以为"链路通了、只是没人投任务"，而真相是包源机可能已经关了 ——
+    和"空套件写成功回执"是同一类错误。
+    """
+    blocker = tmp_path / "afile"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: blocker / "farm")
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+
+    assert farm_agent.main() == 3
+    captured = capsys.readouterr()
+    assert "无任务，退出" not in captured.out
+    assert "农场不可达" in captured.err
+
+
+def test_once_still_clean_when_farm_ok_and_no_task(root, monkeypatch, capsys):
+    """正常空农场保持原行为：`无任务，退出` + 返回 0（这是链路通了的证明）。"""
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+
+    assert farm_agent.main() == 0
+    assert "无任务，退出" in capsys.readouterr().out
+
