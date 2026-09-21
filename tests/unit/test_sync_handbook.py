@@ -343,3 +343,32 @@ def test_both_docs_clone_into_the_expected_directory(doc_texts):
                 f"{name} 的 clone 没写目标目录名（`hall-auto.git` 会落地成 `hall-auto`，"
                 f"后续 `cd {_CLONE_TARGET}` 必然报路径不存在）：{ln.strip()}"
             )
+
+
+# 2026-09-21 第二台真机实测又暴露一个坑，而且是**报错指向错误方向**的那一类：
+#   节点读不到共享盘裸仓库的 pack 文件（那 3 个文件的 ACL 里没有 `hallshare`，
+#   是 `git clone --bare` 走硬链接把本地目录的 ACL 带过来的），
+#   而 git 报的却是 `failed to copy file to '<桌面上的目标文件>': Permission denied` ——
+#   一线会去查桌面保护策略、杀软、磁盘空间，**全错**。
+#   真因在共享盘那一侧，只有共享宿主能修（`tools/check_share_acl.ps1`）。
+#   两份文档都必须把这条写进报错对照表，否则下一个测试同事会照错方向再浪费半天。
+_PERMISSION_DENIED = "Permission denied"
+_ACL_TOOL = "check_share_acl"
+
+
+def test_both_docs_point_the_pack_permission_error_at_the_share_acl(doc_texts):
+    """两份文档都要说明：pack 拷贝报 `Permission denied` 是**共享盘权限**问题。
+
+    这条的价值在于**它反直觉** —— 报错里的路径是本地目标文件，真因却在共享盘。
+    文档不写，一线必然在本机反复折腾（换目录、关杀软、清盘），全是白费。
+    """
+    for name, text in doc_texts.items():
+        assert _PERMISSION_DENIED in text, (
+            f"{name} 的报错对照表里没有 `Permission denied` 这一条 —— "
+            "真机上撞到时一线只能自己猜，而这一条**猜必错**"
+        )
+        assert _ACL_TOOL in text, (
+            f"{name} 没提 `tools\\check_share_acl.ps1` —— "
+            "这条错只有共享宿主能修，文档必须把球明确踢给负责人，"
+            "否则一线会在测试机上做一堆无用功"
+        )
