@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -120,7 +122,8 @@ def test_venv_reinstalls_when_requirements_changed(bm):
     if not py.is_file():
         pytest.skip("本机没有 .venv")
 
-    with mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
          mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
          mock.patch.object(Path, "exists", return_value=True), \
          mock.patch.object(Path, "read_text", return_value="b" * 64), \
@@ -151,7 +154,8 @@ def test_venv_reinstalls_when_marker_lies(bm):
             return False, "缺 pywinauto"  # 第一次（跳过前校验）报缺
         return True, "关键依赖均可 import"
 
-    with mock.patch.object(bm, "_deps_probe", side_effect=probe), \
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_deps_probe", side_effect=probe), \
          mock.patch.object(Path, "exists", return_value=True), \
          mock.patch.object(Path, "read_text", return_value="c" * 64), \
          mock.patch.object(Path, "write_text"), \
@@ -172,7 +176,8 @@ def test_venv_fails_but_does_not_mark_when_deps_still_broken(bm):
         pytest.skip("本机没有 .venv")
 
     writes: list = []
-    with mock.patch.object(bm, "_deps_probe", return_value=(False, "缺 pytest")), \
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_deps_probe", return_value=(False, "缺 pytest")), \
          mock.patch.object(bm, "_req_digest", return_value="d" * 64), \
          mock.patch.object(Path, "exists", return_value=False), \
          mock.patch.object(Path, "write_text", side_effect=lambda *a, **k: writes.append(a)), \
@@ -311,6 +316,22 @@ def _no_real_pip_probe():
     """
     with mock.patch("socket.create_connection"):
         yield
+
+
+def _no_share_wheelhouse(bm):
+    """单测里不真去找共享盘上的 wheelhouse。
+
+    `step_venv` 现在会去共享盘找**离线 wheelhouse**（无外网机器装依赖靠它），
+    而这一步在第 2 步、比第 7 步「共享盘连接」还早，所以 `_resolve_wheelhouse`
+    自己会先 `net use` 一次。不挡住的话：结论取决于跑测试这台机器连不连得上那个
+    共享盘，而且网络盘 `is_dir()` 断网时卡 20s+。
+
+    **为什么不做成 autouse**：`step_share_login` 的用例要的就是真实的
+    `_share_connect`（它们 mock 的是更内层的 `hall_auto.fetch.share_reachable`
+    和 `subprocess.run`）。autouse 把它一起挡掉，那几个用例就再也测不到东西了
+    —— 实测踩过。所以这里显式声明，哪个用例要真连自己不加就行。
+    """
+    return mock.patch.object(bm, "_wheelhouse_share_dirs", return_value=[])
 
 
 def _place_fixture(bm, tmp_path: Path) -> Path:
@@ -1091,7 +1112,8 @@ def test_venv_warns_when_pip_source_unreachable_but_still_tries(bm):
     为什么不拦：探测有偏差（代理 / DNS / 防火墙策略），硬拦会把本来能装的机器判死。
     装不装得上最终由 pip 说了算 —— 所以必须看到它**仍然去跑了 pip install**。
     """
-    with mock.patch.object(bm, "_deps_probe", return_value=(True, "关键依赖均可 import")), \
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_deps_probe", return_value=(True, "关键依赖均可 import")), \
          mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
          mock.patch.object(bm, "_pip_net_ok", return_value=(False, "pypi.org:443 连不上")), \
          mock.patch.object(Path, "is_file", return_value=False), \
@@ -1101,7 +1123,7 @@ def test_venv_warns_when_pip_source_unreachable_but_still_tries(bm):
 
     joined = "\n".join(st.detail)
     assert "探不到 pip 源" in joined, joined
-    assert "--skip-venv" in joined, "要给出「拷 .venv + --skip-venv」这条不碰网络的绕法"
+    assert "wheelhouse" in joined, "要给出「离线 wheelhouse」这条不碰网络的绕法"
     assert "index-url" in joined, "要给出内网镜像这条绕法"
     installs = [c for c in run.call_args_list if "install" in str(c)]
     assert installs, "探测失败不该拦路，仍要尝试 pip install"
@@ -1115,7 +1137,8 @@ def test_venv_offline_hint_on_pip_failure(bm):
             return _fake_run(returncode=1, stderr="Could not find a version")
         return _fake_run()
 
-    with mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
          mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
          mock.patch.object(bm, "_pip_net_ok", return_value=(True, "可达")), \
          mock.patch.object(Path, "is_file", return_value=False), \
@@ -1125,7 +1148,21 @@ def test_venv_offline_hint_on_pip_failure(bm):
     assert st.ok is False
     joined = "\n".join(st.detail)
     assert "pip install 失败" in joined, joined
-    assert "--skip-venv" in joined and "index-url" in joined, joined
+    assert "wheelhouse" in joined and "index-url" in joined, joined
+    assert "fetch_wheelhouse.py" in joined, "要告诉操作员离线包是哪个脚本产出的"
+
+
+def test_offline_hint_does_not_recommend_copying_the_venv(bm):
+    """**回归锁**：绕法里不许再推荐「整份拷 .venv + --skip-venv」。
+
+    这条以前是推荐做法，2026-09-21 核出它是脆的：`pyvenv.cfg` 的 `home` 和
+    `Scripts/*.exe` 里都写死了原机器的绝对路径，用户名或 Python 安装位置一变就起不来。
+    留着它会让一线反复踩，所以现在只允许它作为**被劝退的**反面出现。
+    """
+    hint = bm.PIP_OFFLINE_HINT
+    assert "wheelhouse" in hint and "index-url" in hint
+    assert "别再用" in hint and ".venv" in hint, "要明确劝退「整份拷 .venv」，不能只是不提"
+
 
 
 def test_venv_does_not_probe_pip_when_deps_already_ok(bm):
@@ -1150,3 +1187,371 @@ def test_venv_does_not_probe_pip_when_deps_already_ok(bm):
     assert st.ok
     assert any("跳过安装" in line for line in st.detail), st.detail
     probe.assert_not_called()
+
+
+# ---------------- 无外网：离线 wheelhouse（2026-09-21） ----------------
+#
+# 起因（用户：「但是新测试机没有外网环境啊」）：
+# 手册原来给无网机器的那条路是「整份拷 .venv + --skip-venv」。核了一下是**脆**的：
+#   - `.venv/pyvenv.cfg` 的 `home` 指向原机器的 Python 安装路径；
+#   - `.venv/Scripts/pip.exe` / `pytest.exe` 等启动器里写死了原 venv 的绝对路径。
+# 用户名或 Python 安装位置一变就起不来，而报错看不出来是路径问题。
+#
+# 改成：在**有网**的机器上跑 `tools/fetch_wheelhouse.py` 产出一份 wheel 目录，
+# 搬到无网机器上，bootstrap 用 `pip install --no-index --find-links <dir>` 离线装。
+# wheel 与 Python 版本绑死（cp312 装不进 3.13），所以清单里记了版本，主动比对。
+#
+# 下面把这几条钉死。
+
+
+def test_bootstrap_module_imports_without_pyyaml():
+    """**回归锁 · 自举链条的第一环**：系统 Python 上没有 PyYAML 时，脚本必须仍能起来。
+
+    2026-09-21 实测到的真问题：`hall_auto/__init__.py` 曾经
+    `from hall_auto.config import load_config`，而 `config.py` 顶层 `import yaml`
+    —— 于是 `import hall_auto.dpi` 这种跟 YAML 毫无关系的导入也要求装 PyYAML。
+    结果全新机器上 `python tools/bootstrap_machine.py` 在**打印第一行之前**就
+    `ModuleNotFoundError: No module named 'yaml'` 崩掉，而"装依赖"正是它的第 2 步。
+
+    报错指向"环境没铺好"，实际是"铺环境的脚本自己起不来" —— 又一处报错指错方向。
+    修法是 `hall_auto/__init__.py` 改惰性导出（PEP 562）。这条用例防它被改回去。
+    """
+    repo = str(REPO_ROOT)
+    code = (
+        "import sys; sys.modules['yaml'] = None\n"  # 之后任何 import yaml 都会 ImportError
+        f"sys.path.insert(0, r'{repo}')\n"
+        "import hall_auto.dpi, hall_auto.wheelhouse, hall_auto.env_pack\n"
+        "import importlib.util, pathlib\n"
+        f"p = pathlib.Path(r'{repo}') / 'tools' / 'bootstrap_machine.py'\n"
+        "spec = importlib.util.spec_from_file_location('bm_probe', p)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "print('OK', mod._venv_python().name)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", code], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, f"没有 PyYAML 时脚本起不来：\n{proc.stderr}"
+    assert "OK" in proc.stdout, proc.stdout
+
+
+def test_hall_auto_package_exports_stay_usable_after_lazy_rewrite():
+    """惰性导出不能把 `from hall_auto import load_config` 这类用法弄坏。"""
+    import hall_auto
+
+    assert "load_config" in dir(hall_auto)
+    assert "expected_version_from_setup_name" in dir(hall_auto)
+    assert callable(hall_auto.load_config)
+    assert callable(hall_auto.expected_version_from_setup_name)
+    with pytest.raises(AttributeError):
+        hall_auto.不存在的名字  # noqa: B018
+
+
+def test_py_xy_reports_version_and_empty_on_broken(bm, tmp_path):
+    """`_py_xy` 既回答"能不能跑"，也回答"是哪一代 Python"（决定 wheel 能不能用）。"""
+    assert bm._py_xy(Path(sys.executable)) == f"{sys.version_info[0]}.{sys.version_info[1]}"
+    assert bm._py_xy(tmp_path / "没有这个.exe") == ""
+    assert bm._venv_python_ok(tmp_path / "没有这个.exe") is False
+
+
+def test_running_under_detects_current_interpreter(bm):
+    """换解释器重跑靠这个判定，判错了要么不换（假绿）、要么无限递归。"""
+    assert bm._running_under(Path(sys.executable)) is True
+    assert bm._running_under(Path(sys.executable).parent / "没有这个.exe") is False
+    assert bm.REEXEC_ENV, "重入标记不能为空，否则防不住无限递归"
+
+
+def test_dir_reachable_is_false_for_missing(bm, tmp_path):
+    """极简探测版（自举第一遍用）：存在的目录 True，不存在的 False，且不抛异常。"""
+    assert bm._dir_reachable(tmp_path) is True
+    assert bm._dir_reachable(tmp_path / "没有") is False
+
+
+def test_resolve_wheelhouse_prefers_explicit_arg(bm, tmp_path):
+    """`--wheelhouse` 是人明确指的路，最优先。"""
+    wh = tmp_path / "wh"
+    wh.mkdir()
+    got, why = bm._resolve_wheelhouse(wh, None)
+    assert got == wh and why == ""
+
+
+def test_resolve_wheelhouse_missing_explicit_dir_says_which_flag(bm, tmp_path):
+    """指错了要报**是哪个开关**指错的，不能只说"没找到"。"""
+    got, why = bm._resolve_wheelhouse(tmp_path / "没有", None)
+    assert got is None
+    assert "--wheelhouse" in why, why
+
+
+def test_resolve_wheelhouse_finds_repo_local_dir_before_installer_dir(bm, tmp_path, monkeypatch):
+    """「整包拷贝」路线（手册 1C）会把 wheelhouse 连同仓库一起带过来 —— 要优先用它。
+
+    仓库根是**不需要读配置**就知道的，所以无网机器的第一遍也走得通；
+    `installer_dir` 则可能来自读不了的 `config.local.yaml`。
+    """
+    repo = tmp_path / "repo"
+    (repo / "wheelhouse").mkdir(parents=True)
+    inst = tmp_path / "inst"
+    (inst / "wheelhouse").mkdir(parents=True)
+    monkeypatch.setattr(bm, "REPO_ROOT", repo)
+
+    got, why = bm._resolve_wheelhouse(None, inst)
+    assert got == repo / "wheelhouse", f"{got} / {why}"
+
+
+def test_wheelhouse_share_dirs_puts_env_var_first(bm, monkeypatch):
+    """`HALL_PACKAGE_SHARE` 必须排在配置里的共享盘之前，且**不读配置**。
+
+    它是自举第一遍（系统 Python、没装依赖、import 不了 `hall_auto.config`）
+    唯一能走通的路，所以顺序上也不能被配置压过去。
+    """
+    monkeypatch.setenv("HALL_PACKAGE_SHARE", "//host/hall-packages")
+    with mock.patch("hall_auto.fetch.share_dirs", return_value=[Path("//other/hall-packages")]):
+        dirs = bm._wheelhouse_share_dirs()
+    assert dirs[0] == Path("//host/hall-packages"), dirs
+    assert Path("//other/hall-packages") in dirs, dirs
+
+
+def test_wheelhouse_share_dirs_survives_config_import_failure(bm, monkeypatch):
+    """配置 import 不了（没装 PyYAML）时，仍然要能靠环境变量拿到共享盘。"""
+    monkeypatch.setenv("HALL_PACKAGE_SHARE", "//host/hall-packages")
+    monkeypatch.setitem(sys.modules, "hall_auto.config", None)  # 之后的 import 会 ImportError
+    dirs = bm._wheelhouse_share_dirs()
+    assert dirs == [Path("//host/hall-packages")], dirs
+
+
+def _write_wheelhouse(wh: Path, python_xy: str, req_sha: str) -> None:
+    from hall_auto.wheelhouse import MANIFEST_NAME
+
+    wh.mkdir(parents=True, exist_ok=True)
+    (wh / "pyyaml-6.0-cp312-cp312-win_amd64.whl").write_bytes(b"x")
+    (wh / MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "python_xy": python_xy,
+                "requirements_sha256": req_sha,
+                "wheel_count": 1,
+                "wheels": ["pyyaml-6.0-cp312-cp312-win_amd64.whl"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_wheelhouse_usable_rejects_wheel_for_another_python(bm, tmp_path):
+    """**核心防线**：为别的 Python 版本下的 wheel，必须当场判不能用并说清原因。
+
+    不判的话 pip 只会抛 `No matching distribution found` 或一堆编译错误 ——
+    一线看不出根因是"wheel 是为另一个 Python 版本下的"。
+    """
+    mine = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    other = "3.9" if mine != "3.9" else "3.8"
+    wh = tmp_path / "wh"
+    _write_wheelhouse(wh, other, "a" * 64)
+
+    ok, why = bm._wheelhouse_usable(wh, Path(sys.executable), "a" * 64)
+    assert ok is False
+    assert other in why and mine in why, why
+    assert "fetch_wheelhouse.py" in why, "要告诉人怎么重做一份"
+
+
+def test_wheelhouse_usable_rejects_when_requirements_changed(bm, tmp_path):
+    """requirements 改过，旧 wheelhouse 就不能再用了（缺新包会装到一半失败）。"""
+    mine = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    wh = tmp_path / "wh"
+    _write_wheelhouse(wh, mine, "a" * 64)
+
+    ok, why = bm._wheelhouse_usable(wh, Path(sys.executable), "b" * 64)
+    assert ok is False
+    assert "requirements" in why, why
+
+
+def test_wheelhouse_usable_accepts_matching_manifest(bm, tmp_path):
+    """版本与 requirements 都对得上 -> 能用，且理由里带上 wheel 数量。"""
+    mine = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    wh = tmp_path / "wh"
+    _write_wheelhouse(wh, mine, "a" * 64)
+
+    ok, why = bm._wheelhouse_usable(wh, Path(sys.executable), "a" * 64)
+    assert ok is True, why
+    assert "1" in why, why
+
+
+def test_venv_prefers_offline_wheelhouse_over_network(bm, tmp_path):
+    """**核心防线**：有可用的 wheelhouse 时，pip 必须走 `--no-index --find-links`。
+
+    而且**不许**再探一次 pip 源 —— 无网机器上那一下纯属白等。
+    离线优先不只是为了没网：它同时把版本锁死，5 台机器装出来的依赖完全一致。
+    """
+    wh = tmp_path / "wh"
+    wh.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append([str(a) for a in argv] if isinstance(argv, (list, tuple)) else [str(argv)])
+        return _fake_run()
+
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_resolve_wheelhouse", return_value=(wh, "")), \
+         mock.patch.object(bm, "_wheelhouse_usable", return_value=(True, "Python 3.12，7 个 wheel")), \
+         mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
+         mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
+         mock.patch.object(bm, "_pip_net_ok") as net, \
+         mock.patch.object(Path, "is_file", return_value=False), \
+         mock.patch.object(Path, "write_text"), \
+         mock.patch.object(bm.subprocess, "run", side_effect=fake_run):
+        st = bm.step_venv(False)
+
+    assert st.ok, st.detail
+    installs = [c for c in calls if "install" in " ".join(c)]
+    assert installs, st.detail
+    assert all("--no-index" in c and "--find-links" in c for c in installs), installs
+    assert str(wh) in " ".join(installs[0]), installs[0]
+    net.assert_not_called()
+
+
+def test_venv_falls_back_online_when_offline_install_fails(bm, tmp_path):
+    """离线装失败要**继续尝试在线** —— 不能因为"有 wheelhouse 但用不了"就比原来更差。"""
+    wh = tmp_path / "wh"
+    wh.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        argv_list = [str(a) for a in argv] if isinstance(argv, (list, tuple)) else [str(argv)]
+        calls.append(argv_list)
+        if "--no-index" in argv_list:
+            return _fake_run(returncode=1, stderr="No matching distribution found")
+        return _fake_run()
+
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_resolve_wheelhouse", return_value=(wh, "")), \
+         mock.patch.object(bm, "_wheelhouse_usable", return_value=(True, "Python 3.12，7 个 wheel")), \
+         mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
+         mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
+         mock.patch.object(bm, "_pip_net_ok", return_value=(True, "可达")) as net, \
+         mock.patch.object(Path, "is_file", return_value=False), \
+         mock.patch.object(Path, "write_text"), \
+         mock.patch.object(bm.subprocess, "run", side_effect=fake_run):
+        st = bm.step_venv(False)
+
+    assert st.ok, st.detail
+    installs = [c for c in calls if "install" in " ".join(c)]
+    assert any("--no-index" in c for c in installs), "先要试离线"
+    assert any("--no-index" not in c for c in installs), "离线失败后要继续试在线"
+    net.assert_called()
+
+
+def test_venv_reports_unusable_wheelhouse_instead_of_silently_going_online(bm, tmp_path):
+    """有 wheelhouse 但用不了，要把**原因**说出来（版本不符？requirements 改过？）。
+
+    静默回落到在线，在无网机器上就是"跑了半天然后失败"，人不知道是 wheel 不对。
+    """
+    wh = tmp_path / "wh"
+    wh.mkdir()
+
+    def fake_run(argv, **kwargs):
+        argv_list = [str(a) for a in argv] if isinstance(argv, (list, tuple)) else [str(argv)]
+        if "install" in argv_list:
+            return _fake_run(returncode=1, stderr="连不上")
+        return _fake_run()
+
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_resolve_wheelhouse", return_value=(wh, "")), \
+         mock.patch.object(bm, "_wheelhouse_usable", return_value=(False, "wheel 是给 Python 3.9 下的")), \
+         mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
+         mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
+         mock.patch.object(bm, "_pip_net_ok", return_value=(True, "可达")), \
+         mock.patch.object(Path, "is_file", return_value=False), \
+         mock.patch.object(Path, "write_text"), \
+         mock.patch.object(bm.subprocess, "run", side_effect=fake_run):
+        st = bm.step_venv(False)
+
+    joined = "\n".join(st.detail)
+    assert "用不了" in joined and "Python 3.9" in joined, joined
+
+
+def test_skip_venv_probes_instead_of_trusting_existence(bm):
+    """**回归锁**：`--skip-venv` 不再"文件在就跳过"，要实测依赖能用。
+
+    原因：手册以前给无网机器的绕法是整份拷 `.venv`。那种 venv 文件全在但起不来
+    （`pyvenv.cfg` 的 `home` 指向原机器）。旧逻辑会一路蒙到第 12 步自检才炸，
+    报错还看不出根因。现在当场探、当场说，并给出离线 wheelhouse 这条出路。
+    """
+    with mock.patch.object(bm, "_venv_python_ok", return_value=True), \
+         mock.patch.object(bm, "_deps_probe", return_value=(False, "缺 pywinauto")), \
+         mock.patch.object(Path, "is_file", return_value=True):
+        st = bm.step_venv(True)
+
+    assert st.ok is False
+    joined = "\n".join(st.detail)
+    assert "--skip-venv 指定的 venv 不可用" in joined, joined
+    assert "wheelhouse" in joined, "要给出离线 wheelhouse 这条出路"
+
+
+def test_venv_rebuilds_copied_venv_that_cannot_start(bm):
+    """拷来的 .venv 起不来 -> 当场本机重建，别拖到第 12 步才炸。"""
+    cmds: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        cmds.append([str(a) for a in argv] if isinstance(argv, (list, tuple)) else [str(argv)])
+        return _fake_run()
+
+    with _no_share_wheelhouse(bm), \
+         mock.patch.object(bm, "_venv_python_ok", return_value=False), \
+         mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
+         mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
+         mock.patch.object(Path, "is_file", return_value=True), \
+         mock.patch.object(Path, "read_text", return_value="a" * 64), \
+         mock.patch.object(bm.subprocess, "run", side_effect=fake_run):
+        st = bm.step_venv(False)
+
+    assert st.ok, st.detail
+    assert any("本机重建" in line for line in st.detail), st.detail
+    assert any("venv" in c for c in cmds), cmds
+
+
+def test_main_reexecs_under_the_venv_interpreter(bm):
+    """**核心防线**：main() 里必须有"换成 venv 解释器重跑"这一段。
+
+    为什么必须有：本脚本 import 的 `hall_auto.config` 依赖 PyYAML。用**系统** Python
+    跑的时候，第 5/7/8/10 步会各自"读配置失败"然后**静默跳过**（异常都被吞成一行日志），
+    最后照样打印"全部通过" —— 也就是说**不换解释器，脚本会给一个假绿**。
+    假绿比报错坏得多：人会以为环境好了，直到跑批才批量失败。
+    """
+    src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
+    main_src = src[src.index("def main()"):]
+
+    assert "REEXEC_ENV" in main_src, "main() 里要能看到换解释器的重入标记"
+    assert "_venv_python()" in main_src, "要拿 venv 的解释器路径来比"
+    assert "_running_under(" in main_src, "要判定当前是不是已经在 venv 里"
+
+
+def test_dependency_failure_stops_before_the_rest_of_the_steps(bm):
+    """依赖没铺好要**当场停**，不要继续跑后面几步。
+
+    后面几步全都要 import 第三方包，继续跑只会刷一屏"读配置失败"的假错，
+    把真正的原因（pip 装不上）埋掉 —— 又是一次"报错指向错误方向"。
+    """
+    src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
+    main_src = src[src.index("def main()"):]
+
+    guard = main_src.index("if not venv_step.ok:")
+    first_other_step = main_src.index("run(step_fixtures(")
+    assert guard < first_other_step, "依赖失败的拦截必须排在其余步骤之前"
+    assert "aborted=True" in main_src[guard:first_other_step + 200]
+
+
+def test_share_connect_is_shared_by_venv_and_share_login(bm):
+    """第 2 步（取离线 wheel）和第 7 步（正式连盘）必须**共用一份**连接逻辑。
+
+    各写一份的话，"认哪个环境变量、失败怎么报"会慢慢长歪 —— 这类分叉本项目踩过几次。
+    """
+    src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
+    login = src[src.index("def step_share_login"):src.index("def step_fetch_packages")]
+    assert "_share_connect(" in login, "step_share_login 要用公共件"
+    # 真正的连接机制（拼 net use 命令、裁 UNC、起子进程）只该有一份。
+    # 这里只查机制、不查字面 "net use" —— 注释里解释它是合法的。
+    for mech in ("subprocess.run", "_unc_target("):
+        assert mech not in login, f"连接细节（{mech}）不该在 step_share_login 里再抄一份"
+
+    resolver = src[src.index("def _resolve_wheelhouse"):src.index("def _wheelhouse_usable")]
+    assert "_share_connect(" in resolver, "取离线 wheel 时也要能连上共享盘"

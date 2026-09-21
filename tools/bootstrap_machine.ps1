@@ -18,9 +18,11 @@
 # Usage (elevation recommended; steps 4, 11 and the 7-Zip install need admin):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\bootstrap_machine.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\bootstrap_machine.ps1 -InstallerDir "D:\Test\hall"
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\bootstrap_machine.ps1 -Wheelhouse "D:\wheelhouse"
 param(
     [string]$InstallerDir = "",
     [string]$NodeId = "",
+    [string]$Wheelhouse = "",
     [switch]$SkipVenv,
     [switch]$SkipSevenZip,
     [switch]$SkipSecurityTools,
@@ -117,6 +119,7 @@ $env:PYTHONIOENCODING = "utf-8"
 $argv = @("$repo\tools\bootstrap_machine.py")
 if ($InstallerDir) { $argv += @("--installer-dir", $InstallerDir) }
 if ($NodeId) { $argv += @("--node-id", $NodeId) }
+if ($Wheelhouse) { $argv += @("--wheelhouse", $Wheelhouse) }
 if ($SkipVenv) { $argv += "--skip-venv" }
 if ($SkipSevenZip) { $argv += "--skip-seven-zip" }
 if ($SkipSecurityTools) { $argv += "--skip-security-tools" }

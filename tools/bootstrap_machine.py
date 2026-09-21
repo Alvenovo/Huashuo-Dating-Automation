@@ -66,13 +66,18 @@
 选项：
     --installer-dir PATH   华硕大厅安装包目录（默认沿用现有 config.local.yaml 或内置默认）
     --node-id ID           本机节点标识（默认主机名）
-    --skip-venv            不检查虚拟环境与依赖
+    --skip-venv            不检查虚拟环境与依赖（**仍会实测依赖能不能用**，不再只看文件在不在）
+    --wheelhouse PATH      离线 wheel 目录（无外网机器用；不指定则自动找）
     --skip-seven-zip       不检查/自动安装 7-Zip
     --skip-security-tools  不从共享盘准备 P2 内部安全工具
     --skip-schtask         不检查/建计划任务
     --skip-selftest        不跑 tests/unit 自检
     --no-download          不下载安装包，只用本地已有的
     --skip-share           不尝试连接共享盘
+
+**它会跑两遍，这是设计**：第一遍用系统 Python（只需要标准库）建 venv + 装依赖，
+然后换成 `.venv` 的解释器把整套重跑一遍。原因见 `main()` 里的注释 ——
+不换解释器的话，依赖 PyYAML 的那几步会**静默跳过**，最后给你一个假绿。
 
 产物：
     reports/bootstrap/bootstrap_<node>_<时间>.json   本次铺设结果（含环境画像）
@@ -92,6 +97,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from shutil import which
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -101,6 +107,7 @@ from hall_auto.dpi import (  # noqa: E402
     machine_profile,
     node_id,
 )
+from hall_auto.wheelhouse import verify_manifest as _verify_wheelhouse  # noqa: E402
 
 REQUIRED_FILES = {
     # 相对 installer_dir 的相对路径 -> 说明
@@ -173,10 +180,35 @@ PIP_PROBE_TIMEOUT_SEC = 8
 
 # pip 装不了时的两条绕法。写成常量是为了让代码提示与手册是同一句话。
 PIP_OFFLINE_HINT = (
-    "装依赖必须能访问 pip 源。两条绕法："
-    "① 用内网镜像：pip config set global.index-url <镜像地址>，再重跑本脚本；"
-    "② 从一台已铺好的机器整份拷 .venv 过来，然后加 --skip-venv 重跑（完全不碰网络）。"
+    "装依赖得能拿到包。无外网的机器按顺序试："
+    "① 离线 wheelhouse —— 在有网的机器上跑一次 tools/fetch_wheelhouse.py，"
+    "把产出的目录放到共享盘 hall-packages\\wheelhouse\\（或加 --wheelhouse <目录>），"
+    "bootstrap 会自动用它离线装；"
+    "② 内网镜像：pip config set global.index-url <镜像地址>，再重跑本脚本。"
+    "（别再用「整份拷 .venv」了：pyvenv.cfg 和 Scripts/*.exe 里都写死了原机器的路径，"
+    "用户名或 Python 安装位置一变就起不来。）"
 )
+
+# 离线 wheel 目录的候选位置：共享盘上的相对路径（见 _resolve_wheelhouse）
+WHEELHOUSE_SHARE_SUBDIR = "wheelhouse"
+WHEELHOUSE_LOCAL_DIRNAME = "wheelhouse"
+
+# 自举重入标记：见 `_reexec_under_venv`。用环境变量而不是命令行开关，
+# 是因为它是"本进程是子进程"的内部事实，不该出现在用户可见的用法里。
+REEXEC_ENV = "HALL_BOOTSTRAP_IN_VENV"
+
+
+def _venv_python() -> Path:
+    """仓库 venv 里的解释器路径。"""
+    return REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+
+
+def _running_under(py: Path) -> bool:
+    """当前进程是不是就在用 `py` 这个解释器跑。"""
+    try:
+        return Path(sys.executable).resolve() == Path(py).resolve()
+    except OSError:
+        return False
 
 
 def _free_gb(path: Path) -> tuple[float, str]:
@@ -369,6 +401,193 @@ def _stale_node_hint(config_node: str, node: str) -> str:
     return ""
 
 
+def _py_xy(py: Path, timeout_sec: int = 30) -> str:
+    """问这个解释器自己是哪个版本（`major.minor`）。**跑不起来返回空串**。
+
+    一次探测回答两个问题：① 这个 `python.exe` 到底能不能跑；② 它是哪一代 Python
+    （决定离线 wheel 能不能用）。
+
+    为什么要"真起一次"而不是看文件在不在：拷来的 `.venv` 里 `python.exe` 只是个
+    转发器，它按 `pyvenv.cfg` 的 `home` 去找真正的解释器；那个路径在新机器上不存在时，
+    它会以缺 DLL 的失败退出或弹一个没人看的窗。文件全在、进程起不来 —— 这是常态。
+    """
+    try:
+        proc = subprocess.run(
+            [str(py), "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, check=False, timeout=timeout_sec,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _venv_python_ok(py: Path) -> bool:
+    """这个 venv 的 `python.exe` 能不能跑起来。"""
+    return bool(_py_xy(py))
+
+
+def _dir_reachable(directory: Path, timeout_sec: float = 3.0) -> bool:
+    """目录能不能打开（带超时）。
+
+    **自举第一遍用的极简版**：那时 PyYAML 还没装，`hall_auto.fetch`（含
+    `share_reachable`）import 不了。行为对齐 `hall_auto.fetch.share_reachable`
+    的核心判据 —— 断网时网络盘 `is_dir()` 会卡 20s+，所以必须加超时，
+    宁可当它没有（后面还有在线安装兜底），也别把铺设卡死。
+    """
+    import threading
+
+    box = {"ok": False}
+
+    def probe() -> None:
+        try:
+            box["ok"] = directory.is_dir()
+        except OSError:
+            box["ok"] = False
+
+    thread = threading.Thread(target=probe, daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    return box["ok"]
+
+
+def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> None:
+    """尽力把 `dirs` 连上（`net use`），过程通过 `log` 记下来。
+
+    **抽出来是为了只写一份**：两个地方都要连共享盘 —— 第 7 步（正式连盘）和
+    第 2 步（去共享盘取离线 wheel，那会儿第 7 步还没跑到）。两处各写一份的话，
+    "认哪个环境变量、失败怎么报"会慢慢长歪，这类分叉本项目已经踩过几次。
+
+    幂等：已可达只记一行，不重复 `net use`。
+
+    凭据**只走环境变量**（红线：不落盘、不进 git）：
+        HALL_SHARE_USER / HALL_SHARE_PASSWORD
+    """
+    try:
+        from hall_auto.fetch import share_reachable  # noqa: PLC0415
+    except Exception:
+        # 自举第一遍：依赖还没装，用等价的极简版（见 _dir_reachable）
+        def share_reachable(directory: Path, timeout_sec: int = 3) -> tuple[bool, str]:
+            ok = _dir_reachable(directory, float(timeout_sec))
+            return ok, ("" if ok else "目录不存在或不可达")
+
+    user = (os.environ.get("HALL_SHARE_USER") or "").strip()
+    password = os.environ.get("HALL_SHARE_PASSWORD") or ""
+
+    for d in dirs:
+        ok, why = share_reachable(Path(d))
+        if ok:
+            log(f"{d}: 已可达（无需再连）")
+            continue
+        if not user or not password:
+            log(f"{d}: 当前不可达（{why}），且未设 HALL_SHARE_USER/PASSWORD，无法自动连接")
+            continue
+        target = _unc_target(str(d))
+        if not target:
+            log(f"{d}: 路径格式不像 UNC（\\\\host\\share），跳过")
+            continue
+        cmd = ["net", "use", target, password, f"/user:{user}", "/persistent:yes"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stdout or proc.stderr or "").strip()[:160]
+            log(f"{target}: 连接失败 rc={proc.returncode} {detail}")
+            continue
+        ok2, why2 = share_reachable(Path(d))
+        log(f"{target}: 已连接（{'可达' if ok2 else f'仍不可达：{why2}'}）")
+
+
+def _wheelhouse_share_dirs() -> list[Path]:
+    """可能放着 `wheelhouse/` 的共享盘目录 —— **不依赖 PyYAML**。
+
+    为什么要单独一份：第 2 步跑在"还没装依赖"的时刻，`hall_auto.config` 连
+    import 都做不到（它顶层 `import yaml`）。所以：
+      ① `HALL_PACKAGE_SHARE` —— `hall_auto.fetch.share_dirs()` 本来就认这个环境
+         变量，且**不读配置**，所以这一段零依赖；
+      ② 能 import 配置时，再补上 `package_share.dirs`。
+    ① 放前面是因为它本来就是"人临时指定"的覆盖项，优先级更高。
+    """
+    dirs: list[Path] = []
+    env = (os.environ.get("HALL_PACKAGE_SHARE") or "").strip()
+    if env:
+        dirs.append(Path(env))
+    try:
+        from hall_auto.config import load_config  # noqa: PLC0415
+        from hall_auto.fetch import share_dirs  # noqa: PLC0415
+
+        for d in share_dirs(load_config()):
+            if d not in dirs:
+                dirs.append(d)
+    except Exception:
+        pass  # 还没装依赖 / 配置读不了 —— 上面那一段已经尽力了
+    return dirs
+
+
+def _resolve_wheelhouse(
+    wheelhouse: Path | None, installer_dir: Path | None
+) -> tuple[Path | None, str]:
+    """找到本机能用的离线 wheel 目录。返回 (目录, 没找到的原因)。
+
+    查找顺序（**本机的优先，网络最后** —— 网络那一步最慢也最可能失败）：
+      1. `--wheelhouse <目录>` —— 人明确指定的，最优先；
+      2. `<仓库>/wheelhouse` —— 「整包拷贝」路线（手册 1C）天然会带上它；
+      3. `<installer_dir>/wheelhouse` —— 跟安装包放一起，拷包时顺手带过来；
+      4. 共享盘 `<share>/wheelhouse/` —— 有网机器产出一次，所有节点自动取到。
+
+    第 4 条会**顺带 `net use` 一次**（第 7 步才正式连盘，而这一步在第 2 步），
+    否则凭据没建立时共享盘一律"不可达"，离线装依赖这条路就是死的。
+
+    与 `step_security_tools` 的分工要看清：那个是**拷回本机**（内部工具不能留在
+    共享盘上被别的机器调用）；这里**不拷** —— wheel 有几十上百个文件、几百 MB，
+    每次 bootstrap 都拷一遍纯属浪费。直接让 pip `--find-links` 指向共享盘。
+    """
+    if wheelhouse is not None:
+        p = Path(wheelhouse)
+        if p.is_dir():
+            return p, ""
+        return None, f"--wheelhouse 指的目录不存在：{p}"
+
+    for local in (REPO_ROOT / WHEELHOUSE_LOCAL_DIRNAME,):
+        if local.is_dir():
+            return local, ""
+    if installer_dir is not None:
+        p = Path(installer_dir) / WHEELHOUSE_LOCAL_DIRNAME
+        if p.is_dir():
+            return p, ""
+
+    shares = _wheelhouse_share_dirs()
+    if not shares:
+        return None, "没配共享盘，本机也没有 wheelhouse 目录"
+
+    _share_connect(shares, lambda _msg: None)  # 静默连一次，失败不在这里报
+    tried: list[str] = []
+    for directory in shares:
+        if not _dir_reachable(directory):
+            tried.append(f"{directory} 不可达")
+            continue
+        p = Path(directory) / WHEELHOUSE_SHARE_SUBDIR
+        if p.is_dir():
+            return p, ""
+        tried.append(f"{directory} 下没有 {WHEELHOUSE_SHARE_SUBDIR}\\")
+    return None, "；".join(tried)
+
+
+
+def _wheelhouse_usable(wh_dir: Path, py: Path, want_req_sha256: str = "") -> tuple[bool, str]:
+    """这份 wheel 能不能给**本机的 venv** 用。
+
+    两件事必须都对上，否则 pip 只会抛 `No matching distribution found` 或一堆编译错误
+    —— **一线看不出根因是"wheel 是为另一个 Python 版本下的"**：
+      ① wheel 的 Python 版本（`cp312` 的 wheel 装不进 3.13）；
+      ② requirements.txt 有没有改过（改过就得重下）。
+    版本比对放在 `hall_auto/wheelhouse.py`，与产出方共用一份 schema。
+    """
+    xy = _py_xy(py)
+    if not xy:
+        return False, f"本机 venv 起不来（{py}），没法判断 wheel 能不能用"
+    return _verify_wheelhouse(wh_dir, xy, want_req_sha256)
+
+
 def step_env_check(node: str, installer_dir: Path | None = None, config_node_id: str = "") -> Step:
     st = Step("环境自检")
     profile = machine_profile()
@@ -439,22 +658,59 @@ def step_env_check(node: str, installer_dir: Path | None = None, config_node_id:
     return st
 
 
-def step_venv(skip: bool) -> Step:
+def step_venv(skip: bool, wheelhouse: Path | None = None, installer_dir: Path | None = None) -> Step:
     """虚拟环境与依赖：**先检测、缺什么才装什么**。
 
     跳过条件（任一条满足即跳过 pip）：
-      1. `--skip-venv` 且 venv 已就位 —— 显式要求跳过
+      1. `--skip-venv` 且 venv 已就位**且实测能用** —— 显式要求跳过
       2. venv 在 + 标记文件哈希与 requirements.txt 一致 + 关键依赖都能 import
     第 2 条是默认路径：本机铺过一次后，重跑 bootstrap 不该再碰网络。
+
+    ## 无外网的机器（2026-09-21 加）
+
+    测试机没有外网 → pip 连不上源。所以装依赖有两条路，**先试离线**：
+      1. `wheelhouse`（`--wheelhouse` 指定 / `installer_dir/wheelhouse` / 共享盘
+         `wheelhouse/`）—— 由 `tools/fetch_wheelhouse.py` 在有网机器上产出；
+      2. 在线 pip。
+    离线优先不只是为了没网的机器：它同时把**版本锁死**，5 台机器装出来的依赖完全一致，
+    不受镜像源当时有什么影响。离线失败会**继续尝试在线**，不会比原来更差。
+
+    ## 为什么 `--skip-venv` 现在要实测
+
+    原来只要 `.venv\\Scripts\\python.exe` 存在就跳过。但「整份拷 `.venv`」这条路是**脆**的：
+    `pyvenv.cfg` 的 `home` 指向原机器的 Python 安装路径，`Scripts/*.exe` 里写死了原 venv
+    的绝对路径 —— 新机器上用户名或安装位置不同就起不来。原来那种坏 venv 会一路蒙到
+    第 12 步自检才炸，报错还看不出根因。现在当场探、当场说。
     """
     st = Step("虚拟环境与依赖")
     venv = REPO_ROOT / ".venv"
-    py = venv / "Scripts" / "python.exe"
+    py = _venv_python()
     req = REPO_ROOT / "requirements.txt"
     marker = venv / DEPS_MARKER_NAME
 
+    # ---- 检测 0：venv 在，但它自己能不能跑 ----
+    # 拷贝来的 venv 常常是"文件都在、python.exe 起不来"。先探一下，
+    # 起不来就本机重建（`python -m venv` 对已存在的目录是幂等的，会就地修好）。
+    if py.is_file() and not _venv_python_ok(py):
+        st.log(f"⚠️ {py} 存在但跑不起来（多半是拷贝来的 .venv 路径不对）—— 本机重建")
+        proc = subprocess.run([sys.executable, "-m", "venv", str(venv)],
+                              capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            st.fail(f"重建 venv 失败 rc={proc.returncode}: {(proc.stderr or '')[:300]}")
+            return st
+
     if skip and py.is_file():
-        st.log(f"按 --skip-venv 跳过（沿用 {py}）")
+        ok, why = _deps_probe(py)
+        if ok:
+            st.log(f"按 --skip-venv 跳过（沿用 {py}）：{why}")
+            return st
+        st.fail(
+            f"--skip-venv 指定的 venv 不可用：{why}\n"
+            "    拷来的 .venv 常因路径不同而失效（pyvenv.cfg 的 home 指向原机器的 Python，\n"
+            "    Scripts/*.exe 里写死了原 venv 路径）。\n"
+            "    处理：① 去掉 --skip-venv 重跑，让它本机重建（推荐）；\n"
+            "          ② 或用 --wheelhouse 指向离线 wheel 目录，完全不碰网络。"
+        )
         return st
 
     # ---- 检测 1：venv 是否存在 ----
@@ -488,7 +744,31 @@ def step_venv(skip: bool) -> Step:
         else:
             st.log("无依赖标记（首次铺设或标记被清），按需安装")
 
-    # ---- 装之前先探一次 pip 源，把结论**早点**给人 ----
+    # ---- 需要装：先看有没有离线 wheelhouse ----
+    wh_dir, wh_why = _resolve_wheelhouse(wheelhouse, installer_dir)
+    wh_usable = False
+    if wh_dir is not None:
+        wh_usable, wh_check = _wheelhouse_usable(wh_dir, py, want)
+        if wh_usable:
+            st.log(f"用离线 wheelhouse：{wh_dir}（{wh_check}）")
+        else:
+            st.log(f"⚠️ 有 wheelhouse（{wh_dir}）但用不了：{wh_check} —— 改用在线安装")
+    else:
+        st.log(f"没有离线 wheelhouse（{wh_why}）")
+
+    if wh_usable:
+        st.log(f"离线装依赖：{req.name}（--no-index --find-links）")
+        proc = subprocess.run(
+            [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check",
+             "--no-index", "--find-links", str(wh_dir), "-r", str(req)],
+            capture_output=True, text=True, check=False,
+        )
+        if proc.returncode == 0:
+            return _finish_venv(py, marker, want, st)
+        st.log(f"⚠️ 离线安装失败（rc={proc.returncode}），改用在线：{(proc.stderr or '')[-300:]}")
+        st.log(f"   离线包是这套：{PIP_OFFLINE_HINT}")
+
+    # ---- 在线：装之前先探一次 pip 源，把结论**早点**给人 ----
     # 不探的话：没外网的机器上 pip 自己会重试好几轮（几分钟）才抛一段截断的 stderr，
     # 一线分不清是"没网"还是"包名写错"。
     # **探测失败不拦路**：探测有偏差（代理、DNS、防火墙策略），装不装得上最终由 pip 说了算。
@@ -499,7 +779,6 @@ def step_venv(skip: bool) -> Step:
     else:
         st.log(f"⚠️ 探不到 pip 源：{net_why} —— 仍会尝试安装。若装失败，按这两条绕法处理：{PIP_OFFLINE_HINT}")
 
-    # ---- 需要装：pip 本身幂等，已装的包会跳过 ----
     st.log(f"装依赖：{req.name}")
     proc = subprocess.run(
         [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", str(req)],
@@ -509,7 +788,11 @@ def step_venv(skip: bool) -> Step:
         st.fail(f"pip install 失败 rc={proc.returncode}: {(proc.stderr or '')[-400:]}\n{PIP_OFFLINE_HINT}")
         return st
 
-    # ---- 装完复核，通过了才写标记（避免"装失败也被记为就绪"）----
+    return _finish_venv(py, marker, want, st)
+
+
+def _finish_venv(py: Path, marker: Path, want: str, st: Step) -> Step:
+    """装完复核，通过了才写标记（避免"装失败也被记为就绪"）。"""
     ok, why = _deps_probe(py)
     if not ok:
         st.fail(f"pip 已跑完但依赖仍不齐：{why}")
@@ -783,45 +1066,25 @@ def step_share_login(skip: bool) -> Step:
 
     try:
         from hall_auto.config import load_config
-        from hall_auto.fetch import share_dirs, share_reachable
+        from hall_auto.fetch import share_dirs
 
         cfg = load_config()
     except Exception as exc:
         st.log(f"读配置跳过：{exc}")
         return st
 
-    wanted: list[str] = [str(d) for d in share_dirs(cfg)]
+    wanted: list[Path] = list(share_dirs(cfg))
     farm = (os.environ.get("HALL_FARM_ROOT") or "").strip()
     if farm.replace("/", "\\").startswith("\\\\"):
-        wanted.append(farm)
+        wanted.append(Path(farm))
 
     if not wanted:
         st.log("未配置共享盘（package_share.dirs 为空）且未设 HALL_FARM_ROOT，跳过")
         return st
 
-    user = (os.environ.get("HALL_SHARE_USER") or "").strip()
-    password = os.environ.get("HALL_SHARE_PASSWORD") or ""
-
-    for d in wanted:
-        ok, why = share_reachable(Path(d))
-        if ok:
-            st.log(f"{d}: 已可达（无需再连）")
-            continue
-        if not user or not password:
-            st.log(f"{d}: 当前不可达（{why}），且未设 HALL_SHARE_USER/PASSWORD，无法自动连接")
-            continue
-        target = _unc_target(d)
-        if not target:
-            st.log(f"{d}: 路径格式不像 UNC（\\\\host\\share），跳过")
-            continue
-        cmd = ["net", "use", target, password, f"/user:{user}", "/persistent:yes"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode != 0:
-            detail = (proc.stdout or proc.stderr or "").strip()[:160]
-            st.log(f"{target}: 连接失败 rc={proc.returncode} {detail}")
-            continue
-        ok2, why2 = share_reachable(Path(d))
-        st.log(f"{target}: 已连接（{'可达' if ok2 else f'仍不可达：{why2}'}）")
+    # 连接细节（认哪些环境变量、失败怎么报）统一在 _share_connect 里，
+    # 第 2 步取离线 wheel 时用的是同一份 —— 避免两处慢慢长歪。
+    _share_connect(wanted, st.log)
     return st
 
 
@@ -1162,11 +1425,46 @@ def step_farm_root(skip: bool) -> Step:
     return st
 
 
+def _write_report(node: str, installer_dir: Path, steps: list[Step], *, aborted: bool = False) -> int:
+    """把本次铺设结果落盘并打印结论。返回进程退出码。"""
+    payload = {
+        "node": node,
+        "repo": str(REPO_ROOT),
+        "admin": is_admin(),
+        "interpreter": sys.executable,
+        "profile": machine_profile(),
+        "installer_dir": str(installer_dir),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "aborted_before_full_run": aborted,
+        "steps": [s.to_dict() for s in steps],
+        "ok": all(s.ok for s in steps),
+    }
+    out_dir = REPO_ROOT / "reports" / "bootstrap"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"bootstrap_{node}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    failed = [s.name for s in steps if not s.ok]
+    say("=" * 46)
+    if failed:
+        say(f"结果：{len(failed)} 步有问题 -> {'; '.join(failed)}")
+    else:
+        say("结果：全部通过，本机已可跑批")
+    say(f"明细：{out}")
+    return 0 if not failed else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="测试机一次性环境铺设")
     parser.add_argument("--installer-dir", default="")
     parser.add_argument("--node-id", default="")
     parser.add_argument("--skip-venv", action="store_true")
+    parser.add_argument(
+        "--wheelhouse",
+        default="",
+        help="离线 wheel 目录（无外网机器用；不指定则依次找 <仓库>/wheelhouse、"
+        "<installer-dir>/wheelhouse、共享盘 wheelhouse/）",
+    )
     parser.add_argument("--skip-seven-zip", action="store_true", help="不检查/自动安装 7-Zip")
     parser.add_argument(
         "--skip-security-tools", action="store_true", help="不从共享盘准备 P2 内部安全工具"
@@ -1185,23 +1483,59 @@ def main() -> int:
         or existing.get("installer_dir")
         or "C:/Users/Public/Desktop/Test/华硕大厅"
     )
+    wheelhouse = Path(args.wheelhouse) if args.wheelhouse.strip() else None
 
     say(f"=== 华硕大厅自动化 · 机器铺设 [{node}] ===")
     say(f"仓库: {REPO_ROOT}")
+    say(f"解释器: {sys.executable}")
     say(f"管理员: {is_admin()}")
     say("")
 
     steps: list[Step] = []
 
-    def run(st: Step) -> None:
+    def run(st: Step) -> Step:
         steps.append(st)
         say(f"[{'OK' if st.ok else 'FAIL'}] {st.name}")
         for line in st.detail:
             say(f"    {line}")
         say("")
+        return st
 
     run(step_env_check(node, installer_dir, str(existing.get("node_id") or "")))
-    run(step_venv(args.skip_venv))
+
+    # ---- 阶段 1：把 venv 与依赖铺好（这一段只需要标准库）----
+    venv_step = run(step_venv(args.skip_venv, wheelhouse=wheelhouse, installer_dir=installer_dir))
+
+    if not venv_step.ok:
+        # 依赖没铺好，后面几步全都要 import 第三方包 —— 继续跑只会刷一屏"读配置失败"
+        # 的假错，把真正的原因（pip 装不上）埋掉。停在这里，指向性最强。
+        say("依赖没铺好。后面几步都要 import 第三方包，继续跑只会刷一屏看着像配置坏了的假错。")
+        say("按上面第 2 步给的提示修（离线 wheelhouse / 内网镜像），然后**重跑同一条命令**")
+        say("（铺设是幂等的，已经做过的会跳过）。")
+        return _write_report(node, installer_dir, steps, aborted=True)
+
+    # ---- 阶段 2：换成 venv 的解释器，把整套重跑一遍 ----
+    # 为什么必须换（2026-09-21 在干净 Python 上实测到）：
+    # 本脚本要 import hall_auto.*，而 hall_auto.config 顶层 import yaml。
+    # 系统 Python 上没有 yaml → 第 5/7/8/10 步会各自"读配置失败"然后**静默跳过**
+    # （它们都把异常吞成一行日志），最后打印"全部通过"。
+    # 也就是说：不换解释器，脚本会给你一个**假绿**。这比报错更坏。
+    venv_py = _venv_python()
+    if venv_py.is_file() and not _running_under(venv_py) and os.environ.get(REEXEC_ENV) != "1":
+        say("=" * 46)
+        say(f"依赖已就绪。换用 venv 的解释器重跑整套：{venv_py}")
+        say("（本脚本 import 的 hall_auto.config 依赖 PyYAML，系统 Python 上没有；"
+            "不换解释器的话后面几步会静默跳过。）")
+        say("")
+        env = dict(os.environ)
+        env[REEXEC_ENV] = "1"
+        proc = subprocess.run(
+            [str(venv_py), "-X", "utf8", str(Path(__file__).resolve()), *sys.argv[1:]],
+            env=env, check=False,
+        )
+        return proc.returncode
+
+    # ---- 阶段 3：其余步骤（现在跑在 venv 的解释器下，第三方包都可用）----
     run(step_fixtures(installer_dir))
     run(step_seven_zip(installer_dir, allow_download=not args.no_download, skip=args.skip_seven_zip))
     run(step_write_local_config(installer_dir, node))
@@ -1214,29 +1548,8 @@ def main() -> int:
     run(step_schtask(args.skip_schtask))
     run(step_selftest(args.skip_selftest))
 
-    payload = {
-        "node": node,
-        "repo": str(REPO_ROOT),
-        "admin": is_admin(),
-        "profile": machine_profile(),
-        "installer_dir": str(installer_dir),
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "steps": [s.to_dict() for s in steps],
-        "ok": all(s.ok for s in steps),
-    }
-    out_dir = REPO_ROOT / "reports" / "bootstrap"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"bootstrap_{node}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return _write_report(node, installer_dir, steps)
 
-    failed = [s.name for s in steps if not s.ok]
-    say("=" * 46)
-    if failed:
-        say(f"结果：{len(failed)} 步有问题 -> {'; '.join(failed)}")
-    else:
-        say("结果：全部通过，本机已可跑批")
-    say(f"明细：{out}")
-    return 0 if not failed else 1
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ PS1 = REPO_ROOT / "tools" / "bootstrap_machine.ps1"
 
 # 包装脚本要转发的 10 个开关，必须与 Python 侧 argparse 对齐
 _EXPECTED_PARAMS = [
-    "InstallerDir", "NodeId", "SkipVenv", "SkipSevenZip", "SkipSecurityTools",
+    "InstallerDir", "NodeId", "Wheelhouse", "SkipVenv", "SkipSevenZip", "SkipSecurityTools",
     "SkipSchtask", "SkipSelftest", "SkipShare", "SkipFarm", "NoDownload",
 ]
 
@@ -114,7 +114,11 @@ def test_ps1_never_runs_a_bare_python(ps1_text):
         assert "$py" in stripped, f"这行在直接调外部命令、没走解析结果：{line}"
 
 
-def test_ps1_forwards_all_ten_switches(ps1_text):
-    """10 个开关必须一个不少地转发给 Python 侧（历史上两边对齐过，别再漂）。"""
+def test_ps1_forwards_all_switches(ps1_text):
+    """11 个开关必须一个不少地转发给 Python 侧（历史上两边对齐过，别再漂）。
+
+    `Wheelhouse` 是 2026-09-21 加的：无外网机器上 `wheelhouse\\` 不一定放在脚本会
+    自动找的位置，得能手动指路。只加 Python 侧不加包装脚本，等于一线根本用不上。
+    """
     missing = [p for p in _EXPECTED_PARAMS if p not in ps1_text]
     assert not missing, f"这些开关没被转发：{missing}"
