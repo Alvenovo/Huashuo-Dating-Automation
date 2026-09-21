@@ -228,3 +228,57 @@ def test_reset_allowed_reads_env_gate():
         assert installer.reset_allowed() is True
         os.environ["HALL_ALLOW_INSTALL"] = "0"
         assert installer.reset_allowed() is False
+
+
+# ---------------- 钉住包的位置：必须认 _cache ----------------
+#
+# 2026-09-21 查出的真 bug：新机器上钉住包不是人拷来的，是 bootstrap 从共享盘/官网
+# 取回来的，落点在 `installer_dir/_cache/fixtures/`。而 `reset_fixture.py` 读的是
+# `cfg.update_package_path`，早先只认 `installer_dir/fixtures/` —— 于是离线新机上
+# 它会报「钉住安装包不存在」，P1-A 更新用例的起点建不起来
+# （表现为该用例失败，看着像产品问题，实际是包放错了位置）。
+# 与 `security_package_path` 是同一类洞，那次修了安全包、这次漏了夹具包。
+
+
+def _fixture_cfg(tmp_path, package: str):
+    import yaml
+
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(yaml.safe_dump({
+        "installer_dir": str(tmp_path / "installer"),
+        "update_fixture": {"name": "7-Zip", "package": package},
+    }, allow_unicode=True), encoding="utf-8")
+    with mock.patch.dict("os.environ", {"HALL_CONFIG": str(cfg_file)}, clear=False):
+        os.environ.pop("HALL_PACKAGE_CACHE", None)
+        return load_config(cfg_file)
+
+
+def test_update_package_path_prefers_direct_location(tmp_path):
+    """直路径有 -> 就用它（既有跑法不能改坏）。"""
+    cfg = _fixture_cfg(tmp_path, "fixtures/7z2602-x64.exe")
+    direct = tmp_path / "installer" / "fixtures" / "7z2602-x64.exe"
+    direct.parent.mkdir(parents=True)
+    direct.write_bytes(b"x")
+    assert cfg.update_package_path == direct
+
+
+def test_update_package_path_falls_back_to_cache(tmp_path):
+    """**回归锁**：只有 `_cache/fixtures/` 有也要认出来。"""
+    cfg = _fixture_cfg(tmp_path, "fixtures/7z2602-x64.exe")
+    cached = tmp_path / "installer" / "_cache" / "fixtures" / "7z2602-x64.exe"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"x")
+    assert cfg.update_package_path == cached
+
+
+def test_update_package_path_returns_direct_when_nowhere(tmp_path):
+    """两边都没有 -> 返回直路径（让调用方报错时报出"应该放哪"，便于补救）。"""
+    cfg = _fixture_cfg(tmp_path, "fixtures/7z2602-x64.exe")
+    assert cfg.update_package_path == tmp_path / "installer" / "fixtures" / "7z2602-x64.exe"
+
+
+def test_update_package_path_respects_absolute_path(tmp_path):
+    """配的是绝对路径 -> 原样返回，不拼接 installer_dir。"""
+    absolute = tmp_path / "elsewhere" / "7z.exe"
+    cfg = _fixture_cfg(tmp_path, str(absolute))
+    assert cfg.update_package_path == absolute

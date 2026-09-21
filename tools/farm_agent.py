@@ -28,7 +28,7 @@
 
 **`env` 只放非敏感项**（白名单见 `hall_auto/env_pack.py`：`HALL_ALLOW_INSTALL` /
 `HALL_NODE_ID` / `HALL_FARM_ROOT` / `HALL_PACKAGE_SHARE` …）。任务文件躺在共享盘上，
-**密码绝不写进去**。凭据走节点本地 `tools/farm_node.env`（已 gitignore），格式：
+**密码绝不写进去**。凭据走节点本地 `farm_node.env`（**仓库根**，已 gitignore），格式：
 
     HALL_TEST_USER=13800000000
     HALL_TEST_PASSWORD=xxxx
@@ -68,7 +68,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from hall_auto.dpi import is_interactive_session, machine_profile, node_id  # noqa: E402
-from hall_auto.env_pack import NODE_ENV_FILENAME, build_suite_env, credential_status  # noqa: E402
+from hall_auto.env_pack import (  # noqa: E402
+    NODE_ENV_EVIDENCE_NAME,
+    NODE_ENV_FILENAME,
+    build_suite_env,
+    credential_status,
+)
 from hall_auto.evidence import EVIDENCE_ROOT  # noqa: E402
 from hall_auto.suites import build_command, get_suite  # noqa: E402
 
@@ -218,12 +223,55 @@ def run_suite(
     return proc.returncode, creds
 
 
-def newest_run_dir() -> Path | None:
-    """本轮新产生的证据目录（按修改时间取最新）。"""
+def evidence_snapshot() -> set[str]:
+    """跑套件**之前**给证据根目录拍个快照，用于事后判定"这一轮新增了哪个目录"。"""
+    if not EVIDENCE_ROOT.is_dir():
+        return set()
+    return {d.name for d in EVIDENCE_ROOT.iterdir() if d.is_dir()}
+
+
+def newest_run_dir(exclude: set[str] | None = None) -> Path | None:
+    """本轮新产生的证据目录（按修改时间取最新）。
+
+    `exclude` 传跑之前的快照。**不加这个过滤会张冠李戴**：套件没产出证据目录时
+    （收集失败 / 进程起不来 / 一条用例都没收到），这里会返回**上一轮的旧目录**，
+    调用方把它当本轮证据回传 —— 报告里那台机器就挂着一份别的运行的结果，
+    比"没有证据"危险得多。
+    """
     if not EVIDENCE_ROOT.is_dir():
         return None
-    dirs = [d for d in EVIDENCE_ROOT.iterdir() if d.is_dir()]
+    dirs = [
+        d for d in EVIDENCE_ROOT.iterdir()
+        if d.is_dir() and (exclude is None or d.name not in exclude)
+    ]
     return max(dirs, key=lambda d: d.stat().st_mtime) if dirs else None
+
+
+def _write_node_env(run_dir: Path, node: str, task_id: str, suite: str, creds: dict[str, bool]) -> None:
+    """把本轮凭据状态写进证据目录，随证据一起回传。
+
+    **为什么必须落到证据里**：控制机汇总（`farm_control.aggregate`）只读 `results/`
+    下的证据目录，不读 `done/` 回执。凭据状态只写回执的话，汇总报告的「凭据」列
+    永远是 ✗ —— 而手册让测试人员正是靠这一列区分「这台机器没配凭据」和
+    「凭据配了、是用例本身在跳过」。写错一处，一线就会去反复折腾 `farm_node.env`。
+    """
+    try:
+        (run_dir / NODE_ENV_EVIDENCE_NAME).write_text(
+            json.dumps(
+                {
+                    "node": node,
+                    "task_id": task_id,
+                    "suite": suite,
+                    "credentials": creds,
+                    "profile": machine_profile(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"  凭据状态写入证据失败（汇总报告凭据列会不准）：{exc}", file=sys.stderr)
 
 
 def main() -> int:
@@ -280,11 +328,15 @@ def main() -> int:
             sid = int(entry.get("shard_id") or 1)
             scount = int(entry.get("shard_count") or 1)
             print(f"  跑 {name}（分片 {sid}/{scount}）")
+            before = evidence_snapshot()   # 先拍快照，避免没产出证据时错认上一轮的目录
             rc, creds = run_suite(name, sid, scount, log, task_env=task_env)
-            run_dir = newest_run_dir()
+            run_dir = newest_run_dir(exclude=before)
             results.append({"suite": name, "shard_id": sid, "shard_count": scount, "exit_code": rc,
                             "run_dir": run_dir.name if run_dir else None})
-            if run_dir is not None:
+            if run_dir is None:
+                print(f"  {name} 本轮没产出证据目录（rc={rc}），不猜测、不回传", file=sys.stderr)
+            else:
+                _write_node_env(run_dir, node, task_id, name, creds)
                 dest = root / "results" / node / run_dir.name
                 try:
                     if dest.exists():

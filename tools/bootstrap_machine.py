@@ -71,6 +71,7 @@ import ctypes
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -99,6 +100,11 @@ SEVEN_ZIP_EXE = Path("C:/Program Files/7-Zip/7z.exe")
 SEVEN_ZIP_FIXTURE_SHA256 = "6745fa76dc2ea031596d8678f6f6b99c3c1b435b4164a63485adbbc7b8d82ef0"
 SEVEN_ZIP_URL = "https://www.7-zip.org/a/7z2602-x64.exe"
 
+# 钉住包相对 `installer_dir`（也相对共享盘根）的路径。
+# 与 `config.yaml` 的 `update_fixture.package`、`reset_fixture.py` 读的
+# `cfg.update_package_path` 必须是同一个位置，否则"取到了但用不上"。
+FIXTURE_REL = "fixtures/7z2602-x64.exe"
+
 # 节点本地凭据文件的名字（仓库根下，已在 .gitignore）。
 # 与 hall_auto/env_pack.NODE_ENV_FILENAME 是同一条约定，这里 import 过来免得抄错。
 from hall_auto.env_pack import NODE_ENV_FILENAME  # noqa: E402
@@ -118,7 +124,17 @@ SUGGESTED_NODE_ENV = (
     "HALL_SHARE_PASSWORD",
 )
 
-SELFTEST_MARKER = "unit"
+# 新机器（还没有 config.local.yaml）要用的大厅目标版 / 基线版。
+#
+# **为什么不能只靠仓库模板 `config.yaml`**：它是公开仓库的模板，里面的版本是旧的
+# （`baseline_setup` 还指着早已从共享盘下架的 1.6.8.17S）。新机器读它 → 第 10 步
+# 「安装包准备」既拿不到本地包、也拿不到共享盘包 → 转去猜的 CDN 模板（实测 404）
+# → **直接 FAIL**，而手册写的预期结果是"全部通过"。所以这里必须显式落盘。
+#
+# 只做 `setdefault`：老机器手工配过的值一律不覆盖。
+# 改版本时这两处要跟共享盘 `hall-packages` 上实际放的包保持一致。
+DEFAULT_LATEST_SETUP = "myappstore_1.6.11.4S_Setup.exe"
+DEFAULT_BASELINE_SETUP = "myappstore_1.6.10.7S_Setup.exe"
 
 # 依赖装好后写的标记文件，内容 = requirements.txt 的 SHA256。
 # 下次 bootstrap 先比哈希，一致就直接跳过 pip（秒级）；不一致才走 pip + 校验。
@@ -355,7 +371,7 @@ def step_fixtures(installer_dir: Path) -> Step:
         st.log(f"大厅安装包 {len(setups)} 个：{', '.join(p.name for p in setups)}")
     else:
         st.log(f"{installer_dir} 下暂无大厅安装包 —— 后续步骤会按配置自动下载")
-    seven_zip = installer_dir / "fixtures" / "7z2602-x64.exe"
+    seven_zip = installer_dir / FIXTURE_REL
     if seven_zip.is_file():
         digest = sha256_of(seven_zip)
         if digest == SEVEN_ZIP_FIXTURE_SHA256:
@@ -366,7 +382,7 @@ def step_fixtures(installer_dir: Path) -> Step:
                 f"实际 {digest[:16]}…（本地包被换过）"
             )
     else:
-        st.log(f"暂无 7-Zip 更新夹具包：{seven_zip}（下一步会按需从 {SEVEN_ZIP_URL} 取）")
+        st.log(f"暂无 7-Zip 更新夹具包：{seven_zip}（下一步会按 缓存/共享盘/官网 顺序取）")
     tools_dir = installer_dir / "fixtures" / "security_tools"
     wanted = ["CheckAppV.exe", "SignCheck_v2.ps1"]
     missing = [n for n in wanted if not (tools_dir / n).is_file()]
@@ -385,8 +401,16 @@ def _ensure_seven_zip_fixture(installer_dir: Path, allow_download: bool, st: Ste
     （`reset_fixture.py` 靠它把 7-Zip 压回 26.02，大厅更新列表里才有东西可更新）。
     早先只在"7-Zip 没装"时才去取它，于是**已经装了 7-Zip 的机器永远拿不到夹具包**，
     `test_update_fixture_via_hall` 直接失败。两个身份各自都需要它，所以无条件确保。
+
+    **取包顺序：本地直路径 → 缓存 → 共享盘 → 官网下载**（前三个都不出外网）。
+    早先只有"本地直路径 + 官网下载"两条路，于是**没有外网的测试机上，明明共享盘
+    躺着这个包也取不到** —— 7-Zip 装不上（手册却承诺"7-Zip 你完全不用管"），
+    P1-A 更新用例也报「钉住安装包不存在」。
+
+    **取到后一律落到规范位置 `installer_dir/fixtures/`**：`reset_fixture.py` 和
+    P1-A 都按这里找它，只留在 `_cache/fixtures/` 下它们看不到。
     """
-    installer = installer_dir / "fixtures" / "7z2602-x64.exe"
+    installer = installer_dir / FIXTURE_REL
     if installer.is_file():
         digest = sha256_of(installer)
         if digest == SEVEN_ZIP_FIXTURE_SHA256:
@@ -401,13 +425,79 @@ def _ensure_seven_zip_fixture(installer_dir: Path, allow_download: bool, st: Ste
             st.log(f"删不掉坏包（{exc}），放弃重取")
             return None
 
-    if not allow_download:
-        st.log(f"钉住包不在本地（{installer}），--no-download 下不取；P1-A 更新用例会失败")
+    got = _fixture_from_cache_or_share(installer_dir, st)
+    if got is None:
+        if not allow_download:
+            st.log(f"钉住包不在本地（{installer}），--no-download 下不取；P1-A 更新用例会失败")
+            return None
+        got = _fixture_by_download(installer, st)
+    if got is None:
+        return None
+
+    # 统一落到规范位置：只留在 `_cache/fixtures/` 下，reset_fixture 会报"不存在"。
+    try:
+        if got.resolve() != installer.resolve():
+            installer.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(got, installer)
+    except OSError as exc:
+        st.log(f"把钉住包落到 {installer} 失败（{exc}），将直接使用 {got}")
+        return got
+
+    digest = sha256_of(installer)
+    if digest != SEVEN_ZIP_FIXTURE_SHA256:
+        st.log(f"取到的包 sha256 不符（{digest[:16]}…），不用它")
+        return None
+    st.log(f"已取到钉住包：{installer}")
+    return installer
+
+
+def _fixture_config(installer_dir: Path):
+    """读配置并把 installer_dir 钉成本次铺设用的目录。
+
+    为什么必须钉住：`step_seven_zip` 跑在**第 4 步**，而写 `config.local.yaml` 是第 5 步 ——
+    新机器此刻读到的 `installer_dir` 还是仓库模板里的占位路径（`C:/Users/ASUS/...`）。
+    不钉住的话，缓存查找会落到一个别人的目录上，取回来的包也不在本次要用的 installer_dir 里。
+    `Config` 是 frozen dataclass，`dataclasses.replace` 换字段不产生副作用。
+    """
+    from dataclasses import replace
+
+    from hall_auto.config import load_config
+
+    return replace(load_config(), installer_dir=installer_dir)
+
+
+def _fixture_from_cache_or_share(installer_dir: Path, st: Step) -> Path | None:
+    """从本机缓存或共享盘取钉住包（都不出外网）。拿不到返回 None，不抛错。
+
+    这条路的现实意义：测试机常常没有外网，而共享盘上有这个包。
+    """
+    try:
+        cfg = _fixture_config(installer_dir)
+    except Exception as exc:
+        st.log(f"读配置失败，跳过缓存/共享盘取钉住包：{exc}")
         return None
 
     try:
+        from hall_auto.fetch import cache_dir, ensure_from_share
+
+        cached = cache_dir(cfg) / FIXTURE_REL
+        if cached.is_file():
+            st.log(f"钉住包命中本机缓存：{cached}")
+            return cached
+        got = ensure_from_share(cfg, FIXTURE_REL)
+    except Exception as exc:
+        st.log(f"从共享盘取钉住包失败（{exc}），继续尝试下载")
+        return None
+    if got is not None:
+        st.log(f"钉住包取自共享盘：{got.path}")
+        return got.path
+    return None
+
+
+def _fixture_by_download(installer: Path, st: Step) -> Path | None:
+    """从官网取钉住包（复用 fetch 的 .part 原子改名 + 递增重试）。"""
+    try:
         installer.parent.mkdir(parents=True, exist_ok=True)
-        # 复用 fetch 的下载：带 .part 原子改名 + 递增重试，比这里重写一份稳。
         from hall_auto.fetch import _download
 
         _download(SEVEN_ZIP_URL, installer, timeout_sec=60, retries=3)
@@ -418,12 +508,6 @@ def _ensure_seven_zip_fixture(installer_dir: Path, allow_download: bool, st: Ste
             "P1-A 更新用例需要它"
         )
         return None
-
-    digest = sha256_of(installer)
-    if digest != SEVEN_ZIP_FIXTURE_SHA256:
-        st.log(f"刚取到的包 sha256 不符（{digest[:16]}…），不用它")
-        return None
-    st.log(f"已取到钉住包：{installer}")
     return installer
 
 
@@ -627,7 +711,10 @@ def step_write_local_config(installer_dir: Path, node: str) -> Step:
     existing = _load_existing_local_config()
     # 只覆盖与机器绑定、必须逐台不同的字段；其余（超时、夹具名、update_fixture 摘要）保持原样
     existing["installer_dir"] = installer_dir.as_posix()
-    existing.setdefault("latest_setup", "myappstore_1.6.11.4S_Setup.exe")
+    existing.setdefault("latest_setup", DEFAULT_LATEST_SETUP)
+    # 基线版同样要落盘：`config.yaml` 里那个 1.6.8.17S 已经不在共享盘上了，
+    # 不写的话第 10 步取基线包必失败（见 DEFAULT_BASELINE_SETUP 的说明）。
+    existing.setdefault("baseline_setup", DEFAULT_BASELINE_SETUP)
     existing.setdefault("timeouts", {"launch_sec": 120, "ready_sec": 150, "install_sec": 300})
     fixture_apps = existing.setdefault("fixture_apps", {})
     fixture_apps.setdefault("install", "网易云音乐")
@@ -775,6 +862,14 @@ def step_schtask(skip: bool) -> Step:
 
 
 def step_selftest(skip: bool) -> Step:
+    """跑 `tests/unit` 全量自检。
+
+    **不要加 `-m` 过滤**：早先用 `-m unit` 只跑带 unit 标记的那部分，而 `tests/unit`
+    下 260 条里只有 127 条带标记 —— 漏掉的正好是 `test_fetch_policy` /
+    `test_farm_agent_policy` / `test_env_pack_policy` / `test_reset_policy` /
+    `test_bootstrap_policy` 这些**多机链路**模块。手册写的是"全绿说明环境 OK"，
+    只跑一半属于自检名不副实（路径已限定 tests/unit，不需要再按 marker 收窄）。
+    """
     st = Step("自检 tests/unit")
     if skip:
         st.log("按 --skip-selftest 跳过")
@@ -785,7 +880,7 @@ def step_selftest(skip: bool) -> Step:
         return st
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     proc = subprocess.run(
-        [str(py), "-X", "utf8", "-m", "pytest", "tests/unit", "-m", SELFTEST_MARKER, "-q", "--skip-env-check"],
+        [str(py), "-X", "utf8", "-m", "pytest", "tests/unit", "-q", "--skip-env-check"],
         capture_output=True, text=True, cwd=str(REPO_ROOT), env=env, check=False,
     )
     tail = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()][-3:]
@@ -800,7 +895,7 @@ def step_selftest(skip: bool) -> Step:
 
 
 def step_node_env_template() -> Step:
-    """准备节点本地凭据文件模板 `tools/farm_node.env`（已 gitignore）。
+    """准备节点本地凭据文件模板（仓库根下 `farm_node.env`，已 gitignore）。
 
     **不生成任何真实凭据**，只在文件不存在时放一份带注释的模板并提示要填什么。
     密码只走这里（机器本地），不落共享盘、不进任务文件。

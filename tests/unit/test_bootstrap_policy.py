@@ -278,6 +278,25 @@ def _no_real_download():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_share():
+    """单元测试同样不许真去探测共享盘。
+
+    与 `_no_real_download` 同一个理由，但后果更隐蔽：钉住包的取用链现在是
+    「本地 → 缓存 → 共享盘 → 下载」，而本机 `config.yaml` 配的是**真实共享盘地址**。
+    不挡住的话：
+      - 每个相关用例都真去连那台机器（探测失败要等 5s 超时，实测把单测拖到 3 分钟以上）；
+      - 在共享盘可用的机器上，本该"本地没有 → 去下载"的用例会真从共享盘拷回一个包，
+        于是它**再也不走下载分支**，断言集体失配（假红）；
+      - 反之在共享盘不可达的机器上又是另一套结果 —— 同一份代码在两种机器上跑出不同结论。
+
+    需要共享盘路径的用例自己 `mock.patch("hall_auto.fetch.share_dirs", ...)`，
+    显式 patch 会覆盖这里的默认值。
+    """
+    with mock.patch("hall_auto.fetch.share_dirs", return_value=[]):
+        yield
+
+
 def _place_fixture(bm, tmp_path: Path) -> Path:
     """造一个"已经在本地、且摘要对得上"的钉住包，并让常量认它。
 
@@ -713,4 +732,147 @@ def test_write_local_config_keeps_farm_root_when_env_absent(bm, tmp_path, monkey
     assert st.ok, st.detail
     text = (tmp_path / "config.local.yaml").read_text(encoding="utf-8")
     assert "//LAPTOP-VS5F7HF4/hall-farm" in text, "重跑 bootstrap 不该擦掉已落盘的农场目录"
+
+
+# ---------------- 钉住包的取用链：本地 -> 缓存 -> 共享盘 -> 下载 ----------------
+#
+# 这条链是给**没有外网的测试机**用的：共享盘上摆一份钉住包，所有节点走局域网取。
+# 早先只有「本地直路径 + 官网下载」两条路，于是离线机器上：
+#   ① 7-Zip 装不上（手册却写着"7-Zip 你完全不用管"）；
+#   ② 第 10 步把包取到 `_cache/fixtures/` 后，`reset_fixture.py` 找的是
+#      `installer_dir/fixtures/` → 报「钉住安装包不存在」→ P1-A 更新用例起点建不起来。
+# 所以取到后**必须落到规范位置**，这也是下面第一条用例锁的重点。
+
+
+def _fixture_cfg(installer: Path):
+    """给 `_fixture_config` 用的最小配置：只需要 installer_dir（决定缓存落点）。"""
+    return mock.Mock(installer_dir=installer, raw={})
+
+
+def test_seven_zip_fixture_comes_from_share_when_offline(bm, tmp_path):
+    """**离线机器的关键路径**：本地没有 + 禁下载 + 共享盘有 -> 仍要拿到，并落到规范位置。"""
+    share = tmp_path / "share"
+    (share / "fixtures").mkdir(parents=True)
+    payload = b"from-share"
+    (share / "fixtures" / "7z2602-x64.exe").write_bytes(payload)
+    installer = tmp_path / "installer"
+    installer.mkdir()
+    digest = hashlib.sha256(payload).hexdigest()
+
+    with mock.patch.object(bm, "_fixture_config", return_value=_fixture_cfg(installer)), \
+         mock.patch("hall_auto.fetch.share_dirs", return_value=[share]), \
+         mock.patch("hall_auto.fetch.share_reachable", return_value=(True, "")), \
+         mock.patch("hall_auto.fetch._expected_sha", return_value=""), \
+         mock.patch.object(bm, "SEVEN_ZIP_FIXTURE_SHA256", digest):
+        st = bm.Step("probe")
+        got = bm._ensure_seven_zip_fixture(installer, allow_download=False, st=st)
+
+    assert got is not None, st.detail
+    assert any("共享盘" in line for line in st.detail), st.detail
+    assert got == installer / "fixtures" / "7z2602-x64.exe", "必须落到 reset_fixture 找的那个位置"
+    assert got.is_file()
+
+
+def test_seven_zip_fixture_comes_from_cache_when_offline(bm, tmp_path):
+    """本地直路径没有、但缓存里有（上一轮取过）-> 直接用它，不联网。"""
+    installer = tmp_path / "installer"
+    cache = installer / "_cache" / "fixtures"
+    cache.mkdir(parents=True)
+    payload = b"cached"
+    (cache / "7z2602-x64.exe").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+
+    with mock.patch.object(bm, "_fixture_config", return_value=_fixture_cfg(installer)), \
+         mock.patch.object(bm, "SEVEN_ZIP_FIXTURE_SHA256", digest):
+        st = bm.Step("probe")
+        got = bm._ensure_seven_zip_fixture(installer, allow_download=False, st=st)
+
+    assert got == installer / "fixtures" / "7z2602-x64.exe"
+    assert got.is_file()
+    assert any("缓存" in line for line in st.detail), st.detail
+
+
+def test_fixture_config_pins_installer_dir(bm, tmp_path):
+    """`_fixture_config` 必须把 installer_dir 钉成本次铺设的目录。
+
+    `step_seven_zip` 在第 4 步跑，而写 `config.local.yaml` 是第 5 步 ——
+    新机器此刻读到的还是仓库模板里的占位路径（`C:/Users/ASUS/...`）。
+    不钉住的话，缓存查找和落点都会跑到别人的目录上。
+    """
+    cfg = bm._fixture_config(tmp_path)
+    assert cfg.installer_dir == tmp_path
+
+
+# ---------------- 第 12 步自检必须跑全量 ----------------
+
+
+def test_selftest_runs_whole_unit_suite(bm):
+    """自检**不能**按 marker 收窄。
+
+    早先的命令是 `pytest tests/unit -m unit`，而 `tests/unit` 下 260 条里只有 127 条
+    带 `unit` 标记 —— 漏掉的正好是 fetch / farm_agent / env_pack / reset / bootstrap
+    这些**多机链路**模块。手册写的是"全绿说明环境 OK"，只跑一半属自检名不副实。
+    """
+    with mock.patch.object(bm.subprocess, "run", return_value=_fake_run()) as run:
+        bm.step_selftest(False)
+
+    argv = run.call_args_list[0][0][0]
+    assert "tests/unit" in argv
+    # `-m pytest` 那个 -m 是"跑模块"，是必须的；要禁的是**第二个** -m（marker 过滤）
+    assert argv.count("-m") == 1, f"不该再按 marker 过滤：{argv}"
+    assert argv[argv.index("-m") + 1] == "pytest"
+
+
+# ---------------- 手册与代码的一致性（防漂移）----------------
+#
+# 这轮踩的坑就是"文档说 A、代码做 B"，而且两轮复核都只核对了名字对不对、
+# 没核对新机器上跑不跑得通。把手册那张 12 步表和 main() 的调用顺序一起钉住。
+
+
+_CODE_CALL_ORDER = [
+    "env_check", "venv", "fixtures", "seven_zip", "write_local_config", "node_env_template",
+    "share_login", "security_tools", "farm_root", "fetch_packages", "schtask", "selftest",
+]
+
+_MANUAL_STEP_KEYWORDS = {
+    1: "环境自检", 2: "虚拟环境", 3: "夹具", 4: "7-Zip", 5: "config.local.yaml",
+    6: "farm_node.env", 7: "共享盘", 8: "安全工具", 9: "农场目录",
+    10: "安装包", 11: "计划任务", 12: "单元测试",
+}
+
+
+def test_bootstrap_main_call_order_is_locked(bm):
+    """`main()` 里 12 个步骤的调用顺序是手册那张表的依据，钉住它。"""
+    import re
+
+    src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
+    main_src = src[src.index("def main()"):]
+    calls = re.findall(r"run\(step_(\w+)\(", main_src)
+    assert calls == _CODE_CALL_ORDER, f"步骤顺序变了，手册那张表要同步改：{calls}"
+
+
+def test_manual_bootstrap_step_table_matches_code(bm):
+    """《测试机操作手册》「脚本会依次做这 12 件事」那张表要与代码对得上。
+
+    测试人员就是照着这张表判断"第几步红了该找谁"。表里写 12 步、代码跑 11 步，
+    或者顺序错位，一线会按错误的编号去查故障（上一轮真发生过：故障表写第 10 步、
+    实际是第 11 步）。
+    """
+    import re
+
+    manual = REPO_ROOT / "项目知识库" / "测试机操作手册.md"
+    if not manual.is_file():
+        pytest.skip("手册不在本仓库（发布给测试同事的包里可能只带手册）")
+
+    text = manual.read_text(encoding="utf-8")
+    # 只取「脚本会依次做这 12 件事」那一节里的表 —— 「全流程一览」那张表在文档更前面，
+    # 也是 `| 1 | ...` 开头，不切出区块会把两张表混在一起数。
+    assert "脚本会依次做这 12 件事" in text, "手册里那张 12 步表的标题变了，本用例要跟着改"
+    block = text.split("脚本会依次做这 12 件事", 1)[1].split("**预期结果**", 1)[0]
+    rows = [(int(n), body) for n, body in re.findall(r"^\| (\d+) \| ([^|]*?) \|", block, re.M)
+            if int(n) <= 12]
+    assert len(rows) == 12, f"手册 12 步表取到 {len(rows)} 行：{rows}"
+    wrong = [n for n, body in rows if _MANUAL_STEP_KEYWORDS[n] not in body]
+    assert not wrong, f"这些行与代码对不上：{wrong}（行内容：{[b for n, b in rows if n in wrong]}）"
+    assert len(_CODE_CALL_ORDER) == 12
 

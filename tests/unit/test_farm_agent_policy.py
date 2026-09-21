@@ -210,3 +210,83 @@ def test_farm_root_survives_config_read_error(monkeypatch):
         with pytest.raises(SystemExit):
             farm_agent.farm_root()
 
+
+# ---------------- 证据回传：不许错认上一轮的目录 ----------------
+#
+# 回传逻辑是"跑完取证据根目录下最新的那个 run"。若本轮**没产出**证据目录
+# （用例收集失败 / pytest 起不来 / 一条都没收集到），"最新"就是**上一轮的旧目录** ——
+# 于是报告里那台机器挂着一份别的运行的结果。这比"没有证据"危险得多：
+# 结论看着有、实际张冠李戴。
+#
+# 解法是跑之前先给证据根目录拍快照，只认新出现的。
+
+
+@pytest.fixture
+def evidence_root(tmp_path, monkeypatch):
+    root = tmp_path / "evidence"
+    root.mkdir()
+    monkeypatch.setattr(farm_agent, "EVIDENCE_ROOT", root)
+    return root
+
+
+def test_evidence_snapshot_empty_when_root_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(farm_agent, "EVIDENCE_ROOT", tmp_path / "nope")
+    assert farm_agent.evidence_snapshot() == set()
+
+
+def test_newest_run_dir_returns_none_when_nothing_new(evidence_root):
+    """**核心回归锁**：没有新目录时返回 None，绝不回落旧目录。"""
+    (evidence_root / "OLD_2026-09-01_0000").mkdir()
+    snapshot = farm_agent.evidence_snapshot()
+    assert snapshot == {"OLD_2026-09-01_0000"}
+    assert farm_agent.newest_run_dir(exclude=snapshot) is None
+
+
+def test_newest_run_dir_picks_the_new_one(evidence_root):
+    """有新目录时只认新的那个（旧的不参与比较）。"""
+    old = evidence_root / "OLD_2026-09-01_0000"
+    old.mkdir()
+    snapshot = farm_agent.evidence_snapshot()
+    new = evidence_root / "NEW_2026-09-21_1000"
+    new.mkdir()
+    assert farm_agent.newest_run_dir(exclude=snapshot) == new
+
+
+def test_newest_run_dir_none_without_exclude_still_works(evidence_root):
+    """不传 exclude 时保持旧行为（兼容调用方），返回最新目录。"""
+    (evidence_root / "ONLY_2026-09-21_1000").mkdir()
+    assert farm_agent.newest_run_dir() is not None
+
+
+# ---------------- 凭据状态随证据回传 ----------------
+#
+# 控制机汇总时**只读 results/ 下的证据目录**，不读 done/ 回执。
+# 凭据状态只写回执的话，汇总报告的「凭据」列恒为 ✗，
+# 而手册让一线正是靠这一列区分"没配凭据"和"用例本身在跳过"。
+
+
+def test_write_node_env_lands_in_run_dir(tmp_path):
+    run_dir = tmp_path / "R01_2026-09-21_1000"
+    run_dir.mkdir()
+    creds = {"password_login": True, "microsoft_sso": False, "change_password": False, "share_creds": True}
+    farm_agent._write_node_env(run_dir, "R01", "T1", "login", creds)
+
+    payload = json.loads(
+        (run_dir / farm_agent.NODE_ENV_EVIDENCE_NAME).read_text(encoding="utf-8")
+    )
+    assert payload["credentials"] == creds
+    assert payload["node"] == "R01" and payload["task_id"] == "T1" and payload["suite"] == "login"
+    assert "profile" in payload, "环境画像也一起带上，汇总时不必另找"
+
+
+def test_write_node_env_does_not_crash_on_bad_path(tmp_path):
+    """写不进去只警告，不能让整轮任务失败（证据已经跑出来了，别丢）。"""
+    farm_agent._write_node_env(tmp_path / "no" / "such" / "dir", "R01", "T1", "login", {})
+
+
+def test_evidence_name_matches_control_side():
+    """节点写、控制机读的是同一个文件名，两处常量必须同源。"""
+    from hall_auto.env_pack import NODE_ENV_EVIDENCE_NAME
+
+    assert farm_agent.NODE_ENV_EVIDENCE_NAME == NODE_ENV_EVIDENCE_NAME
+

@@ -94,18 +94,30 @@ def package_url(cfg: Config, filename: str) -> str:
 
     配置里 `download.url_template` 优先（支持 `{filename}` 占位）；没配走默认 CDN。
     `update_fixture.url` 若与本 filename 匹配也认——历史配置里钉过更新包直链。
+
+    **匹配按 basename 比**：`update_fixture.package` 是 `fixtures/7z2602-x64.exe` 这种
+    带子目录的相对路径，而调用方传的 filename 可能带也可能不带子目录。早先按整串比，
+    于是钉住包落到"没配 url_template → 走默认 ASUS CDN → 拼出 .../AppStore/fixtures/7z2602-x64.exe
+    → 404"，白等三次重试才失败。
     """
     download = (cfg.raw.get("download") or {}) if isinstance(cfg.raw, dict) else {}
     template = str(download.get("url_template") or "").strip()
     if not template:
         # 兼容历史：update_fixture.url 通常就是直链
         fixture_url = str(cfg.update_fixture.url or "").strip()
-        if fixture_url and cfg.update_fixture.package and Path(cfg.update_fixture.package).name == filename:
+        if fixture_url and _same_package(cfg.update_fixture.package, filename):
             return fixture_url
         template = DEFAULT_URL_TEMPLATE
     if "{filename}" in template:
         return template.replace("{filename}", filename)
     return template.rstrip("/") + "/" + filename
+
+
+def _same_package(configured: str, filename: str) -> bool:
+    """配置里的包名与本次要取的 filename 是不是同一个包（按 basename 比，容忍子目录）。"""
+    if not configured or not filename:
+        return False
+    return Path(configured).name == Path(filename).name
 
 
 def _expected_sha(cfg: Config, filename: str) -> str:
@@ -117,8 +129,8 @@ def _expected_sha(cfg: Config, filename: str) -> str:
         got = checksums.get(filename)
         if got:
             return str(got).strip().lower()
-    # 更新夹具包自带摘要
-    if cfg.update_fixture.package and Path(cfg.update_fixture.package).name == filename:
+    # 更新夹具包自带摘要（同样按 basename 比，见 `_same_package` 的说明）
+    if _same_package(cfg.update_fixture.package, filename):
         return str(cfg.update_fixture.sha256 or "").strip().lower()
     return ""
 

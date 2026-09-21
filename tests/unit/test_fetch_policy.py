@@ -472,3 +472,75 @@ def test_copy_tree_from_share_overwrites_readonly_file(cfg_share, tmp_path):
 
     assert count == 1
     assert stale.read_bytes() == b"fresh", "只读文件必须被覆盖，不能静默跳过"
+
+
+# ---------------- 钉住包：包名带子目录时的 url / sha 匹配 ----------------
+#
+# 2026-09-21 查出的真 bug：`update_fixture.package` 是 `fixtures/7z2602-x64.exe`，
+# 而调用方传进来的 filename 有时带子目录、有时不带。早先按**整串**比较，于是：
+#   - `_expected_sha` 对钉住包永远返回空 -> 配置里钉的 sha256 **从未生效**；
+#   - `package_url` 匹配不上 -> 回落默认 ASUS CDN，拼出
+#     `.../AppStore/fixtures/7z2602-x64.exe`（404），白等三次重试才失败。
+# 两处都改成按 basename 比。
+
+FIXTURE_SHA = "6745fa76dc2ea031596d8678f6f6b99c3c1b435b4164a63485adbbc7b8d82ef0"
+
+
+@pytest.fixture
+def cfg_fixture(tmp_path):
+    """带 update_fixture 的 Config，且**故意不配** download.url_template。"""
+    import yaml
+
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(yaml.safe_dump({
+        "installer_dir": str(tmp_path),
+        "latest_setup": "myappstore_1.6.11.4S_Setup.exe",
+        "download": {"url_template": "", "sha256": {}},
+        "update_fixture": {
+            "name": "7-Zip（64位）",
+            "package": "fixtures/7z2602-x64.exe",
+            "sha256": FIXTURE_SHA,
+            "url": "https://www.7-zip.org/a/7z2602-x64.exe",
+        },
+    }, allow_unicode=True), encoding="utf-8")
+    with mock.patch.dict("os.environ", {"HALL_CONFIG": str(cfg_file)}, clear=False):
+        yield load_config(cfg_file)
+
+
+def test_same_package_compares_basenames():
+    """带子目录与不带子目录指的是同一个包。"""
+    assert fetch._same_package("fixtures/7z2602-x64.exe", "fixtures/7z2602-x64.exe")
+    assert fetch._same_package("fixtures/7z2602-x64.exe", "7z2602-x64.exe")
+    assert not fetch._same_package("fixtures/7z2602-x64.exe", "other.exe")
+    assert not fetch._same_package("", "a.exe")
+    assert not fetch._same_package("a.exe", "")
+
+
+def test_expected_sha_matches_nested_package_name(cfg_fixture):
+    """**回归锁**：钉住包的 sha256 必须真的被认出来（否则配置形同虚设）。"""
+    assert fetch._expected_sha(cfg_fixture, "fixtures/7z2602-x64.exe") == FIXTURE_SHA
+    assert fetch._expected_sha(cfg_fixture, "7z2602-x64.exe") == FIXTURE_SHA
+
+
+def test_package_url_uses_fixture_url_for_nested_name(cfg_fixture):
+    """钉住包要走它自己的直链，不能回落到 ASUS CDN 拼出一个 404 地址。"""
+    assert fetch.package_url(cfg_fixture, "fixtures/7z2602-x64.exe") == \
+        "https://www.7-zip.org/a/7z2602-x64.exe"
+
+
+def test_package_url_still_falls_back_to_default_cdn(cfg_fixture):
+    """别的包没配直链时仍走默认 CDN —— 别把回落路径改坏。"""
+    url = fetch.package_url(cfg_fixture, "myappstore_1.6.11.4S_Setup.exe")
+    assert "dlcdnets.asus.com" in url
+    assert url.endswith("myappstore_1.6.11.4S_Setup.exe")
+
+
+def test_ensure_package_verifies_fixture_sha_from_share(cfg_fixture, tmp_path):
+    """端到端：共享盘上的钉住包摘要不符时必须被拒（半截包/被换过的包）。"""
+    share = tmp_path / "share"
+    (share / "fixtures").mkdir(parents=True)
+    (share / "fixtures" / "7z2602-x64.exe").write_bytes(b"tampered")
+
+    with mock.patch.object(fetch, "share_dirs", return_value=[share]):
+        with pytest.raises(fetch.FetchError):
+            fetch.ensure_from_share(cfg_fixture, "fixtures/7z2602-x64.exe")

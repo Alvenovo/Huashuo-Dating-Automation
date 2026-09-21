@@ -11,7 +11,8 @@
 #   role           承担的角色：ui（功能主流程）/ install（P0 安装层，破坏性）/ security（P2 安全验证）
 #   os             系统版本（用于兼容性分组）
 #   screen         分辨率
-#   scale          显示缩放（默认统一 100%，见 bootstrap）
+#   scale          显示缩放（**照实填，不用统一**：脚本走 Per-Monitor Aware 物理像素坐标，
+#                  100% / 125% / 150% 都不影响正确性，只作为环境画像供分组比对）
 #   webview2       是否已装 WebView2 运行时（yes/no）
 #   ms_session     是否有缓存的微软登录会话（yes/no，决定 SSO 用例跑或 skip）
 #   note           备注
@@ -21,7 +22,7 @@ machines:
     role: ui
     os: ""
     screen: ""
-    scale: 100
+    scale: ""            # 照实填（如 100 / 125 / 150），别改机器设置去凑
     webview2: ""
     ms_session: ""
     note: ""

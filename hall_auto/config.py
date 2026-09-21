@@ -128,7 +128,25 @@ class Config:
 
     @property
     def update_package_path(self) -> Path:
-        return self.installer_dir / self.update_fixture.package
+        """更新夹具（钉住包）的路径：`installer_dir` 直路径优先，其次 `_cache`。
+
+        **为什么要认 `_cache`**：新机器上这个包不是人拷来的，是 bootstrap 从共享盘
+        （或官网）取回来的，落点在 `installer_dir/_cache/fixtures/`（见
+        `fetch.py::cache_dir`）。只认直路径的话，`tools/reset_fixture.py` 会报
+        「钉住安装包不存在」→ P1-A 更新用例的起点建不起来（表现为该用例失败，
+        看着像产品问题，实际是包放错了位置）。与 `security_package_path` 同一套口径。
+        """
+        name = self.update_fixture.package
+        path = Path(name)
+        if path.is_absolute():
+            return path
+        direct = self.installer_dir / name
+        if direct.is_file():
+            return direct
+        from hall_auto.fetch import cache_dir
+
+        cached = cache_dir(self) / name
+        return cached if cached.is_file() else direct
 
     @property
     def update_version_exe(self) -> Path:
@@ -138,7 +156,18 @@ class Config:
     def security_package_path(self) -> Path:
         name = self.security.package or self.latest_setup
         path = Path(name)
-        return path if path.is_absolute() else self.installer_dir / name
+        if path.is_absolute():
+            return path
+        direct = self.installer_dir / name
+        if direct.is_file():
+            return direct
+        # 回退到 `_cache/`：bootstrap 从共享盘/下载取回的包**落在缓存里，不在根目录**
+        # （见 hall_auto/fetch.py::cache_dir）。不认这个位置的话，新机器上 P2 会以
+        # 「待检安装包不存在」抛错（红格），而不是 skip —— 看着像产品缺陷，实际是包的位置。
+        from hall_auto.fetch import cache_dir
+
+        cached = cache_dir(self) / name
+        return cached if cached.is_file() else direct
 
     @property
     def security_manifest_path(self) -> Path:

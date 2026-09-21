@@ -34,6 +34,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from hall_auto.env_pack import NODE_ENV_EVIDENCE_NAME  # noqa: E402
 from hall_auto.suites import SUITES, get_suite  # noqa: E402
 
 
@@ -65,6 +66,21 @@ def cmd_dispatch(args) -> int:
     suite_names = [s.strip() for s in args.suites.split(",") if s.strip()]
     if not nodes or not suite_names:
         raise SystemExit("--nodes 与 --suites 都不能为空")
+
+    # 人在环套件（manual）必须挡在农场外：它在节点上会卡在 input() 等验证码/新密码，
+    # agent 一直不返回、整台机器再也取不到下一个任务，而控制机这边只看到"执行中"。
+    # 手册明确承诺 login-manual「永不进农场」，这里就得真的拒投，不能只打印一句警告。
+    if not getattr(args, "allow_manual", False):
+        manual = [n for n in suite_names if not get_suite(n).farm_safe]
+        if manual:
+            raise SystemExit(
+                f"套件 {', '.join(manual)} 是人在环（要真人守着输短信验证码 / 改密码），"
+                "不能投进无人值守农场：\n"
+                "  它在节点上会卡在等输入，agent 一直不返回，那台机器再也取不到新任务。\n"
+                "  请在**那台机器的交互式终端**里手工跑：\n"
+                f"    .\\.venv\\Scripts\\python.exe -X utf8 tools\\farm_agent.py --local {manual[0]}\n"
+                "  确实要投（例如你正远程盯着那台机器），加 --allow-manual 显式放行。"
+            )
 
     for name in suite_names:
         get_suite(name)  # 早报错，别投出去才发现名字写错
@@ -130,9 +146,10 @@ def _warn_missing_credentials(suite_names: list[str]) -> None:
         return
     print("\n⚠ 凭据提醒：")
     for name in needed:
-        print(f"  {name} 需要节点本地 tools/farm_node.env 里有：{_CRED_REQUIRED[name]}")
-    print("  （密码不落共享盘、不进任务文件；每台节点机各自的 farm_node.env 已 gitignore）")
-    print("  没配的节点上，这些用例会静默 skip —— 汇总表里看 credentials 字段就能区分。")
+        print(f"  {name} 需要节点本地 farm_node.env 里有：{_CRED_REQUIRED[name]}")
+    print("  （密码不落共享盘、不进任务文件；每台节点机各自仓库根下的 farm_node.env 已 gitignore）")
+    print("  没配的节点上，这些用例会静默 skip —— 汇总表「节点环境」里的凭据列能区分：")
+    print("    ✗ = 这台机器没配凭据（去填 farm_node.env）；✓ = 凭据配了，是用例本身在跳过。")
 
 
 def _print_concurrency_notes(suite_names: list[str]) -> None:
@@ -165,11 +182,40 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _node_creds_from_receipts(root: Path) -> dict[str, dict]:
+    """兜底：从 `done/` 回执里取各节点最近一次的凭据状态（按文件修改时间取最新）。
+
+    只在证据目录里没有 `node_env.json` 时才用得上 —— 比如早先版本节点跑出来的结果。
+    正常情况下 `node_env.json` 与本次运行严格对应，优先用它。
+    """
+    out: dict[str, dict] = {}
+    done_dir = root / "done"
+    if not done_dir.is_dir():
+        return out
+    for path in sorted(done_dir.glob("*.json"), key=lambda p: p.stat().st_mtime):
+        data = _read_json(path)
+        node = str(data.get("node") or "")
+        creds = data.get("credentials")
+        if node and isinstance(creds, dict) and creds:
+            out[node] = creds
+    return out
+
+
 def cmd_aggregate(args) -> int:
     root = farm_root()
     results_root = root / "results"
     if not results_root.is_dir():
         raise SystemExit(f"没有结果目录：{results_root}")
+
+    fallback_creds = _node_creds_from_receipts(root)
 
     nodes_data: dict[str, dict] = {}
     for node_dir in sorted(d for d in results_root.iterdir() if d.is_dir()):
@@ -177,16 +223,27 @@ def cmd_aggregate(args) -> int:
             summary_file = run_dir / "summary.json"
             if not summary_file.is_file():
                 continue
-            try:
-                summary = json.loads(summary_file.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            summary = _read_json(summary_file)
+            if not summary:
                 continue
             # 同一节点多轮 result 合并：后面的覆盖前面的同名用例
             bucket = nodes_data.setdefault(node_dir.name, {"profile": summary.get("profile") or {},
-                                                            "cases": {}, "runs": []})
+                                                            "cases": {}, "runs": [],
+                                                            "credentials": {}})
             bucket["runs"].append(summary.get("run"))
+            # 凭据状态来自节点随证据回传的 node_env.json（farm_agent 写）。
+            # **必须真的读它**：报告的「凭据」列是测试人员区分「没配凭据」和
+            # 「用例本身在跳过」的唯一依据（见《测试机操作手册》第四部分）。
+            node_env = _read_json(run_dir / NODE_ENV_EVIDENCE_NAME)
+            creds = node_env.get("credentials")
+            if isinstance(creds, dict) and creds:
+                bucket["credentials"] = creds
             for case in summary.get("cases") or []:
                 bucket["cases"][case["nodeid"]] = case
+
+    for node, bucket in nodes_data.items():
+        if not bucket.get("credentials") and node in fallback_creds:
+            bucket["credentials"] = fallback_creds[node]
 
     if not nodes_data:
         raise SystemExit("没有可汇总的结果（results/ 下没有 summary.json）")
@@ -195,6 +252,9 @@ def cmd_aggregate(args) -> int:
     out.write_text(_render_matrix(nodes_data), encoding="utf-8")
     print(f"汇总报告：{out}")
     print(f"覆盖节点 {len(nodes_data)} 台，用例 {len({c for v in nodes_data.values() for c in v['cases']})} 条")
+    no_creds = sorted(n for n, v in nodes_data.items() if not (v.get("credentials") or {}))
+    if no_creds:
+        print(f"⚠ 这些节点没拿到凭据状态（报告里凭据列会全 ✗，别据此判断用例是否真跑）：{', '.join(no_creds)}")
     return 0
 
 
@@ -301,6 +361,11 @@ def main() -> int:
     p_dispatch.add_argument("--nodes", required=True, help="逗号分隔的节点标识")
     p_dispatch.add_argument("--suites", required=True, help=f"逗号分隔的套件名，可用：{', '.join(sorted(SUITES))}")
     p_dispatch.add_argument("--task-id", default="")
+    p_dispatch.add_argument(
+        "--allow-manual",
+        action="store_true",
+        help="允许把人在环套件（login-manual）投进农场。默认拒绝——它会让节点卡在等输入。",
+    )
     p_dispatch.set_defaults(func=cmd_dispatch)
 
     p_status = sub.add_parser("status", help="看任务进度")

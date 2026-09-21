@@ -23,8 +23,8 @@
 2. **任务文件里的 `env`** —— 控制机随任务下发。**只放非敏感项**
    （`HALL_ALLOW_INSTALL` / `HALL_NODE_ID` / `HALL_FARM_ROOT` / `HALL_PACKAGE_SHARE`），
    共享盘是全组可读的，**密码绝不往这里放**
-3. **节点本地凭据文件** —— `tools/farm_node.env`（`KEY=VALUE`，**已在 .gitignore**）。
-   凭据放机器本地、不落共享盘。bootstrap 时由人拷一次，或直接用 `setx` 设成用户级变量。
+3. **节点本地凭据文件** —— 仓库根下 `farm_node.env`（`KEY=VALUE`，**已在 .gitignore**）。
+   凭据放机器本地、不落共享盘。bootstrap 会生成一份空模板，由人填。
 
 ## 为什么凭据不写进任务文件
 
@@ -49,6 +49,11 @@ from pathlib import Path
 
 # 节点本地凭据文件：仓库根下，已在 .gitignore。不放共享盘。
 NODE_ENV_FILENAME = "farm_node.env"
+
+# 随证据目录一起回传的「本轮凭据状态」文件名。
+# 节点侧（tools/farm_agent.py）写、控制机侧（tools/farm_control.py）读，
+# 两边必须同名 —— 汇总报告的「凭据」列靠它区分「这台没配凭据」和「用例本身在跳过」。
+NODE_ENV_EVIDENCE_NAME = "node_env.json"
 
 # 允许从任务文件下发的变量白名单。只有这些会被接受，其余一律忽略 ——
 # 防止有人（或控制机的 bug）往共享盘的任务文件里塞密码。
