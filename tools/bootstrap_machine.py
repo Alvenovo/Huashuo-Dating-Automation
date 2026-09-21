@@ -89,6 +89,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import locale
 import os
 import shutil
 import subprocess
@@ -284,6 +285,73 @@ def _req_digest(req: Path) -> str:
         return ""
 
 
+def _decode_console(data: bytes | str | None) -> str:
+    """把子进程输出解码成文本，**不因为猜错编码就丢输出**。
+
+    ## 为什么不能用 `subprocess.run(..., text=True)`
+
+    包装脚本 `bootstrap_machine.ps1` 会设 `PYTHONUTF8=1`，于是
+    `locale.getpreferredencoding(False)` 变成 `utf-8` —— 而 Windows 自带命令
+    在中文系统上吐的是 **ANSI(cp936)**：`net use` / `schtasks /Create` / `icacls`。
+    `schtasks /Query /XML` 更是 **UTF-16LE**。
+
+    `text=True` 时 subprocess 用 TextIOWrapper 按 utf-8 解这些字节，直接
+    `UnicodeDecodeError`，**reader 线程死掉 → `proc.stdout` 变 `None`**。
+    2026-09-21 在真测试机上实测到 3 次（`0xb4`/`0xbe`/`0xb3`），表现是：
+
+    - 控制台刷一堆 `Exception in thread Thread-2X (_readerthread)` 的 traceback（吓人但看不出是谁）；
+    - **那一句报错永远看不到内容** —— 最坑的是 `_task_action`：读不到 XML 就以为
+      「任务不存在」，于是每次重跑都走 `/Create /F` 把计划任务**强制重建**，
+      正好重置了触发时间（`step_schtask` 的 docstring 明说不许发生这件事）。
+
+    顺序：UTF-16 BOM → utf-8 → 本机 ANSI。utf-8 放前面是因为我们自己起的 Python
+    子进程（pytest / pip）输出本来就是 utf-8（`PYTHONIOENCODING=utf-8`）。
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, (bytes, bytearray)):
+        return ""  # 单测里 subprocess 被 mock 成裸 Mock：当作"没有输出"，别抛
+    raw = bytes(data)
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        ansi = locale.getencoding()  # 3.11+；忽略 UTF-8 模式，给的正是 ANSI 代码页
+    except AttributeError:  # pragma: no cover - 仅老解释器
+        ansi = "mbcs"
+    return raw.decode(ansi, errors="replace")
+
+
+class _Proc:
+    """`subprocess.run` 的结果替身：`stdout`/`stderr` **已经解码好**。
+
+    只要 `.returncode` / `.stdout` / `.stderr` 三个属性，就够所有调用方用了 ——
+    这样把 `text=True` 换成 `_run_text()` 时，下游一行都不用改。
+    """
+
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, proc: object):
+        self.returncode = getattr(proc, "returncode", None)
+        self.stdout = _decode_console(getattr(proc, "stdout", None))
+        self.stderr = _decode_console(getattr(proc, "stderr", None))
+
+
+def _run_text(cmd, **kwargs) -> _Proc:
+    """跑子进程并拿到**解码好的**文本输出。用法同 `subprocess.run`，但别传 `text`。
+
+    `capture_output=True` 由这里统一加（本模块的调用方全都要收输出）。
+    """
+    for key in ("text", "encoding", "errors", "capture_output", "universal_newlines"):
+        kwargs.pop(key, None)
+    return _Proc(subprocess.run(cmd, capture_output=True, **kwargs))
+
+
 def _deps_probe(py: Path) -> tuple[bool, str]:
     """在不装任何东西的前提下，确认关键依赖都能 import。
 
@@ -293,9 +361,9 @@ def _deps_probe(py: Path) -> tuple[bool, str]:
     """
     code = ";".join(f"import {mod}" for mod, _ in DEPS_PROBE)
     try:
-        proc = subprocess.run(
+        proc = _run_text(
             [str(py), "-c", code],
-            capture_output=True, text=True, check=False, timeout=120,
+            check=False, timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"校验进程起不来：{exc}"
@@ -416,9 +484,9 @@ def _py_xy(py: Path, timeout_sec: int = 30) -> str:
     它会以缺 DLL 的失败退出或弹一个没人看的窗。文件全在、进程起不来 —— 这是常态。
     """
     try:
-        proc = subprocess.run(
+        proc = _run_text(
             [str(py), "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
-            capture_output=True, text=True, check=False, timeout=timeout_sec,
+            check=False, timeout=timeout_sec,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -492,7 +560,7 @@ def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> None:
             log(f"{d}: 路径格式不像 UNC（\\\\host\\share），跳过")
             continue
         cmd = ["net", "use", target, password, f"/user:{user}", "/persistent:yes"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = _run_text(cmd, check=False)
         if proc.returncode != 0:
             detail = (proc.stdout or proc.stderr or "").strip()[:160]
             log(f"{target}: 连接失败 rc={proc.returncode} {detail}")
@@ -615,13 +683,13 @@ def step_env_check(node: str, installer_dir: Path | None = None, config_node_id:
         st.log(f"未装 7-Zip（{seven_zip}）—— 下一步会尝试自动安装")
     # 中文 OCR 语言包（tools/ocr_text.ps1 兜底路用到）
     try:
-        proc = subprocess.run(
+        proc = _run_text(
             [
                 "powershell", "-NoProfile", "-Command",
                 "[Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime]"
                 "::AvailableRecognizerLanguages | ForEach-Object { $_.LanguageTag }",
             ],
-            capture_output=True, text=True, timeout=60, check=False,
+            timeout=60, check=False,
         )
         tags = [t.strip() for t in (proc.stdout or "").splitlines() if t.strip()]
         if any(t.lower().startswith("zh") for t in tags):
@@ -697,8 +765,7 @@ def step_venv(skip: bool, wheelhouse: Path | None = None, installer_dir: Path | 
     # 起不来就本机重建（`python -m venv` 对已存在的目录是幂等的，会就地修好）。
     if py.is_file() and not _venv_python_ok(py):
         st.log(f"⚠️ {py} 存在但跑不起来（多半是拷贝来的 .venv 路径不对）—— 本机重建")
-        proc = subprocess.run([sys.executable, "-m", "venv", str(venv)],
-                              capture_output=True, text=True, check=False)
+        proc = _run_text([sys.executable, "-m", "venv", str(venv)], check=False)
         if proc.returncode != 0:
             st.fail(f"重建 venv 失败 rc={proc.returncode}: {(proc.stderr or '')[:300]}")
             return st
@@ -721,7 +788,7 @@ def step_venv(skip: bool, wheelhouse: Path | None = None, installer_dir: Path | 
     if not py.is_file():
         base = sys.executable
         st.log(f"未检测到虚拟环境，创建：{base} -m venv .venv")
-        proc = subprocess.run([base, "-m", "venv", str(venv)], capture_output=True, text=True, check=False)
+        proc = _run_text([base, "-m", "venv", str(venv)], check=False)
         if proc.returncode != 0:
             st.fail(f"建 venv 失败 rc={proc.returncode}: {(proc.stderr or '')[:300]}")
             return st
@@ -762,10 +829,10 @@ def step_venv(skip: bool, wheelhouse: Path | None = None, installer_dir: Path | 
 
     if wh_usable:
         st.log(f"离线装依赖：{req.name}（--no-index --find-links）")
-        proc = subprocess.run(
+        proc = _run_text(
             [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check",
              "--no-index", "--find-links", str(wh_dir), "-r", str(req)],
-            capture_output=True, text=True, check=False,
+            check=False,
         )
         if proc.returncode == 0:
             return _finish_venv(py, marker, want, st)
@@ -784,9 +851,9 @@ def step_venv(skip: bool, wheelhouse: Path | None = None, installer_dir: Path | 
         st.log(f"⚠️ 探不到 pip 源：{net_why} —— 仍会尝试安装。若装失败，按这两条绕法处理：{PIP_OFFLINE_HINT}")
 
     st.log(f"装依赖：{req.name}")
-    proc = subprocess.run(
+    proc = _run_text(
         [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", str(req)],
-        capture_output=True, text=True, check=False,
+        check=False,
     )
     if proc.returncode != 0:
         st.fail(f"pip install 失败 rc={proc.returncode}: {(proc.stderr or '')[-400:]}\n{PIP_OFFLINE_HINT}")
@@ -812,7 +879,7 @@ def _finish_venv(py: Path, marker: Path, want: str, st: Step) -> Step:
 
 def _log_installed(py: Path, st: Step) -> None:
     """把关键包版本打进日志，便于多机汇总时比对环境是否一致。"""
-    proc = subprocess.run([str(py), "-m", "pip", "list"], capture_output=True, text=True, check=False)
+    proc = _run_text([str(py), "-m", "pip", "list"], check=False)
     for line in (proc.stdout or "").splitlines():
         if line.lower().startswith(("pytest ", "pywinauto ", "pywin32 ", "pillow ", "pyyaml ")):
             st.log(f"  {line.strip()}")
@@ -1250,10 +1317,12 @@ def _task_action(task: str) -> str:
     """读计划任务的动作命令行；不存在或读不到返回空串。
 
     `schtasks /Query /XML` 比 `/FO LIST` 好解析，且能拿到完整命令行。
+    注意它的输出是 **UTF-16LE**（带 BOM）—— 靠 `_run_text` 解码，
+    用 `text=True` 会按 utf-8 解崩、`stdout` 变 `None`，于是"任务明明在却当成不存在"。
     """
-    proc = subprocess.run(
+    proc = _run_text(
         f'schtasks /Query /TN {task} /XML',
-        shell=True, capture_output=True, text=True, check=False,
+        shell=True, check=False,
     )
     if proc.returncode != 0:
         return ""
@@ -1286,12 +1355,17 @@ def step_schtask(skip: bool) -> Step:
             st.log(f"要强制重建：先 schtasks /Delete /TN {task} /F 再重跑本脚本")
             return st
         st.log(f"任务 {task} 已存在但指向别的脚本，将覆盖重建")
+    else:
+        # 查询没结果：要么本机确实还没有这个任务（新机正常），要么查询本身没跑成。
+        # 明说一句 —— 下面走的是 `/Create /F`，**会重置已存在任务的触发时间**，
+        # 所以"为什么判定成不存在"必须留在日志里，别让人事后猜。
+        st.log(f"未查到任务 {task}，按「本机还没有」处理（接下来创建）")
 
     cmd = (
         f'schtasks /Create /TN {task} /SC ONCE /ST 00:00 /RL HIGHEST /F '
         f'/TR "powershell -NoProfile -ExecutionPolicy Bypass -File {script}"'
     )
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)
+    proc = _run_text(cmd, shell=True, check=False)
     if proc.returncode != 0:
         st.fail(f"建任务失败 rc={proc.returncode}: {(proc.stdout or proc.stderr or '')[:300]}")
     else:
@@ -1318,6 +1392,19 @@ def step_selftest(skip: bool) -> Step:
     所以现在：① 把每条 `FAILED …` 逐条列出来（超过上限就折起来并说还有几条）；
     ② 把完整 stdout+stderr 落一份到 `reports/bootstrap/selftest_<node>_<时间>.log`，
     报告里只给路径。**报错必须能指向下一步**，否则等于没有报错。
+
+    ## 失败后换进程重跑一次（2026-09-21 加）
+
+    真机实测：本机杀软（Windows Defender 的 ML 判定 `Trojan:Win32/Bearfoos.A!ml`）
+    会把**进程刚写出的文件**判毒 —— 读它返回 `GetLastError=225 ERROR_VIRUS_INFECTED`
+    （Python 映射成 `[Errno 22] Invalid argument`），十几秒后直接把文件删掉。
+    于是 `tests/unit` 里"写个临时包再读回来"的那几条会**偶发**红，
+    而失败项与代码质量无关（2026-09-21 首台真机 DESKTOP-DOHED68 红的就是这 2 条）。
+
+    手册教一线"遇到时先重跑一遍"，这里把那一步自动化：有失败用例名时，
+    **换一个 pytest 进程只重跑这几条**。全绿 → 判为环境级 flake，本步按通过计，
+    但首跑红的名单与 flake 结论都留在日志里（不静默）；仍红 → 按真失败处理。
+    **不要改成"红了就跳过"** —— 那会把真的回归一起盖掉。
     """
     st = Step("自检 tests/unit")
     if skip:
@@ -1328,9 +1415,9 @@ def step_selftest(skip: bool) -> Step:
         st.fail("没有 .venv，无法自检")
         return st
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-    proc = subprocess.run(
+    proc = _run_text(
         [str(py), "-X", "utf8", "-m", "pytest", "tests/unit", "-q", "--skip-env-check"],
-        capture_output=True, text=True, cwd=str(REPO_ROOT), env=env, check=False,
+        cwd=str(REPO_ROOT), env=env, check=False,
     )
 
     raw = (proc.stdout or "") + (proc.stderr or "")
@@ -1345,6 +1432,7 @@ def step_selftest(skip: bool) -> Step:
         st.log(result_line)
 
     failed = [ln for ln in lines if ln.startswith(("FAILED ", "ERROR "))]
+    failed_ids = _failed_case_ids(raw)
     if failed:
         st.log(f"失败 {len(failed)} 条：")
         for ln in failed[:SELFTEST_MAX_LISTED]:
@@ -1369,13 +1457,88 @@ def step_selftest(skip: bool) -> Step:
         except OSError as exc:
             st.log(f"完整输出落盘失败（不影响结论）：{exc}")
 
-    if proc.returncode != 0:
-        hint = f"，完整输出见 {log_path}" if log_path else ""
-        st.fail(
-            f"自检未通过 rc={proc.returncode}{hint}。"
-            "重跑单条排查：.venv\\Scripts\\python.exe -m pytest <上面某条> -q"
+    if proc.returncode == 0:
+        return st
+
+    # ---- 换进程重跑失败的那几条：分辨"环境级 flake"与"真失败" ----
+    retry_raw = ""
+    if failed_ids:
+        retry_raw, retry_rc = _rerun_failed_cases(py, failed_ids, env)
+        _append_selftest_log(log_path, failed_ids, retry_raw, retry_rc)
+        if retry_rc == 0:
+            st.log(f"换进程重跑这 {len(failed_ids)} 条：**全绿** —— 判为环境级 flake，不是代码问题")
+            st.log(
+                "  本步按通过计。首跑红的那几条多半是本机杀软误杀临时文件"
+                "（`[Errno 22]` / `GetLastError=225`）—— 见 项目知识库/运行手册.md「坑 6」。"
+            )
+            return st
+        still = _failed_case_ids(retry_raw)
+        st.log("换进程重跑：仍有失败 —— 不是偶发，按真失败处理")
+        for node in still[:SELFTEST_MAX_LISTED]:
+            st.log(f"  仍未过：{node}")
+
+    if _looks_like_av_quarantine(raw + retry_raw):
+        st.log(
+            "⚠️ 红的这几条命中**已知的本机杀软误杀**（`[Errno 22]`）：Windows Defender 会把"
+            "进程刚写出的临时文件判成 `Trojan:Win32/Bearfoos.A!ml`，此后读它返回 "
+            "`GetLastError=225`（Python 显示成 Invalid argument），十几秒后连文件都被删掉。"
         )
+        st.log(
+            "   这是**环境问题、不是代码问题**，但会连带影响取包 / 装包 —— 必须先处理，"
+            "别去改 fetch：见 项目知识库/运行手册.md「坑 6」（含确认命令与排除项做法）。"
+        )
+
+    hint = f"，完整输出见 {log_path}" if log_path else ""
+    st.fail(
+        f"自检未通过 rc={proc.returncode}{hint}。"
+        "重跑单条排查：.venv\\Scripts\\python.exe -m pytest <上面某条> -q"
+    )
     return st
+
+
+def _looks_like_av_quarantine(raw: str) -> bool:
+    """输出里出现 `[Errno 22]` -> 提示"杀软误杀刚写出的文件"（见 运行手册 坑 6）。
+
+    只作**提示**，不改判定：判成 flake 的前提是"换进程重跑转绿"；
+    这里说的是"重跑也红，但红的形态是已知的环境问题"—— 该修环境，不是该改代码。
+    """
+    return "Errno 22" in raw
+
+
+def _failed_case_ids(raw: str) -> list[str]:
+    """从 pytest 输出里抽出失败用例的 nodeid（`FAILED <id> - 断言信息`）。"""
+    ids: list[str] = []
+    for ln in raw.splitlines():
+        if ln.startswith(("FAILED ", "ERROR ")):
+            node = ln.split(None, 1)[1].split(" - ")[0].strip()
+            if node and node not in ids:
+                ids.append(node)
+    return ids
+
+
+def _rerun_failed_cases(py: Path, failed_ids: list[str], env: dict) -> tuple[str, int]:
+    """只重跑失败的那几条用例，返回 (原始输出, rc)。"""
+    proc = _run_text(
+        [str(py), "-X", "utf8", "-m", "pytest", *failed_ids, "-q", "--skip-env-check"],
+        cwd=str(REPO_ROOT), env=env, check=False,
+    )
+    return (proc.stdout or "") + (proc.stderr or ""), proc.returncode or 0
+
+
+def _append_selftest_log(log_path, failed_ids: list[str], retry_raw: str, retry_rc: int) -> None:
+    """把重跑那一轮的输出**追加到同一份日志**（不另开文件，免得一次铺设散落两份）。"""
+    if not log_path:
+        return
+    try:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(
+                "\n\n" + "=" * 70
+                + f"\n[重跑] 只重跑首跑失败的 {len(failed_ids)} 条：\n  "
+                + "\n  ".join(failed_ids)
+                + f"\n[重跑] rc={retry_rc}\n" + retry_raw
+            )
+    except OSError:
+        pass  # 日志是辅助产物，写不进去不该影响结论
 
 
 # ---------------- 主流程 ----------------

@@ -1733,3 +1733,190 @@ def test_selftest_green_run_writes_no_log(bm, tmp_path, monkeypatch):
     st, out_dir = _selftest_with(bm, monkeypatch, tmp_path, "", returncode=0)
     assert st.ok is True
     assert not list(out_dir.glob("selftest_*.log"))
+
+
+# ---------------- 子进程输出解码（2026-09-21 首台真机事故）----------------
+#
+# 真机 DESKTOP-DOHED68 跑 bootstrap 时，控制台刷出 3 个
+# `Exception in thread Thread-2X (_readerthread): UnicodeDecodeError: 'utf-8' codec ...`
+#
+# 根因：包装脚本 `bootstrap_machine.ps1` 设了 `PYTHONUTF8=1`，
+# 于是 `locale.getpreferredencoding(False)` 变成 utf-8；而 Windows 自带命令
+# 在中文系统上吐的是 **ANSI(cp936)**（`net use` / `schtasks /Create`），
+# `schtasks /Query /XML` 更是 **UTF-16LE**。
+# `subprocess.run(..., text=True)` 按 utf-8 解 -> reader 线程死 -> `proc.stdout` 变 `None`
+# -> **那一句报错永远看不到内容**。
+#
+# 最坑的是 `_task_action`：读不到 XML 就以为「任务不存在」，
+# 于是每次重跑都走 `/Create /F` 把计划任务强制重建 —— 正好重置了触发时间，
+# 而 `step_schtask` 的 docstring 明说这件事不许发生。
+#
+# 修法：统一走 `_run_text()`（先收字节、再自己解码），下面把这条钉死。
+
+
+def test_decode_console_handles_gbk_and_utf16(bm):
+    """真实世界里会遇到的四种形态都要解出来，且**不许抛**。"""
+    assert bm._decode_console("已经是文本") == "已经是文本"
+    assert bm._decode_console(b"plain ascii") == "plain ascii"
+    # net use / schtasks /Create：ANSI(cp936)
+    assert bm._decode_console("共享盘不可达".encode("cp936")) == "共享盘不可达"
+    # schtasks /Query /XML：UTF-16LE 带 BOM
+    assert "Task" in bm._decode_console('<?xml version="1.0"?><Task/>'.encode("utf-16"))
+    assert bm._decode_console(None) == ""
+    # 单测里 subprocess 常被 mock 成裸 Mock —— 那种情况下当作「没有输出」，
+    # 不能让解码这一步把结论炸掉
+    assert bm._decode_console(mock.Mock()) == ""
+
+
+def test_run_text_decodes_real_gbk_child(bm):
+    """真起一个吐 cp936 字节的子进程 —— 这正是 `text=True` 会崩的那种输出。"""
+    code = "import sys;sys.stdout.buffer.write('共享盘 可达'.encode('cp936'))"
+    proc = bm._run_text([sys.executable, "-c", code], check=False)
+    assert proc.returncode == 0
+    assert proc.stdout == "共享盘 可达", f"解出来是 {proc.stdout!r}"
+
+
+def test_no_text_mode_subprocess_left(bm):
+    """**回归锁**：本模块不许再用 `text=True`（会被 `PYTHONUTF8=1` 带偏）。
+
+    新加子进程调用请走 `_run_text()`；反引号里的 `text=True` 是文档，不算。
+    """
+    import re
+
+    src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
+    offenders = []
+    for i, ln in enumerate(src.splitlines(), 1):
+        # 先把反引号包起来的片段（文档/注释里的写法）整段拿掉，再看剩下的是不是真代码
+        if "text=True" in re.sub(r"`[^`]*`", "", ln):
+            offenders.append(f"{i}: {ln.strip()}")
+    assert not offenders, "这些行还在用 text=True：\n" + "\n".join(offenders)
+
+
+# ---------------- 第 12 步自检：红的是不是"环境级 flake" ----------------
+
+
+def _selftest_with_sequence(bm, monkeypatch, tmp_path, results):
+    """按顺序给每次 `subprocess.run` 指定返回值，模拟「首跑红、重跑绿」。"""
+    fake_py = tmp_path / "python.exe"
+    fake_py.write_bytes(b"")
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
+    seq = list(results)
+
+    def fake_run(cmd, **kw):
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    with mock.patch.object(bm, "_venv_python", return_value=fake_py), \
+         mock.patch.object(bm.subprocess, "run", side_effect=fake_run) as run:
+        st = bm.step_selftest(False)
+    return st, run
+
+
+def test_selftest_retries_failed_cases_in_a_fresh_process(bm, tmp_path, monkeypatch):
+    """**环境级 flake**：首跑红、换进程重跑绿 -> 按通过计，但必须留下痕迹。
+
+    首台真机就是这么红的（杀软把进程刚写的临时文件判毒，见 运行手册「坑 6」）。
+    手册让一线「遇到时先重跑一遍」；这里把那一遍自动化 ——
+    否则每台新机器都要人来问一次「这两条红是不是我代码坏了」。
+    """
+    red = ("FAILED tests/unit/a.py::test_one - OSError: [Errno 22] Invalid argument\n"
+           "1 failed, 9 passed in 3s\n")
+    green = "9 passed in 1s\n"
+    st, run = _selftest_with_sequence(
+        bm, monkeypatch, tmp_path,
+        [_fake_run(returncode=1, stdout=red), _fake_run(returncode=0, stdout=green)],
+    )
+
+    assert run.call_count == 2, "应当只重跑一次"
+    assert st.ok is True, st.detail
+    joined = "\n".join(st.detail)
+    assert "test_one" in joined, f"首跑红的用例名要留着，别静默：{joined}"
+    assert "环境级 flake" in joined, joined
+    assert "坑 6" in joined, "要指向排查入口"
+
+    # 重跑只带失败的那一条，不是再跑一遍全量
+    retry_argv = run.call_args_list[1][0][0]
+    assert "tests/unit/a.py::test_one" in retry_argv
+    assert "tests/unit" not in retry_argv
+
+    # 两轮输出落在**同一份**日志里（一次铺设别散落成多份）
+    logs = list((tmp_path / "reports" / "bootstrap").glob("selftest_*.log"))
+    assert len(logs) == 1, f"不该散成多份：{logs}"
+    text = logs[0].read_text(encoding="utf-8")
+    assert "Errno 22" in text, "首跑输出要留着"
+    assert "[重跑]" in text, "重跑那一轮也要留证据"
+
+
+def test_selftest_still_red_after_retry_is_real_failure(bm, tmp_path, monkeypatch):
+    """重跑还红 -> 不是偶发，仍判失败，并把「仍未过」的用例点名。
+
+    防的是"加重试把真回归盖掉"：只有**重跑转绿**才当 flake。
+    """
+    red = "FAILED tests/unit/a.py::test_one - AssertionError: 真坏了\n1 failed, 9 passed in 3s\n"
+    st, _ = _selftest_with_sequence(
+        bm, monkeypatch, tmp_path, [_fake_run(returncode=1, stdout=red)],
+    )
+
+    assert st.ok is False
+    joined = "\n".join(st.detail)
+    assert "不是偶发" in joined, joined
+    assert "仍未过：tests/unit/a.py::test_one" in joined, joined
+
+
+def test_selftest_names_the_known_av_quarantine(bm, tmp_path, monkeypatch):
+    """重跑也红、但红的是 `[Errno 22]` -> 明说"这是杀软误杀，别去改代码"。
+
+    2026-09-21 首台真机就是踩在这个形态上：`Errno 22` 看起来像"共享盘拷贝的 bug"，
+    实际是 Defender 把进程刚写出的临时文件判毒（`GetLastError=225`，见 运行手册 坑 6）。
+    报错必须能指向**下一步该动哪儿**，否则一线只会去改 `fetch.py`。
+    """
+    red = ("FAILED tests/unit/a.py::test_one - OSError: [Errno 22] Invalid argument\n"
+           "1 failed, 9 passed in 3s\n")
+    st, _ = _selftest_with_sequence(
+        bm, monkeypatch, tmp_path, [_fake_run(returncode=1, stdout=red)],
+    )
+
+    joined = "\n".join(st.detail)
+    assert st.ok is False, "环境问题也是问题：这台机器现在确实跑不了这几条，不能判绿"
+    assert "杀软误杀" in joined, joined
+    assert "225" in joined and "坑 6" in joined, joined
+
+
+def test_selftest_does_not_blame_av_for_other_failures(bm, tmp_path, monkeypatch):
+    """普通断言失败不许挂到"杀软"头上 —— 误导比不报更坏。"""
+    red = "FAILED tests/unit/a.py::test_one - AssertionError: 逻辑真的错了\n1 failed, 9 passed in 3s\n"
+    st, _ = _selftest_with_sequence(
+        bm, monkeypatch, tmp_path, [_fake_run(returncode=1, stdout=red)],
+    )
+
+    assert st.ok is False
+    assert "杀软" not in "\n".join(st.detail)
+
+
+def test_selftest_names_the_known_av_quarantine(bm, tmp_path, monkeypatch):
+    """重跑也红、但红的是 `[Errno 22]` -> 明说"这是杀软误杀，别去改代码"。
+
+    2026-09-21 首台真机就是踩在这个形态上：`Errno 22` 看起来像"共享盘拷贝的 bug"，
+    实际是 Defender 把进程刚写出的临时文件判毒（`GetLastError=225`，见 运行手册 坑 6）。
+    报错必须能指向**下一步该动哪儿**，否则一线只会去改 `fetch.py`。
+    """
+    red = ("FAILED tests/unit/a.py::test_one - OSError: [Errno 22] Invalid argument\n"
+           "1 failed, 9 passed in 3s\n")
+    st, _ = _selftest_with_sequence(
+        bm, monkeypatch, tmp_path, [_fake_run(returncode=1, stdout=red)],
+    )
+
+    joined = "\n".join(st.detail)
+    assert st.ok is False, "环境问题也是问题：这台机器现在确实跑不了这几条，不能判绿"
+    assert "杀软误杀" in joined, joined
+    assert "225" in joined and "坑 6" in joined, joined
+
+
+def test_selftest_does_not_blame_av_for_other_failures(bm, tmp_path, monkeypatch):
+    """普通断言失败不许挂到"杀软"头上 —— 误导比不报更坏。"""
+    red = "FAILED tests/unit/a.py::test_one - AssertionError: 逻辑真的错了\n1 failed, 9 passed in 3s\n"
+    st, _ = _selftest_with_sequence(
+        bm, monkeypatch, tmp_path, [_fake_run(returncode=1, stdout=red)],
+    )
+
+    assert st.ok is False
+    assert "杀软" not in "\n".join(st.detail)
