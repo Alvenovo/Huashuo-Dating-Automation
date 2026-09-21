@@ -282,3 +282,64 @@ def test_both_docs_mention_the_token_prefix(doc_texts):
     """细粒度令牌 `github_pat_` 开头 —— 让人一眼能认出拿的是哪种令牌。"""
     for name, text in doc_texts.items():
         assert "github_pat_" in text, f"{name} 没说令牌长什么样"
+
+
+# 2026-09-21 复核发现的**漏项**（用户当场问「新测试机连接共享盘步骤呢」）：
+# 两份文档第一次访问共享盘的动作是 `& "\\...\repo\install_git.ps1"` / `git clone "\\..."`，
+# 而 `hallshare` 凭据要到**后面几步**才设成环境变量 —— 共享的 NTFS 只授权了 `hallshare`
+# （本机账号在网络上是"别人"），所以新机器跑那两条命令**必然**报
+# 「找不到网络路径」/「拒绝访问」，而报错会把人引向"网络坏了"。
+# 正确顺序：**先认证共享盘，再 clone**。
+_NET_USE_SHARE = r"net use \\LAPTOP-VS5F7HF4\hall-packages /user:hallshare"
+
+
+def test_both_docs_authenticate_the_share_before_cloning(doc_texts):
+    """两份文档都必须写「先连共享盘」的命令，而且**排在 clone 之前**。
+
+    这是新机的**第一个网络动作**，漏了它整条链在第一行就断 —— 属于
+    《交付前验收.md》里「前置条件清单漏项」那一类：不在代码里，在现实里。
+    """
+    for name, text in doc_texts.items():
+        blocks = _fenced_blocks(text)
+        assert _NET_USE_SHARE in blocks, (
+            f"{name} 的代码块里没有「先连共享盘」的命令 —— "
+            f"新机器上 `git clone` 共享盘会报「找不到网络路径」，而那是没认证、不是网络坏"
+        )
+        assert blocks.index(_NET_USE_SHARE) < blocks.index("git clone"), (
+            f"{name} 里 `git clone` 出现在连共享盘之前 —— 顺序反了，新机第一条命令就会失败"
+        )
+
+
+# 2026-09-21 第一台真机实测（用户当场跑）又暴露两个坑，同属"文档承诺 ≠ 真机能跑"：
+#   ① `git clone` 走 UNC 路径会被 Git 判为"非本地目录" → `fatal: detected dubious ownership`，
+#      必须先 `git config --global --add safe.directory '<UNC 裸仓库>'`；
+#   ② 裸仓库叫 `hall-auto.git`，clone 按**仓库名**落地成 `hall-auto`，
+#      而文档接着 `cd Huashuo-Dating-Automation` → 路径不存在，后面每一步全断。
+_SAFE_DIRECTORY = "safe.directory"
+_CLONE_TARGET = "Huashuo-Dating-Automation"
+
+
+def test_both_docs_allow_the_unc_bare_repo_before_cloning(doc_texts):
+    """两份文档都要写 `safe.directory` 放行，而且**排在 clone 之前**。"""
+    for name, text in doc_texts.items():
+        blocks = _fenced_blocks(text)
+        assert _SAFE_DIRECTORY in blocks, (
+            f"{name} 没写 `git config --global --add safe.directory` —— "
+            "UNC 路径下 `git clone` 会报 fatal: detected dubious ownership"
+        )
+        assert blocks.index(_SAFE_DIRECTORY) < blocks.index("git clone"), (
+            f"{name} 里 clone 排在 safe.directory 之前 —— 真机上第一条命令就失败"
+        )
+
+
+def test_both_docs_clone_into_the_expected_directory(doc_texts):
+    """clone 必须显式给目标目录名 —— 不给就落地成 `hall-auto`，后面 `cd` 全报路径不存在。"""
+    for name, text in doc_texts.items():
+        blocks = _fenced_blocks(text)
+        lines = [ln for ln in blocks.splitlines() if "git clone" in ln and "hall-auto.git" in ln]
+        assert lines, f"{name} 里找不到从共享盘 clone 的命令"
+        for ln in lines:
+            assert _CLONE_TARGET in ln, (
+                f"{name} 的 clone 没写目标目录名（`hall-auto.git` 会落地成 `hall-auto`，"
+                f"后续 `cd {_CLONE_TARGET}` 必然报路径不存在）：{ln.strip()}"
+            )
