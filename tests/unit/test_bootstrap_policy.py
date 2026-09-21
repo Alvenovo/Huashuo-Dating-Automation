@@ -297,6 +297,22 @@ def _no_real_share():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_pip_probe():
+    """单元测试也不许真去连 pip 源。
+
+    `step_venv` 在装依赖前会探一次 pip 源（好让没外网的新机几秒内失败）。
+    不挡住的话，单测的结论会取决于**跑测试这台机器有没有外网** ——
+    有外网时"应触发重装"的用例正常，没外网时它们会卡在 `_pip_net_ok` 的失败分支上假红。
+
+    挡在 `socket.create_connection` 这一层，而不是把 `bm._pip_net_ok` 整个换成 Mock ——
+    后者会让**直接测 `_pip_net_ok` 自己的用例**测到 Mock 上去（实测踩过）。
+    需要特定结果的用例自己 patch 内层，`mock.patch` 后进先出，会覆盖这里。
+    """
+    with mock.patch("socket.create_connection"):
+        yield
+
+
 def _place_fixture(bm, tmp_path: Path) -> Path:
     """造一个"已经在本地、且摘要对得上"的钉住包，并让常量认它。
 
@@ -876,3 +892,201 @@ def test_manual_bootstrap_step_table_matches_code(bm):
     assert not wrong, f"这些行与代码对不上：{wrong}（行内容：{[b for n, b in rows if n in wrong]}）"
     assert len(_CODE_CALL_ORDER) == 12
 
+
+
+# ---------------- 新机预检：磁盘空间 + pip 源可达性 ----------------
+#
+# 起因（2026-09-21，用户问「新测试机上可能很多前置条件都没有，需要先检查」）：
+# 12 步里每一步都做到了「先检测、缺了才装」，但有**两样新机常缺的东西没人检查**：
+#   1. 磁盘空间 —— 包缓存 ~800MB + 大厅本体 + 证据截图。盘满时会在拷到一半失败，
+#      报错长得像「共享盘坏了」，一线会往完全错的方向查。
+#   2. pip 源可达性 —— 第 2 步要联网装依赖，而手册只在**故障表**里事后提了一句。
+#      没外网时 pip 自己重试好几轮（几分钟）才抛一段截断的 stderr。
+# 下面把这两条钉死。
+
+
+def test_free_gb_reports_existing_path(bm, tmp_path):
+    """正常路径：返回剩余 GB（正数）。"""
+    free, why = bm._free_gb(tmp_path)
+    assert free > 0, f"应报出正数剩余空间，实际 {free}（{why}）"
+    assert why == ""
+
+
+def test_free_gb_walks_up_for_missing_path(bm, tmp_path):
+    """installer_dir 还不存在时（新机首次铺设就是这种），向上找到存在的祖先，别报错。"""
+    missing = tmp_path / "还没有" / "也不会有" / "华硕大厅"
+    assert not missing.exists()
+    free, why = bm._free_gb(missing)
+    assert free > 0, f"路径不存在不该导致检测失败，实际 {free}（{why}）"
+
+
+def test_free_gb_bad_path_is_negative_not_crash(bm, monkeypatch):
+    """拿不到空间时返回负数 + 原因，调用方据此只提示不判失败。"""
+    def boom(_path):
+        raise OSError("盘符不存在")
+
+    monkeypatch.setattr(bm.shutil, "disk_usage", boom)
+    free, why = bm._free_gb(REPO_ROOT)
+    assert free < 0
+    assert "盘符不存在" in why
+
+
+def _fake_env_check(bm, installer_dir, free_gb: float):
+    """跑一遍 step_env_check，把外部依赖全打成假的，只看磁盘那几行。"""
+    with mock.patch.object(bm, "machine_profile", return_value={
+        "os": "Windows 11", "python": "3.12.10", "python_bits": 64,
+        "screen": "2560x1600", "scale_percent": 150, "monitors": 1,
+        "dpi_awareness": "per-monitor",
+    }), \
+         mock.patch.object(bm, "is_interactive_session", return_value=True), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch.object(bm, "SEVEN_ZIP_EXE", REPO_ROOT / "不存在.exe"), \
+         mock.patch.object(bm, "_free_gb", return_value=(free_gb, "")), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run()):
+        return bm.step_env_check("TESTNODE", installer_dir)
+
+
+def test_env_check_warns_when_disk_is_tight(bm, tmp_path):
+    """盘不够时要**明说**，并且点出"看着像共享盘坏了"这个误判方向。"""
+    st = _fake_env_check(bm, tmp_path, free_gb=1.2)
+    joined = "\n".join(st.detail)
+    assert "低于建议的" in joined, joined
+    assert "看着像共享盘坏了" in joined, joined
+
+
+def test_env_check_reports_ok_when_disk_is_plenty(bm, tmp_path):
+    st = _fake_env_check(bm, tmp_path, free_gb=50.0)
+    assert any("够用" in line for line in st.detail), st.detail
+
+
+def test_env_check_disk_failure_is_log_not_fail(bm, tmp_path):
+    """拿不到磁盘信息只提示，不该把整台机器的铺设判死。"""
+    with mock.patch.object(bm, "machine_profile", return_value={
+        "os": "Windows 11", "python": "3.12.10", "python_bits": 64,
+        "screen": "2560x1600", "scale_percent": 150, "monitors": 1,
+        "dpi_awareness": "per-monitor",
+    }), \
+         mock.patch.object(bm, "is_interactive_session", return_value=True), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch.object(bm, "SEVEN_ZIP_EXE", REPO_ROOT / "不存在.exe"), \
+         mock.patch.object(bm, "_free_gb", return_value=(-1.0, "OSError: 盘符不存在")), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run()):
+        st = bm.step_env_check("TESTNODE", tmp_path)
+    assert any("磁盘空间检测跳过" in line for line in st.detail), st.detail
+
+
+def test_pip_probe_target_prefers_index_url_over_proxy(bm, monkeypatch):
+    """同时设了 `PIP_INDEX_URL` 和代理时，探的是 **pip 源**（pip 最终会去那儿）。"""
+    monkeypatch.setenv("PIP_INDEX_URL", "http://mirror.corp.local:8080/simple")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp.local:3128")
+    host, port, what = bm._pip_probe_target()
+    assert (host, port) == ("mirror.corp.local", 8080), (host, port)
+    assert "pip 源" in what
+
+
+def test_pip_probe_target_uses_proxy_when_no_index_url(bm, monkeypatch):
+    """**关键**：只配了代理（公司内网常见的出网方式）时，探代理而不是 pypi.org。
+
+    裸 socket 不走代理，不认代理就会给出**假阴性** —— 把本来能装的机器判成装不了。
+    """
+    monkeypatch.delenv("PIP_INDEX_URL", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp.local:3128")
+    host, port, what = bm._pip_probe_target()
+    assert (host, port) == ("proxy.corp.local", 3128), (host, port)
+    assert "代理" in what
+
+
+def test_pip_probe_target_defaults_to_pypi(bm, monkeypatch):
+    for key in ("PIP_INDEX_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY",
+                "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    host, port, what = bm._pip_probe_target()
+    assert (host, port) == ("pypi.org", 443), (host, port)
+
+
+def test_pip_net_ok_honours_pip_index_url(bm, monkeypatch):
+    """有内网镜像时探的是镜像主机，不是 pypi.org。"""
+    monkeypatch.setenv("PIP_INDEX_URL", "http://mirror.corp.local:8080/simple")
+    with mock.patch("socket.create_connection") as conn:
+        ok, why = bm._pip_net_ok(timeout_sec=1)
+    assert ok is True
+    assert conn.call_args[0][0] == ("mirror.corp.local", 8080), conn.call_args
+    assert "mirror.corp.local:8080" in why
+
+
+def test_pip_net_ok_false_when_unreachable(bm, monkeypatch):
+    monkeypatch.delenv("PIP_INDEX_URL", raising=False)
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    with mock.patch("socket.create_connection", side_effect=OSError("连不上")):
+        ok, why = bm._pip_net_ok(timeout_sec=1)
+    assert ok is False
+    assert "pypi.org:443" in why
+    assert "连不上" in why
+
+
+def test_venv_warns_when_pip_source_unreachable_but_still_tries(bm):
+    """**回归锁**：探不到 pip 源要**立刻说出来**（附两条绕法），但**不拦路**。
+
+    为什么不拦：探测有偏差（代理 / DNS / 防火墙策略），硬拦会把本来能装的机器判死。
+    装不装得上最终由 pip 说了算 —— 所以必须看到它**仍然去跑了 pip install**。
+    """
+    with mock.patch.object(bm, "_deps_probe", return_value=(True, "关键依赖均可 import")), \
+         mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
+         mock.patch.object(bm, "_pip_net_ok", return_value=(False, "pypi.org:443 连不上")), \
+         mock.patch.object(Path, "is_file", return_value=False), \
+         mock.patch.object(Path, "write_text"), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run()) as run:
+        st = bm.step_venv(False)
+
+    joined = "\n".join(st.detail)
+    assert "探不到 pip 源" in joined, joined
+    assert "--skip-venv" in joined, "要给出「拷 .venv + --skip-venv」这条不碰网络的绕法"
+    assert "index-url" in joined, "要给出内网镜像这条绕法"
+    installs = [c for c in run.call_args_list if "install" in str(c)]
+    assert installs, "探测失败不该拦路，仍要尝试 pip install"
+
+
+def test_venv_offline_hint_on_pip_failure(bm):
+    """pip 真失败了，报错里必须带两条绕法（这是操作员唯一能看到的地方）。"""
+    def fake_run(argv, **kwargs):
+        # 建 venv 要成功，装依赖才失败 —— 否则会停在"建 venv 失败"那一步，测不到 pip 分支
+        if "install" in str(argv):
+            return _fake_run(returncode=1, stderr="Could not find a version")
+        return _fake_run()
+
+    with mock.patch.object(bm, "_deps_probe", return_value=(True, "ok")), \
+         mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
+         mock.patch.object(bm, "_pip_net_ok", return_value=(True, "可达")), \
+         mock.patch.object(Path, "is_file", return_value=False), \
+         mock.patch.object(bm.subprocess, "run", side_effect=fake_run):
+        st = bm.step_venv(False)
+
+    assert st.ok is False
+    joined = "\n".join(st.detail)
+    assert "pip install 失败" in joined, joined
+    assert "--skip-venv" in joined and "index-url" in joined, joined
+
+
+def test_venv_does_not_probe_pip_when_deps_already_ok(bm):
+    """**核心防线**：已铺好的机器重跑 bootstrap **不该碰网络** —— 连探测都不该探。
+
+    这是脚本自己写在文档里的承诺（「重跑本脚本不应该产生任何多余的安装动作，也不该碰网络」）。
+    """
+    py = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+    req = REPO_ROOT / "requirements.txt"
+    if not (py.is_file() and req.is_file()):
+        pytest.skip("本机没有 .venv")
+
+    probe = mock.Mock(return_value=(True, "不该被调用"))
+    with mock.patch.object(bm, "_deps_probe", return_value=(True, "关键依赖均可 import")), \
+         mock.patch.object(bm, "_req_digest", return_value="a" * 64), \
+         mock.patch.object(bm, "_pip_net_ok", probe), \
+         mock.patch.object(Path, "exists", return_value=True), \
+         mock.patch.object(Path, "read_text", return_value="a" * 64), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run()):
+        st = bm.step_venv(False)
+
+    assert st.ok
+    assert any("跳过安装" in line for line in st.detail), st.detail
+    probe.assert_not_called()

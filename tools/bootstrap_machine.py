@@ -12,8 +12,8 @@
 
 | 步骤 | 检测什么 | 已有则 |
 | --- | --- | --- |
-| 1 环境自检 | OS / 交互式会话 / Python 位数 / 7-Zip / OCR 语言包 | 只报告，不改 |
-| 2 虚拟环境与依赖 | venv 在否；`requirements.txt` 哈希 + 关键包能否 import | 跳过 pip |
+| 1 环境自检 | OS / 交互式会话 / Python 位数 / 7-Zip / OCR 语言包 / **磁盘剩余空间** | 只报告，不改 |
+| 2 虚拟环境与依赖 | venv 在否；`requirements.txt` 哈希 + 关键包能否 import；**pip 源能否连通** | 跳过 pip |
 | 3 夹具校验 | 逐个查 SHA256 | 只报告 |
 | 4 **7-Zip** | `C:/Program Files/7-Zip/7z.exe` 在否 | 跳过（不重复安装） |
 | 5 生成本机配置 | 逐字段 setdefault，只覆盖机器绑定项 | 保留原有 |
@@ -24,6 +24,14 @@
 | 10 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
 | 11 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
 | 12 自检 | 跑 tests/unit | 可 `--skip-selftest` |
+
+**新机上最容易缺、又确实自动化不了的两样**：`Python 3.x 64 位`（要在 PATH 里）和 `Git`。
+这叫引导悖论 —— 本脚本自己就是 Python 写的、代码本身归 Git 管，没有它们脚本转不起来。
+**除这两样之外的前置条件都由本脚本负责**，包括第 1 步的磁盘空间与第 2 步的 pip 源连通性：
+后者在装依赖前先探一次，几秒内给出结论和两条绕法（内网镜像 / 拷 `.venv` + `--skip-venv`），
+不让 pip 自己重试几分钟再抛一段截断的 stderr。
+**探测失败不拦路** —— 探测有偏差（代理、DNS、防火墙策略），装不装得上最终由 pip 说了算；
+硬拦会把"本来能装的机器"判死，比不探更糟。
 
 第 4 步为什么是**装**而不是**只检测**：`hall_auto/security.py` 的 P2 安全验证要用
 `7z x` 解包待检安装包。这个钉住包本来就在 `installer_dir/fixtures/7z2602-x64.exe`
@@ -149,6 +157,82 @@ DEPS_PROBE = (
     ("yaml", "PyYAML"),
 )
 
+# 铺设这台机器大约要占的磁盘：安装包缓存 ~800MB + 大厅本体 + 证据截图。
+# 低于这个值只**警告不判失败** —— 小盘可能仍然跑得通，但"拷到一半失败"看起来像共享盘坏了，
+# 一线会往错的方向查，所以必须提前把话说出来。
+MIN_FREE_GB = 3.0
+
+# pip 源可达性探测的超时。默认源与 pip 自己的一致；有内网镜像时读 `PIP_INDEX_URL`。
+PIP_PROBE_TIMEOUT_SEC = 8
+
+# pip 装不了时的两条绕法。写成常量是为了让代码提示与手册是同一句话。
+PIP_OFFLINE_HINT = (
+    "装依赖必须能访问 pip 源。两条绕法："
+    "① 用内网镜像：pip config set global.index-url <镜像地址>，再重跑本脚本；"
+    "② 从一台已铺好的机器整份拷 .venv 过来，然后加 --skip-venv 重跑（完全不碰网络）。"
+)
+
+
+def _free_gb(path: Path) -> tuple[float, str]:
+    """`path` 所在卷的剩余空间（GB）。路径不存在时向上找到第一个存在的祖先。
+
+    盘符不存在等异常返回 `(-1.0, 原因)` —— 调用方据此只提示、不判失败。
+    """
+    probe = Path(path)
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    try:
+        usage = shutil.disk_usage(str(probe))
+    except OSError as exc:
+        return -1.0, f"{type(exc).__name__}: {exc}"
+    return usage.free / (1024 ** 3), ""
+
+
+def _pip_probe_target() -> tuple[str, int, str]:
+    """pip 实际会连的 `host:port`，以及它是什么（日志用）。
+
+    顺序：`PIP_INDEX_URL` 的 host > 代理（`HTTPS_PROXY` 等）> `pypi.org:443`。
+
+    **必须认代理**：很多公司内网只能经代理出网，pip 会走 `HTTPS_PROXY`，而裸 socket 不会 ——
+    不认代理的话探测会给出**假阴性**，把本来能装的机器判成装不了（比不探还糟）。
+    """
+    import urllib.parse
+
+    raw = (os.environ.get("PIP_INDEX_URL") or "").strip()
+    if raw:
+        parsed = urllib.parse.urlparse(raw)
+        host = parsed.hostname or "pypi.org"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return host, port, "pip 源"
+
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        value = (os.environ.get(key) or "").strip()
+        if not value:
+            continue
+        parsed = urllib.parse.urlparse(value if "://" in value else f"http://{value}")
+        if parsed.hostname:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            return parsed.hostname, port, f"代理（{key}）"
+
+    return "pypi.org", 443, "默认 pip 源"
+
+
+def _pip_net_ok(timeout_sec: int = PIP_PROBE_TIMEOUT_SEC) -> tuple[bool, str]:
+    """pip 源是否连得上（TCP 连得上就算）。
+
+    探测只是为了**把结论早点告诉人**（几秒 vs pip 自己重试几分钟），
+    **不当作硬门禁** —— 探测有偏差（代理、DNS、防火墙策略），
+    装不装得上最终由 pip 自己说了算。见 `step_venv` 里的用法。
+    """
+    import socket
+
+    host, port, what = _pip_probe_target()
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec):
+            return True, f"{host}:{port} 可达（{what}）"
+    except OSError as exc:
+        return False, f"{host}:{port} 连不上（{what}，{type(exc).__name__}: {exc}）"
+
 
 def _req_digest(req: Path) -> str:
     """requirements.txt 的内容摘要；文件不存在返回空串。"""
@@ -237,7 +321,7 @@ def _load_existing_local_config() -> dict:
 # ---------------- 各步骤 ----------------
 
 
-def step_env_check(node: str) -> Step:
+def step_env_check(node: str, installer_dir: Path | None = None) -> Step:
     st = Step("环境自检")
     profile = machine_profile()
     st.log(f"节点 {node} / {profile['os']} / Python {profile['python']}({profile['python_bits']}位)")
@@ -275,6 +359,21 @@ def step_env_check(node: str) -> Step:
             st.log(f"OCR 只有 {tags or '（无）'}，缺 zh-Hans-CN —— 仅当用到 OCR 兜底路才影响")
     except Exception as exc:
         st.log(f"OCR 语言包检测跳过：{exc}")
+    # 磁盘空间：新机小 C 盘会在取包/装大厅时拷到一半失败，而那种失败看起来像共享盘坏了。
+    if installer_dir is not None:
+        target = Path(installer_dir)
+        free, why = _free_gb(target)
+        where = target.anchor or str(target)
+        if free < 0:
+            st.log(f"磁盘空间检测跳过（{where}）：{why}")
+        elif free < MIN_FREE_GB:
+            st.log(
+                f"⚠️ 磁盘剩余 {free:.1f} GB（{where}），低于建议的 {MIN_FREE_GB:.0f} GB —— "
+                "取包 / 装大厅可能中途失败（看着像共享盘坏了，其实是盘满）。"
+                "建议先清盘，或用 -InstallerDir 指到别的盘"
+            )
+        else:
+            st.log(f"磁盘剩余 {free:.1f} GB（{where}），够用")
     return st
 
 
@@ -327,6 +426,17 @@ def step_venv(skip: bool) -> Step:
         else:
             st.log("无依赖标记（首次铺设或标记被清），按需安装")
 
+    # ---- 装之前先探一次 pip 源，把结论**早点**给人 ----
+    # 不探的话：没外网的机器上 pip 自己会重试好几轮（几分钟）才抛一段截断的 stderr，
+    # 一线分不清是"没网"还是"包名写错"。
+    # **探测失败不拦路**：探测有偏差（代理、DNS、防火墙策略），装不装得上最终由 pip 说了算。
+    # 硬拦会把"本来能装的机器"判死，比不探更糟。
+    net_ok, net_why = _pip_net_ok()
+    if net_ok:
+        st.log(f"pip 源可达：{net_why}")
+    else:
+        st.log(f"⚠️ 探不到 pip 源：{net_why} —— 仍会尝试安装。若装失败，按这两条绕法处理：{PIP_OFFLINE_HINT}")
+
     # ---- 需要装：pip 本身幂等，已装的包会跳过 ----
     st.log(f"装依赖：{req.name}")
     proc = subprocess.run(
@@ -334,7 +444,7 @@ def step_venv(skip: bool) -> Step:
         capture_output=True, text=True, check=False,
     )
     if proc.returncode != 0:
-        st.fail(f"pip install 失败 rc={proc.returncode}: {(proc.stderr or '')[-400:]}")
+        st.fail(f"pip install 失败 rc={proc.returncode}: {(proc.stderr or '')[-400:]}\n{PIP_OFFLINE_HINT}")
         return st
 
     # ---- 装完复核，通过了才写标记（避免"装失败也被记为就绪"）----
@@ -1028,7 +1138,7 @@ def main() -> int:
             say(f"    {line}")
         say("")
 
-    run(step_env_check(node))
+    run(step_env_check(node, installer_dir))
     run(step_venv(args.skip_venv))
     run(step_fixtures(installer_dir))
     run(step_seven_zip(installer_dir, allow_download=not args.no_download, skip=args.skip_seven_zip))
