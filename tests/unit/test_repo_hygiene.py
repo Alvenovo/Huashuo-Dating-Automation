@@ -151,3 +151,50 @@ def test_handover_archive_stays_local_only():
             f"《会话交接.md》第 {i + 1} 行引用 `{ARCHIVE_DIRNAME}` 时没写「仅本机」——"
             " clone / 整包拷贝后该目录不存在，读者会白找一场。"
         )
+
+
+# ---------------- AV 排除项脚本：只能显式调用，不许被 bootstrap 自动带跑 ----------------
+#
+# 背景（2026-09-21 首台真机）：Windows Defender 会把进程刚写出的临时文件判成
+# `Trojan:Win32/Bearfoos.A!ml`，读它返回 GetLastError=225（Python 显示成 `[Errno 22]`），
+# 十几秒后文件被隔离删除。治本是加 Defender 排除项 —— 但那是**安全策略变更**：
+# 这些目录与 python.exe 从此不再被实时查毒。
+#
+# 所以 `tools/add_av_exclusions.ps1` 必须是"人点名才跑"的：可预演、可回滚、
+# 只动本项目相关的那几条。这条用例锁的就是**别哪天顺手把它塞进 bootstrap 的 12 步里** ——
+# 那样 20 台机器会在无人拍板的情况下被削弱防护。
+
+AV_EXCLUSION_SCRIPT = REPO_ROOT / "tools" / "add_av_exclusions.ps1"
+BOOTSTRAP_PY = REPO_ROOT / "tools" / "bootstrap_machine.py"
+
+
+def test_av_exclusion_script_exists_and_is_reversible():
+    """脚本要在，且加/删/预演三条路都在。"""
+    src = AV_EXCLUSION_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "Add-MpPreference" in src and "-ExclusionPath" in src, "得真的加排除项"
+    assert "Remove-MpPreference" in src, (
+        "必须有回滚路径 —— 安全策略变更不可回滚等于把机器锁死"
+    )
+    assert "[switch]$Remove" in src and "[switch]$DryRun" in src, (
+        "`-Remove` / `-DryRun` 两个开关缺一不可"
+    )
+    assert "Administrator" in src, "必须先判管理员，否则报错会指向错误的方向"
+    assert "config.local.yaml" in src, (
+        "installer_dir 必须从本机 config.local.yaml 读 —— 写死路径在别的机器上必然找不到"
+    )
+    assert "退出码" in src, "退出码要写在 .NOTES 里，脚本才好被串进流程"
+
+
+def test_bootstrap_never_runs_av_exclusion_script():
+    """**核心防线**：bootstrap 不许调用它（加排除项必须有人拍板）。
+
+    要改成自动跑，请先确认安全侧同意，并同步改这条用例与《运行手册》坑 6 ——
+    别只是把断言删了。
+    """
+    src = BOOTSTRAP_PY.read_text(encoding="utf-8")
+    assert "add_av_exclusions" not in src, (
+        "bootstrap 里出现了对 add_av_exclusions 的调用 —— "
+        "加 Defender 排除项是安全策略变更，只能由人显式执行"
+    )
+    assert "Add-MpPreference" not in src, "bootstrap 不许直接改 Defender 设置"

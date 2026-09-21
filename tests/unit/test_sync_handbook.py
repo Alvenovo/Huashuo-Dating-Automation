@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -372,3 +373,31 @@ def test_both_docs_point_the_pack_permission_error_at_the_share_acl(doc_texts):
             "这条错只有共享宿主能修，文档必须把球明确踢给负责人，"
             "否则一线会在测试机上做一堆无用功"
         )
+
+
+# ---------------- 知识库引用的脚本必须真的在仓库里 ----------------
+#
+# 2026-09-21 差点犯：确认"杀软误杀临时文件"用的探针先放进了 `reports/probe/`，
+# 而整个 `reports/` 被 `.gitignore` 忽略 —— 可《运行手册》坑 6 正是叫新机器的人去跑它。
+# clone 之后那条命令必然落空，而且**不报错**，只是让人白跑一趟。
+# 探针已挪到 `tools/probe_av_quarantine.py`；这条用例锁住"别再指向空气"。
+
+_KB_DIR = REPO_ROOT / "项目知识库"
+_TOOLS_REF = re.compile(r"tools[\\/]([A-Za-z0-9_]+\.(?:py|ps1))")
+
+
+def test_kb_tool_references_exist():
+    """知识库里 `tools\\xxx.py|ps1` 形式的引用必须真的有这个文件。
+
+    （只查 `tools\\`：`reports/` 下的引用是**本机**跑过的证据，clone 后不存在属正常，
+    但那种引用要写明「本机」，与《会话交接.md》引用 `交接归档/` 的口径一致。）
+    """
+    missing: list[str] = []
+    for doc in sorted(_KB_DIR.glob("*.md")):
+        for name in sorted(set(_TOOLS_REF.findall(doc.read_text(encoding="utf-8")))):
+            if not (REPO_ROOT / "tools" / name).is_file():
+                missing.append(f"{doc.name} -> tools/{name}")
+    assert not missing, (
+        "知识库引用了不存在的 tools 脚本（新机器照着敲会白跑一趟）：\n  "
+        + "\n  ".join(missing)
+    )
