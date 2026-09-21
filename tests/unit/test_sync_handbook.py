@@ -207,3 +207,78 @@ def test_missing_source_fails_clearly(sh, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sh, "DOCS", [tmp_path / "根本没有.md"])
     assert _run(sh, monkeypatch, "--to", str(tmp_path / "out")) == 1
     assert "[FAIL]" in capsys.readouterr().out
+
+
+# ---------------- 两份文档之间的漂移 ----------------
+#
+# 《测试机操作手册》和《新机操作清单》讲同一套动作。两份都发给一线，
+# 一处改了另一处忘改，**一线按旧的那份敲就会失败** —— 而且失败信息只会说 401/404，
+# 看不出是文档过期。下面把最容易漂的两点钉住。
+
+_ZIPBALL = "https://api.github.com/repos/Alvenovo/Huashuo-Dating-Automation/zipball/main"
+# 网页按钮用的地址。**GitHub 的 API 文档里没有它**，私有仓库不保证能用。
+_UNDOCUMENTED = "archive/refs/heads/main.zip"
+
+
+def _fenced_blocks(text: str) -> str:
+    """把所有 ``` 围起来的代码块拼起来 —— 只看"会被照抄去敲"的部分。"""
+    out: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            out.append(line)
+    return "\n".join(out)
+
+
+@pytest.fixture(scope="module")
+def doc_texts() -> dict[str, str]:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    path = REPO_ROOT / "tools" / "sync_handbook.py"
+    spec = spec_from_file_location("sync_handbook_docs", path)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    missing = [d for d in module.DOCS if not d.is_file()]
+    assert not missing, f"DOCS 里这些文件不存在：{missing}"
+    return {d.name: d.read_text(encoding="utf-8") for d in module.DOCS}
+
+
+def test_both_docs_use_the_documented_download_url(doc_texts):
+    """两份文档的下载命令必须是**同一个**、而且是官方文档记载的那个端点。
+
+    2026-09-21 发现原来写的是 `github.com/.../archive/refs/heads/main.zip` ——
+    那是网页按钮用的地址，GitHub 的 API 文档里没有它。私有仓库要走有文档保证的
+    `api.github.com/repos/.../zipball/{ref}`（要求细粒度令牌 `Contents: Read-only`）。
+    """
+    for name, text in doc_texts.items():
+        assert _ZIPBALL in _fenced_blocks(text), f"{name} 的下载命令里没有统一地址"
+
+
+def test_no_doc_tells_people_to_run_the_undocumented_url(doc_texts):
+    """老地址不许出现在**代码块**里 —— 出现在正文里解释"为什么不用它"是允许的。"""
+    for name, text in doc_texts.items():
+        assert _UNDOCUMENTED not in _fenced_blocks(text), (
+            f"{name} 的代码块里还留着 `{_UNDOCUMENTED}` —— 那是网页按钮的地址，"
+            "GitHub 文档没记载，私有仓库不保证可用"
+        )
+
+
+def test_both_docs_state_the_required_token_permission(doc_texts):
+    """令牌只需要 `Contents: Read-only` 这一个权限 —— 两份都得写清楚。
+
+    写错权限的代价很具体：给多了是安全风险，给少了报 404（GitHub 对权限不足
+    会假装"仓库不存在"），一线会去查错方向。
+    """
+    for name, text in doc_texts.items():
+        assert "Contents" in text, f"{name} 没提 Contents 权限"
+        assert "Read-only" in text, f"{name} 没写清权限级别是 Read-only"
+
+
+def test_both_docs_mention_the_token_prefix(doc_texts):
+    """细粒度令牌 `github_pat_` 开头 —— 让人一眼能认出拿的是哪种令牌。"""
+    for name, text in doc_texts.items():
+        assert "github_pat_" in text, f"{name} 没说令牌长什么样"
