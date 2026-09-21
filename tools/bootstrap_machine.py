@@ -197,6 +197,10 @@ WHEELHOUSE_LOCAL_DIRNAME = "wheelhouse"
 # 是因为它是"本进程是子进程"的内部事实，不该出现在用户可见的用法里。
 REEXEC_ENV = "HALL_BOOTSTRAP_IN_VENV"
 
+# 第 12 步自检失败时最多逐条列几条。列全了会把屏幕刷满（一次能红 20 条），
+# 列太少又等于没说 —— 12 条够看清是哪一类，剩下的指到完整日志。
+SELFTEST_MAX_LISTED = 12
+
 
 def _venv_python() -> Path:
     """仓库 venv 里的解释器路径。"""
@@ -1304,12 +1308,22 @@ def step_selftest(skip: bool) -> Step:
     `test_farm_agent_policy` / `test_env_pack_policy` / `test_reset_policy` /
     `test_bootstrap_policy` 这些**多机链路**模块。手册写的是"全绿说明环境 OK"，
     只跑一半属于自检名不副实（路径已限定 tests/unit，不需要再按 marker 收窄）。
+
+    ## 失败时要把**失败用例名**全点出来（2026-09-21 改）
+
+    原来只把 stdout 的最后 3 行贴出来，于是有 20 条红的时候一线只能看到 2 条，
+    还得靠数数猜。而且**完整输出直接丢了** —— 报错里那句断言到底写了什么，
+    屏幕上和报告里都找不到。
+
+    所以现在：① 把每条 `FAILED …` 逐条列出来（超过上限就折起来并说还有几条）；
+    ② 把完整 stdout+stderr 落一份到 `reports/bootstrap/selftest_<node>_<时间>.log`，
+    报告里只给路径。**报错必须能指向下一步**，否则等于没有报错。
     """
     st = Step("自检 tests/unit")
     if skip:
         st.log("按 --skip-selftest 跳过")
         return st
-    py = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+    py = _venv_python()
     if not py.is_file():
         st.fail("没有 .venv，无法自检")
         return st
@@ -1318,11 +1332,49 @@ def step_selftest(skip: bool) -> Step:
         [str(py), "-X", "utf8", "-m", "pytest", "tests/unit", "-q", "--skip-env-check"],
         capture_output=True, text=True, cwd=str(REPO_ROOT), env=env, check=False,
     )
-    tail = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()][-3:]
-    for ln in tail:
-        st.log(ln)
+
+    raw = (proc.stdout or "") + (proc.stderr or "")
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+
+    # 结论行（`4 failed, 365 passed in 105s`）永远先给 —— 它决定后面要不要细看
+    result_line = next(
+        (ln for ln in reversed(lines) if " passed" in ln or " failed" in ln or " error" in ln),
+        "",
+    )
+    if result_line:
+        st.log(result_line)
+
+    failed = [ln for ln in lines if ln.startswith(("FAILED ", "ERROR "))]
+    if failed:
+        st.log(f"失败 {len(failed)} 条：")
+        for ln in failed[:SELFTEST_MAX_LISTED]:
+            st.log(f"  {ln}")
+        if len(failed) > SELFTEST_MAX_LISTED:
+            st.log(f"  …还有 {len(failed) - SELFTEST_MAX_LISTED} 条")
+    elif proc.returncode != 0:
+        # 没有 FAILED/ERROR 行却非零退出：多半是收集期就崩了（导入错误、语法错误）。
+        # 这种情况把尾部原样贴出来，否则屏幕上什么都看不到。
+        st.log("没有逐条失败行（可能是收集期就崩了），末尾输出：")
+        for ln in lines[-SELFTEST_MAX_LISTED:]:
+            st.log(f"  {ln}")
+
+    log_path = ""
+    if raw.strip():
+        try:
+            out_dir = REPO_ROOT / "reports" / "bootstrap"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            log_path = out_dir / f"selftest_{node_id()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            log_path.write_text(raw, encoding="utf-8")
+            st.log(f"完整输出：{log_path}")
+        except OSError as exc:
+            st.log(f"完整输出落盘失败（不影响结论）：{exc}")
+
     if proc.returncode != 0:
-        st.fail(f"自检未通过 rc={proc.returncode}")
+        hint = f"，完整输出见 {log_path}" if log_path else ""
+        st.fail(
+            f"自检未通过 rc={proc.returncode}{hint}。"
+            "重跑单条排查：.venv\\Scripts\\python.exe -m pytest <上面某条> -q"
+        )
     return st
 
 

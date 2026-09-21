@@ -1555,3 +1555,181 @@ def test_share_connect_is_shared_by_venv_and_share_login(bm):
 
     resolver = src[src.index("def _resolve_wheelhouse"):src.index("def _wheelhouse_usable")]
     assert "_share_connect(" in resolver, "取离线 wheel 时也要能连上共享盘"
+
+
+def test_wheelhouse_dir_is_gitignored():
+    """**`wheelhouse/` 必须在 .gitignore 里。**
+
+    为什么是硬要求：`tools/fetch_wheelhouse.py` 的默认落点就是 `<仓库>/wheelhouse`，
+    跑一次就是十几~上百 MB 的 `.whl`。不忽略的话，下一个 `git add -A` 就会把它提交进去
+    —— 体积大到可能直接把 push 卡死，而且事后要改历史才清得掉。
+
+    这类"跑一次就污染仓库"的产物必须靠 gitignore 挡，**不能靠人记得**。
+    """
+    text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    entries = {
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert "wheelhouse/" in entries or "wheelhouse" in entries, (
+        f"fetch_wheelhouse.py 的默认落点没被忽略：{sorted(entries)}"
+    )
+
+
+def test_wheelhouse_dir_name_is_consistent_across_three_places(bm):
+    """产出目录名在三处必须一致：`fetch_wheelhouse.py` 的默认落点、
+    `bootstrap` 的查找名、共享盘子目录名。
+
+    不一致的后果很隐蔽：有网机器产出的东西，无网机器**找不到**，而且不报错 ——
+    只是日志里一句"没有离线 wheelhouse"，然后转头去连 pip 源（无网机器上必然失败）。
+    一线会以为是网络问题，实际是两边目录名对不上。
+    """
+    import importlib.util
+
+    path = REPO_ROOT / "tools" / "fetch_wheelhouse.py"
+    spec = importlib.util.spec_from_file_location("fetch_wheelhouse_under_test", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    produced = module.main.__globals__  # 只为拿 REPO_ROOT，不执行 main
+    assert produced["REPO_ROOT"] == bm.REPO_ROOT, "两边算出的仓库根不一致"
+
+    # 产出方默认写到 REPO_ROOT/"wheelhouse"（源码里的字面量），消费方按常量找
+    src = path.read_text(encoding="utf-8")
+    assert 'REPO_ROOT / "wheelhouse"' in src, "产出方的默认落点变了，要同步消费方与 .gitignore"
+    assert bm.WHEELHOUSE_LOCAL_DIRNAME == "wheelhouse"
+    assert bm.WHEELHOUSE_SHARE_SUBDIR == "wheelhouse"
+
+
+def test_wheelhouse_dir_is_gitignored():
+    """**`wheelhouse/` 必须在 .gitignore 里。**
+
+    为什么是硬要求：`tools/fetch_wheelhouse.py` 的默认落点就是 `<仓库>/wheelhouse`，
+    跑一次就是十几~上百 MB 的 `.whl`。不忽略的话，下一个 `git add -A` 就会把它提交进去
+    —— 体积大到可能直接把 push 卡死，而且事后要改历史才清得掉。
+
+    这类"跑一次就污染仓库"的产物必须靠 gitignore 挡，**不能靠人记得**。
+    """
+    text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    entries = {
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert "wheelhouse/" in entries or "wheelhouse" in entries, (
+        f"fetch_wheelhouse.py 的默认落点没被忽略：{sorted(entries)}"
+    )
+
+
+def test_wheelhouse_dir_name_is_consistent_across_three_places(bm):
+    """产出目录名在三处必须一致：`fetch_wheelhouse.py` 的默认落点、
+    `bootstrap` 的查找名、共享盘子目录名。
+
+    不一致的后果很隐蔽：有网机器产出的东西，无网机器**找不到**，而且不报错 ——
+    只是日志里一句"没有离线 wheelhouse"，然后转头去连 pip 源（无网机器上必然失败）。
+    一线会以为是网络问题，实际是两边目录名对不上。
+    """
+    import importlib.util
+
+    path = REPO_ROOT / "tools" / "fetch_wheelhouse.py"
+    spec = importlib.util.spec_from_file_location("fetch_wheelhouse_under_test", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    produced = module.main.__globals__  # 只为拿 REPO_ROOT，不执行 main
+    assert produced["REPO_ROOT"] == bm.REPO_ROOT, "两边算出的仓库根不一致"
+
+    # 产出方默认写到 REPO_ROOT/"wheelhouse"（源码里的字面量），消费方按常量找
+    src = path.read_text(encoding="utf-8")
+    assert 'REPO_ROOT / "wheelhouse"' in src, "产出方的默认落点变了，要同步消费方与 .gitignore"
+    assert bm.WHEELHOUSE_LOCAL_DIRNAME == "wheelhouse"
+    assert bm.WHEELHOUSE_SHARE_SUBDIR == "wheelhouse"
+
+
+# ---------------- 第 12 步自检：失败要说清是哪几条 ----------------
+
+
+def _selftest_with(bm, monkeypatch, tmp_path, stdout: str, returncode: int = 1):
+    """在 tmp_path 里假装跑一次自检，返回 (Step, 落盘目录)。"""
+    fake_py = tmp_path / "python.exe"
+    fake_py.write_bytes(b"")
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
+    with mock.patch.object(bm, "_venv_python", return_value=fake_py), \
+         mock.patch.object(bm.subprocess, "run",
+                           return_value=_fake_run(returncode=returncode, stdout=stdout)):
+        st = bm.step_selftest(False)
+    return st, tmp_path / "reports" / "bootstrap"
+
+
+def test_selftest_lists_every_failed_case(bm, tmp_path, monkeypatch):
+    """**核心防线**：自检失败要把**每条**失败用例名点出来。
+
+    原来只贴 stdout 的最后 3 行 —— 一次能红 20 条，一线只看得到最后 2 条，
+    还得靠数数猜。手册写的是"全绿说明环境 OK"，红了却不知道哪条红，等于没报。
+    """
+    out = (
+        "FAILED tests/unit/a.py::test_one - AssertionError: 甲\n"
+        "FAILED tests/unit/b.py::test_two - AssertionError: 乙\n"
+        "FAILED tests/unit/c.py::test_three - AssertionError: 丙\n"
+        "3 failed, 10 passed in 2s\n"
+    )
+    st, _ = _selftest_with(bm, monkeypatch, tmp_path, out)
+
+    joined = "\n".join(st.detail)
+    for name in ("test_one", "test_two", "test_three"):
+        assert name in joined, f"{name} 没被列出来：{joined}"
+    assert st.ok is False
+    assert "重跑单条" in joined, "要给出一条能直接复制的排查命令"
+
+
+def test_selftest_folds_long_failure_lists(bm, tmp_path, monkeypatch):
+    """失败太多时折起来，但必须**说清还有几条** —— 静默截断会让人以为只有 12 条。"""
+    many = "".join(f"FAILED tests/unit/m.py::test_{i} - AssertionError: x\n" for i in range(20))
+    st, _ = _selftest_with(bm, monkeypatch, tmp_path, many + "20 failed, 1 passed in 3s\n")
+
+    joined = "\n".join(st.detail)
+    listed = joined.count("FAILED tests/unit/m.py::test_")
+    assert listed == bm.SELFTEST_MAX_LISTED, f"实际列了 {listed} 条"
+    assert "还有 8 条" in joined, joined
+
+
+def test_selftest_saves_full_output_next_to_the_report(bm, tmp_path, monkeypatch):
+    """完整 pytest 输出要落盘，并在结论里给出路径。
+
+    不然"红了但不知道为什么"：断言到底写了什么，屏幕上和报告里都找不到。
+    """
+    out = "FAILED tests/unit/x.py::test_a - AssertionError: 因为 X 所以红\n2 failed, 3 passed in 1s\n"
+    st, out_dir = _selftest_with(bm, monkeypatch, tmp_path, out)
+
+    logs = list(out_dir.glob("selftest_*.log"))
+    assert len(logs) == 1, f"应该恰好落一份日志：{logs}"
+    assert "因为 X" in logs[0].read_text(encoding="utf-8")
+    assert "selftest_" in "\n".join(st.detail), "结论里要给日志路径"
+
+
+def test_selftest_reports_collection_crash_without_failed_lines(bm, tmp_path, monkeypatch):
+    """收集期就崩了（没有 FAILED 行却非零退出）时，尾部输出要原样贴出来。
+
+    这种情况屏幕上本来什么都没有 —— 不贴的话一线只知道"红了"，连是导入错误
+    还是语法错误都不知道。
+    """
+    out = "ImportError: cannot import name 'nope' from 'hall_auto'\nERROR: found no collectors\n"
+    st, _ = _selftest_with(bm, monkeypatch, tmp_path, out)
+
+    joined = "\n".join(st.detail)
+    assert st.ok is False
+    assert "收集期" in joined, joined
+    assert "cannot import name 'nope'" in joined, joined
+
+
+def test_selftest_green_run_writes_no_log(bm, tmp_path, monkeypatch):
+    """全绿时**不落日志** —— 不然每次铺设都往 reports/ 里塞一份没用的文件。
+
+    （这里也顺带保证单测不会往真仓库的 reports/ 写东西：mock 的 stdout 为空。）
+    """
+    st, out_dir = _selftest_with(bm, monkeypatch, tmp_path, "", returncode=0)
+    assert st.ok is True
+    assert not list(out_dir.glob("selftest_*.log"))

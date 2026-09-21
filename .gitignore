@@ -21,3 +21,7 @@ myappstore_*_Setup.exe
 **/.obsidian/workspace-mobile.json
 # 学习库手机版：由 .workbuddy-ai/tools/build_mobile_html.py 生成，属可重建产物
 学习库-手机版.html
+# 离线依赖包（tools/fetch_wheelhouse.py 的默认落点，十几~上百 MB 的 .whl）。
+# **必须忽略**：无外网机器靠它装依赖，但它跟 Python 版本绑死、且体积大，
+# 属于"按需重新产出"的产物，不是源码 —— 提交进去等于给每个 clone 塞一份二进制。
+wheelhouse/
