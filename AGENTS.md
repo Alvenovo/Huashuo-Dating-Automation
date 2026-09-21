@@ -13,9 +13,17 @@
 - **办公机不要 `--allow-install`**；破坏性用例（`destructive` 标记）必须门禁 + 提权才跑。
 - 本机 `python` 不在 PATH，一律 `.venv\Scripts\python.exe`，带 `PYTHONUTF8=1`。
 - 内部安全工具（CheckAppV/SignAppsV/signcheck_v2）和受检安装包**不进公开仓库**，只放 `Desktop/Test/华硕大厅/fixtures/`，committed 的 `config.yaml` 对应块留空。
+- **机器绝对路径不进代码**：`*.py` / `*.ps1` 里不许出现**具体用户 profile** 的绝对路径（`C:/Users/<名字>/...`）。
+  取本机位置用 `$PSScriptRoot`（PS）、`Path.home()`、`config.local.yaml`（已忽略）或环境变量。
+  **唯一例外是 `config.yaml` 的 `installer_dir` 模板值 `C:/Users/ASUS/...`** —— 它是**金丝雀**：
+  bootstrap 第 1 步靠 `_foreign_profile_owner` 认出「这台机器没铺过环境 / 整包拷贝带了老机器的 config」，
+  换成 `C:/Users/Public/...` 会让这条检查**失效并退回假绿**。**别"清理"它**，`tests/unit/test_repo_hygiene.py` 锁着。
+  文档（手册/知识库）与 `tests/` 里的路径只是**举例与夹具**，不受这条约束。
 
 ## 交接与知识库分工
 
 - 《会话交接.md》只放**会变的**：当前进度、环境现状、下一步、未提交/未 push 清单。
 - `项目知识库/` 放**稳定的**：控件图、坑、跑法、决策。同一条事实只留一个权威来源。
 - 一次性过程叙事（第几轮复跑、耗时基线、commit 号）归 commit message，两边都不留。
+- `交接归档/` 是**本机专属**（`.gitignore` 已忽略）：老进度快照 + 过期文档副本。clone / 整包拷贝后**不存在**，
+  所以《会话交接.md》引用它时必须写明「仅本机」，不许写成"去归档里找"这种 clone 后会落空的承诺。

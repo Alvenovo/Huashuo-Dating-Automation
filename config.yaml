@@ -1,3 +1,8 @@
+# ⚠️ 下面这个值是**故意的金丝雀**（原开发机的路径），不是漏改的残留，**别"清理"它**：
+# bootstrap 第 1 步靠 `_foreign_profile_owner` 认出「这台机器还没铺过环境 / 整包拷贝带了老机器的
+# config.local.yaml」—— 认出来才会提示你加 `-InstallerDir` 重跑。换成 `C:/Users/Public/...`
+# （脚本自己的默认值）这条检查就失效了，新机取包失败**而报错长得像"共享盘坏了"**。
+# 真值写在被 .gitignore 的 `config.local.yaml` 里。约束见 AGENTS.md「机器绝对路径不进代码」。
 installer_dir: "C:/Users/ASUS/Desktop/华硕大厅"
 baseline_setup: "myappstore_1.6.8.17S_Setup.exe"
 latest_setup: "myappstore_1.6.10.7S_Setup.exe"
