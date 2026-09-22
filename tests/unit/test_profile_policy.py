@@ -9,7 +9,11 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
+
 from hall_auto import profile
+
+pytestmark = pytest.mark.unit
 
 
 def test_webview2_version_reads_pv():

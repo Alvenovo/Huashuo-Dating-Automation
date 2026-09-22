@@ -30,6 +30,14 @@
 
 见 `DOCS`。加新文档就往那个列表里加一行 —— **别再去手工拷桌面**。
 
+## 覆盖前留档：只保「人改过的」，不保自己的输出
+
+覆盖已有文件前会把它留一份 `xxx-旧版备份.md`，免得对面手工批注过的东西被无声抹掉。
+
+但**上一版就是本脚本生成的（带「发放版」横幅）时不留档** —— 那种文件里没有手工内容，
+留档只会越攒越多：2026-09-22 用户反馈「我要的是新机操作清单，怎么给我生成那么多旧版备份」，
+一查桌面 3 份/文档，全是我们自己上一轮的产物。判据见 `_is_our_output()`。
+
 ## 用法
 
     .venv\\Scripts\\python.exe -X utf8 tools\\sync_handbook.py
@@ -91,6 +99,10 @@ _BANNER = (
     "> **只单独发给操作者**：不要拷进共享盘、不要 commit、不要转发到群里。\n"
     "> 主文档一改这份就旧了 —— 重跑 `tools\\sync_handbook.py` 重新生成，别拿它当权威版本。"
 )
+
+# 本脚本生成物的指纹：横幅里这一句出现，就说明那份文件是**我们上一轮写的**。
+# 用途见 `_is_our_output()` —— 决定覆盖前要不要留档。（测试里锁着它必须在 `_BANNER` 里。）
+_RELEASE_MARK = "发放版（含明文凭据）"
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -211,6 +223,22 @@ def _backup_path(target: Path) -> Path:
     return target.with_name(f"{target.stem}-旧版备份-{stamp}{target.suffix}")
 
 
+def _is_our_output(path: Path) -> bool:
+    """这份文件是不是**本脚本上一轮生成的**（带「发放版」横幅）。
+
+    是的话覆盖时**不留档**。留档的意义是保住**人改过的东西** —— 保住自己的输出没有意义，
+    只会让桌面越攒越多：2026-09-22 用户反馈「我要的是新机操作清单，怎么给我生成那么多
+    旧版备份」，一查桌面 3 份/文档，全是我们自己上一轮的产物。
+
+    横幅插在标题正下方（见 `_BANNER`），所以只读文件头部就够，不用整份读进来。
+    """
+    try:
+        head = path.read_bytes()[:4096]
+    except OSError:
+        return False
+    return _RELEASE_MARK in head.decode("utf-8", errors="replace")
+
+
 def sync_one(doc: Path, to_raw: str, check: bool, password: str, allow_placeholder: bool) -> int:
     """处理一份文档，返回 0 一致/成功，1 旧了、源缺失、或不能生成发放版。"""
     if not doc.is_file():
@@ -250,6 +278,16 @@ def sync_one(doc: Path, to_raw: str, check: bool, password: str, allow_placehold
             f"     跑一次不带 --check 的即可同步"
         )
         return 1
+
+    if _is_our_output(target):
+        # 上一版就是本脚本写的 → 里面没有手工内容，不留档（否则每跑一次就多一份，
+        # 用户 2026-09-22 反馈的正是这个）。
+        target.write_bytes(payload)
+        print(
+            f"[新] 已同步{label} -> {target}"
+            f"（{dst_size} -> {src_size} 字节；上一版是本脚本产物，不留档）"
+        )
+        return 0
 
     # 覆盖前先把旧的留一份，万一对面手工批注过还能找回
     backup = _backup_path(target)

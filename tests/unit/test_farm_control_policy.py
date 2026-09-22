@@ -29,6 +29,8 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import farm_control  # noqa: E402
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def farm(tmp_path, monkeypatch):

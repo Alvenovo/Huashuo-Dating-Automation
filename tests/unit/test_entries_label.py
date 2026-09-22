@@ -1,7 +1,11 @@
 """entries 的纯逻辑单测：入口标签过滤（把首页轮播 WB 磁贴挡在合并热区外）。"""
 from __future__ import annotations
 
+import pytest
+
 from hall_auto.entries import _is_entry_label
+
+pytestmark = pytest.mark.unit
 
 
 def test_bottom_left_entry_labels_pass():

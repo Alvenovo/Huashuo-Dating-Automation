@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
+
 from hall_auto import awake
+
+pytestmark = pytest.mark.unit
 
 
 def test_start_sets_all_flags():

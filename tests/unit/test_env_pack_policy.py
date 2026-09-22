@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hall_auto import env_pack
+
+pytestmark = pytest.mark.unit
 
 
 def test_parse_env_text_basic():

@@ -163,6 +163,41 @@ SHARE_COPY_RETRIES = 3
 # `.part` -> 正式名 的改名重试次数。改名自带瞬时锁重试，所以拷贝循环不用再套一层。
 ATOMIC_REPLACE_ATTEMPTS = 5
 
+# ---- 本机杀软误杀的判定（见 项目知识库/运行手册.md「坑 6」）----
+#
+# Windows Defender 的 ML 判定会把**进程刚写出的文件**判成 `Trojan:Win32/Bearfoos.A!ml`，
+# 此后读它返回 `GetLastError=225 ERROR_VIRUS_INFECTED`。Python 的 errno 表里没有 225，
+# 映射成 `EINVAL(22)`，而 `winerror` 是 `None` —— 于是栈上只剩一句
+# `OSError: [Errno 22] Invalid argument`，**看着像参数写错了**。
+#
+# 判据取"errno 22 或 winerror 225"是有意放宽的：真码 `winerror` 只在用 ctypes 调
+# `CreateFileW` 时才拿得到，走 `open()` 拿不到。宁可多认几个，也别让一线去改拷贝逻辑 ——
+# 2026-09-21 就有人在"共享盘那个文件是不是坏了"上白查了两轮。
+AV_ERRNO = 22
+AV_WINERROR = 225
+
+
+def looks_like_av_block(exc: BaseException | None) -> bool:
+    """这个异常像不像「杀软把刚写出的文件拦了」。"""
+    if exc is None:
+        return False
+    if getattr(exc, "winerror", None) == AV_WINERROR:
+        return True
+    return getattr(exc, "errno", None) == AV_ERRNO
+
+
+def _av_advice(src: Path) -> str:
+    """杀软误杀时追加的排查指引。**不改变异常类型，只把话说清楚。**"""
+    return (
+        f"\n   ⚠️ 这多半**不是**共享盘坏了、也不是拷贝代码的问题："
+        f"Windows Defender 会把进程刚写出的文件判成病毒（`Trojan:Win32/Bearfoos.A!ml`），"
+        f"此后读它返回 `GetLastError=225`，Python 只显示成 `[Errno 22] Invalid argument`。"
+        f"\n   报错里的 `{src}` 是**本机刚写出来的临时文件**（不是共享盘那份），所以查共享盘是白查。"
+        f"\n   先确认：`.venv\\Scripts\\python.exe -X utf8 tools\\probe_av_quarantine.py`（只读）。"
+        f"\n   处理办法见 `项目知识库/运行手册.md`「坑 6」。"
+    )
+
+
 # Windows「瞬时文件锁」的 winerror 码。这些不是错误状态，是别的进程**短暂**持有句柄：
 #   5    拒绝访问   —— 杀软实时保护扫刚 close 的文件、索引服务
 #   32   文件被占用 —— 同上，或另一进程正好在读
@@ -243,13 +278,16 @@ def _copy_from_share(src: Path, dest: Path) -> None:
             if attempt < SHARE_COPY_RETRIES:
                 time.sleep(min(0.2 * attempt, 1.0))
     else:
-        raise FetchError(f"从共享盘拷贝失败 {src}：{last}") from last
+        # 杀软误杀时把话说清楚 —— 否则 `[Errno 22]` 会把人引去查共享盘 / 改拷贝逻辑（见坑 6）。
+        advice = _av_advice(src) if looks_like_av_block(last) else ""
+        raise FetchError(f"从共享盘拷贝失败 {src}：{last}{advice}") from last
 
     try:
         _atomic_replace(part, dest)
     except OSError as exc:
         part.unlink(missing_ok=True)
-        raise FetchError(f"从共享盘拷贝失败 {src}：{exc}") from exc
+        advice = _av_advice(part) if looks_like_av_block(exc) else ""
+        raise FetchError(f"从共享盘拷贝失败 {src}：{exc}{advice}") from exc
 
 
 def share_dirs(cfg: Config) -> list[Path]:

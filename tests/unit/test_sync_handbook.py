@@ -5,7 +5,9 @@
 差了整整三轮修复（含 6 个硬阻断）。这里把四件事钉死：
 
   1. `--check` 能准确说出「一致 / 旧了」，且旧了时退出码为 1（能进 CI / 进清单）；
-  2. 覆盖前**必须留一份旧版备份** —— 万一对面手工批注过还能找回（且**第二次覆盖不覆盖留档**）；
+  2. 覆盖前**留一份旧版备份** —— 万一对面手工批注过还能找回（且**第二次覆盖不覆盖留档**）。
+     但**上一版就是本脚本产物时不留档**：2026-09-22 用户反馈桌面被堆了一堆「旧版备份」，
+     全是我们自己上一轮的输出。判据见 `_is_our_output()`；
   3. 目标不存在时直接建，不报错；
   4. **同步出去的是「发放版」** —— 凭据占位符用 `HALL_SHARE_PASSWORD` 现场替换；
      没设变量时**报错退出，绝不静默降级成占位版**（见文件末「发放版」那一节）。
@@ -594,3 +596,41 @@ def test_plain_doc_without_placeholders_still_syncs(sh, monkeypatch, tmp_path):
     assert _run(sh, monkeypatch, "--to", str(out)) == 0
     assert (out / "普通.md").read_text(encoding="utf-8") == src.read_text(encoding="utf-8")
 
+
+def test_repeated_sync_over_our_own_output_leaves_no_backups(sh, monkeypatch, tmp_path, capsys):
+    """**用户反馈的正是这个**：反复同步不许在桌面堆「旧版备份」。
+
+    2026-09-22 用户说「我要留的是新机操作清单，怎么给我生成那么多旧机备份」——
+    一查桌面 3 份/文档，全是我们自己上一轮的产物。
+    留档的意义是保住**人改过的东西**（见 `test_sync_backs_up_old_copy_before_overwriting`），
+    保住自己的输出没有意义。
+    """
+    src = _doc_with_placeholder(tmp_path)
+    monkeypatch.setattr(sh, "DOCS", [src])
+    monkeypatch.setenv(_ENV_NAME, "PW-EXAMPLE")
+    out = tmp_path / "out"
+
+    for i in range(3):  # 第一次建，后两次是覆盖
+        src.write_text(
+            f'# 清单\n\n第 {i + 1} 版\n'
+            'net use \\\\HOST\\share /user:hallshare "<共享盘密码>"\n',
+            encoding="utf-8",
+        )
+        assert _run(sh, monkeypatch, "--to", str(out)) == 0
+        capsys.readouterr()
+
+    leftovers = sorted(p.name for p in out.iterdir() if "旧版备份" in p.name)
+    assert leftovers == [], f"覆盖自己的输出不该留档，却留下 {len(leftovers)} 份：{leftovers}"
+    assert len(list(out.iterdir())) == 1, f"落点该只有一份当前版：{sorted(p.name for p in out.iterdir())}"
+
+
+def test_release_mark_actually_appears_in_the_banner(sh_real):
+    """指纹必须真的在横幅里 —— 否则 `_is_our_output` 恒为 False，备份又开始堆。
+
+    这种脱钩不会报错：横幅文案改了、指纹没跟着改，判定就静默失效，
+    表现是「桌面又莫名其妙多了一堆旧版备份」。属于本项目反复踩的假绿同类。
+    """
+    assert sh_real._RELEASE_MARK in sh_real._BANNER.format(name="x.md"), (
+        "`_RELEASE_MARK` 没出现在 `_BANNER` 里 —— 覆盖自己的产物时会被误判成手工文件、"
+        "于是每同步一次就多一份「旧版备份」"
+    )

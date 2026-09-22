@@ -32,9 +32,15 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_YAML = REPO_ROOT / "config.yaml"
@@ -198,3 +204,70 @@ def test_bootstrap_never_runs_av_exclusion_script():
         "加 Defender 排除项是安全策略变更，只能由人显式执行"
     )
     assert "Add-MpPreference" not in src, "bootstrap 不许直接改 Defender 设置"
+
+
+# ---------------- `-m unit` 的选择集必须等于 `tests/unit` 的全集 ----------------
+#
+# 2026-09-21 发现（做发放版时顺带撞上，属于本项目最恨的那类"假绿"）：
+# 运行手册写的标准单测命令是 `pytest tests/unit -m unit`，而 13 个文件
+# （307 条用例）**压根没有 unit 标记**，于是被静默 deselect —— 屏幕上是
+# 「127 passed」一片绿。实际 `pytest tests/unit` 收 434 条，其中 **4 条一直在失败**
+# （杀软误杀 `[Errno 22]`，见 运行手册 坑 6），从来没有被人看见。
+#
+# **"绿"和"跑过"是两回事。** 标记漏了不会报错，只会让那些用例安静地不跑 ——
+# 和"桌面副本漂了但同步脚本说没事"是同一个病。这条用例把选择集钉死。
+
+_UNIT_MARK = "pytestmark = pytest.mark.unit"
+
+
+def _has_unit_marker(node: ast.FunctionDef) -> bool:
+    """这个函数上有没有 `@pytest.mark.unit` 装饰器。"""
+    for dec in node.decorator_list:
+        if (
+            isinstance(dec, ast.Attribute)
+            and dec.attr == "unit"
+            and isinstance(dec.value, ast.Attribute)
+            and dec.value.attr == "mark"
+            and isinstance(dec.value.value, ast.Name)
+            and dec.value.value.id == "pytest"
+        ):
+            return True
+    return False
+
+
+def test_every_unit_file_is_selected_by_the_unit_marker():
+    """`tests/unit` 下每条用例都必须能被 `-m unit` 选中。
+
+    两种合格写法：文件里有一行模块级 `pytestmark = pytest.mark.unit`，
+    或者每个 `def test_*` 自己带 `@pytest.mark.unit`。
+
+    ⚠️ **必须走 AST，不能看 `def` 的上一行**（2026-09-22 修）：
+    早先这里判的是 `lines[i-1].strip() == "@pytest.mark.unit"` ——
+    对**带 `@pytest.mark.parametrize` 的用例**必然误判，因为那种写法是
+
+        @pytest.mark.unit
+        @pytest.mark.parametrize(("a", "b"), [...])   # 这里可能跨十几行
+        def test_x(a, b):
+
+    `def` 的上一行是参数表的收尾 `)`，不是 marker。于是 5 个文件里 9 条**本来就标好的**
+    用例被报成"漏标" —— 假红和假绿一样有害：它会让人去给已经标过的用例再加一行。
+    """
+    files = sorted((REPO_ROOT / "tests" / "unit").glob("test_*.py"))
+    assert len(files) >= 20, f"tests/unit 只找到 {len(files)} 个测试文件，路径八成写错了"
+
+    naked: list[str] = []
+    for f in files:
+        text = f.read_text(encoding="utf-8")
+        if _UNIT_MARK in text:
+            continue
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                if not _has_unit_marker(node):
+                    naked.append(f"{f.name}::{node.name}")
+
+    assert not naked, (
+        "这些用例不会被 `pytest tests/unit -m unit`（运行手册里的标准单测命令）选中，"
+        "于是它们红了也没人知道 —— 要么给文件加一行 `pytestmark = pytest.mark.unit`，"
+        "要么给每条用例加 `@pytest.mark.unit`：\n  " + "\n  ".join(sorted(naked))
+    )
+

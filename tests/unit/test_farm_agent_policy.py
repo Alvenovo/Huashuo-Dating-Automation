@@ -20,6 +20,8 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import farm_agent  # noqa: E402
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def root(tmp_path):

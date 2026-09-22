@@ -22,6 +22,8 @@ import pytest
 from hall_auto import installer
 from hall_auto.config import load_config
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def cfg(tmp_path):
