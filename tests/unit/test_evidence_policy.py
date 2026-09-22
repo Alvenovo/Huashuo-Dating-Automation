@@ -25,7 +25,9 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
+import types
 from pathlib import Path
 
 import pytest
@@ -129,6 +131,117 @@ def test_finish_always_writes_summary_and_report_listing_every_case(tmp_path, fa
     nodeids = {c["nodeid"] for c in summary["cases"]}
     assert nodeids == {NODEID_OK, NODEID_BAD}, "不抓图的用例也要留在 cases 里"
     assert [c for c in summary["cases"] if c["nodeid"] == NODEID_OK][0]["screenshot"] is None
+
+
+# ---------------- setup 阶段失败（pytest 的 ERROR）必须进记录 ----------------
+
+
+def _load_conftest():
+    """按**路径**加载 `tests/conftest.py`。
+
+    不写 `import conftest`：跑 pytest 时它可能以 `conftest` / `tests.conftest`
+    两种名字待在 `sys.modules` 里，按名字取不可靠。按路径加载才稳定。
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_hall_conftest_guard", REPO_ROOT / "tests" / "conftest.py"
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeReport:
+    """只带 hook 用到的那几个字段的假 report。"""
+
+    def __init__(self, when, *, failed=False, skipped=False, longrepr="", duration=0.1):
+        self.when = when
+        self.failed = failed
+        self.skipped = skipped
+        self.longrepr = longrepr
+        self.duration = duration
+
+
+class _FakeItem:
+    def __init__(self, nodeid, evidence):
+        self.nodeid = nodeid
+        self.config = types.SimpleNamespace(_evidence=evidence)
+        self.function = types.SimpleNamespace(__doc__="用例说明")
+
+    def iter_markers(self):
+        return []
+
+
+def _feed_report(conftest_mod, item, report):
+    """驱动 hookwrapper 版的 `pytest_runtest_makereport`：走到 yield，再把假 report 交回去。"""
+    gen = conftest_mod.pytest_runtest_makereport(item, None)
+    next(gen)
+
+    class _Outcome:
+        def get_result(self):
+            return report
+
+    try:
+        gen.send(_Outcome())
+    except StopIteration:
+        pass
+
+
+def test_setup_error_is_recorded_so_it_cannot_be_silently_dropped(tmp_path, fake_capture):
+    """**这条锁的是 2026-09-22 的假绿根因。**
+
+    `pytest_runtest_makereport` 原先只认 `when == "call"`，外加 `when == "setup"` 的
+    **skip** —— `setup` 阶段失败（= pytest 的 ERROR，fixture 崩了、用例一行都没执行）
+    **没有分支，直接被丢弃**。
+
+    真机实测后果：节点上 188 条用例因 `%TEMP%\\pytest-of-admin` 拒绝访问而在 setup 就崩，
+    `summary.json` 却写 `total 273 / passed 273 / failed 0`；而
+    `farm_control.aggregate` 按 nodeid 合并跨轮结果、**新那轮没记录就保留老记录**，
+    于是矩阵里那一格挂着更早一轮的 ✓ —— 整行看着全绿。
+
+    所以这里断言三件事：进 records、进 summary 的 `errors`、**不混进 failed**。
+    """
+    s, run = _session(tmp_path, ev.MODE_FAILURE)
+    item = _FakeItem(NODEID_BAD, s)
+    _feed_report(
+        _load_conftest(), item,
+        _FakeReport("setup", failed=True, longrepr="PermissionError: [WinError 5] 拒绝访问。"),
+    )
+
+    assert [r.outcome for r in s.records] == [ev.OUTCOME_ERROR], (
+        "setup 阶段失败没进记录 —— 汇总报告那一格会留着上一轮的旧结果，假绿又回来了"
+    )
+
+    report = s.finish()
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert summary["total"] == 1 and summary["errors"] == 1, "error 没进 summary —— 汇总层还是看不见它"
+    assert summary["failed"] == 0, (
+        "error 不该混进失败列：看报告的人要能区分「跑挂了」和「根本没跑起来」"
+    )
+    assert (_case_dir(run, NODEID_BAD) / "final.png").is_file(), (
+        "error 也要留图 —— 临时目录被拒这类现场只能靠截图复现"
+    )
+    html = report.read_text(encoding="utf-8")
+    assert "错误" in html, "报告里要能一眼看到「错误」这一档，不能只有通过/失败/跳过"
+
+
+def test_setup_skip_is_still_recorded_as_skipped(tmp_path, fake_capture):
+    """补 error 分支别把原有的 setup-skip 分支挤掉（缺凭据/缺夹具靠它才看得见）。"""
+    s, _ = _session(tmp_path, ev.MODE_FAILURE)
+    item = _FakeItem(NODEID_OK, s)
+    _feed_report(_load_conftest(), item, _FakeReport("setup", skipped=True, longrepr="Skipped: 缺凭据"))
+
+    assert [r.outcome for r in s.records] == [ev.OUTCOME_SKIPPED]
+    assert "缺凭据" in s.records[0].assertion
+
+
+def test_call_phase_result_is_unchanged(tmp_path, fake_capture):
+    """call 阶段的行为不能被这次改动带偏（通过/失败仍照旧）。"""
+    s, _ = _session(tmp_path, ev.MODE_FAILURE)
+    item = _FakeItem(NODEID_OK, s)
+    _feed_report(_load_conftest(), item, _FakeReport("call", failed=False))
+
+    assert [r.outcome for r in s.records] == [ev.OUTCOME_PASSED]
 
 
 # ---------------- 农场靠它认本轮目录：目录必须无条件建出来 ----------------

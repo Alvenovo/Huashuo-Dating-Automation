@@ -11,6 +11,7 @@ from hall_auto.dpi import is_interactive_session, machine_profile, node_id
 from hall_auto.evidence import (
     MODE_ALL,
     MODE_FAILURE,
+    OUTCOME_ERROR,
     OUTCOME_FAILED,
     OUTCOME_PASSED,
     OUTCOME_SKIPPED,
@@ -245,6 +246,20 @@ def pytest_runtest_makereport(item, call):
         session.record(item.nodeid, result, report.duration, detail, title=_case_title(item))
     elif report.when == "setup" and report.skipped:
         session.record(item.nodeid, OUTCOME_SKIPPED, report.duration, _skip_label(item, report), title=_case_title(item))
+    elif report.when == "setup" and report.failed:
+        # setup 阶段失败 = pytest 的 ERROR：fixture 崩了，用例**一行都没执行**。
+        #
+        # 这个分支 2026-09-22 才补上。之前没有它，于是 ERROR **一条都不进 evidence**：
+        #   · summary.json 里既不算 passed 也不算 failed，`total` 直接少掉一批；
+        #   · 更糟的是 `farm_control.aggregate` 按 nodeid 合并各轮结果，**新那轮没记录
+        #     就保留老记录** —— 报告那一格于是挂着更早一轮的 ✓，看着全绿。
+        # 实测：节点上 188 个用例因 `%TEMP%\pytest-of-admin` 拒绝访问而 ERROR，
+        # 汇总报告里 unit 显示 273 通过 / 0 失败，假绿。
+        #
+        # 记成 error 而不是 failed：混进失败列，看报告的人分不清「跑挂了」和「没跑起来」。
+        session.record(item.nodeid, OUTCOME_ERROR, report.duration, _assertion_text(report), title=_case_title(item))
+    # ⚠️ teardown 阶段失败（`when == "teardown"`）仍未覆盖：同一 nodeid 会因此产生两条记录，
+    # 得先定下"一条用例只保留最后一条记录"的口径再动，别顺手补。
 
 
 def pytest_sessionfinish(session, exitstatus):

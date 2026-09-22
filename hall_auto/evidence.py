@@ -26,6 +26,10 @@ MODE_FAILURE = "failure-only"
 OUTCOME_PASSED = "passed"
 OUTCOME_FAILED = "failed"
 OUTCOME_SKIPPED = "skipped"
+# setup 阶段就崩（fixture 报错）= pytest 的 ERROR，用例**根本没执行**。
+# 必须与 failed 分开：混在一起看报告的人分不清「跑挂了」和「没跑起来」——
+# 2026-09-22 就是因为它压根没进记录，汇总报告里那一格留着更早一轮的 ✓（假绿）。
+OUTCOME_ERROR = "error"
 
 
 def new_run_dir(root: Path = EVIDENCE_ROOT, node: str | None = None) -> Path:
@@ -103,7 +107,8 @@ class EvidenceSession:
         self.records: list[CaseRecord] = []
 
     def _should_capture(self, outcome: str) -> bool:
-        return self.mode == MODE_ALL or outcome == OUTCOME_FAILED
+        # error 也要留图：setup 崩掉时现场（临时目录被拒、夹具起不来）只能靠截图复现
+        return self.mode == MODE_ALL or outcome in (OUTCOME_FAILED, OUTCOME_ERROR)
 
     def record(self, nodeid: str, outcome: str, duration: float, assertion: str, title: str = "") -> CaseRecord:
         module, case = module_of(nodeid), case_of(nodeid)
@@ -135,6 +140,7 @@ class EvidenceSession:
         passed = sum(1 for r in self.records if r.outcome == OUTCOME_PASSED)
         failed = sum(1 for r in self.records if r.outcome == OUTCOME_FAILED)
         skipped = sum(1 for r in self.records if r.outcome == OUTCOME_SKIPPED)
+        errors = sum(1 for r in self.records if r.outcome == OUTCOME_ERROR)
         total_s = round(sum(r.duration_s for r in self.records), 2)
         summary = {
             "run": self.run_dir.name,
@@ -147,6 +153,7 @@ class EvidenceSession:
             "passed": passed,
             "failed": failed,
             "skipped": skipped,
+            "errors": errors,
             "duration_s": total_s,
             "cases": [r.to_dict() for r in self.records],
         }
@@ -178,7 +185,7 @@ def prune_old_runs(root: Path = EVIDENCE_ROOT, keep_days: int = 30) -> list[Path
 
 _CSS = """
   :root{--pass:#1a7f37;--pass-bg:#e6f4ea;--fail:#c62828;--fail-bg:#fdecea;
-        --skip:#656d76;--skip-bg:#eef1f4;--ink:#1f2328;--muted:#656d76;--line:#d0d7de;--card:#fff;--bg:#f6f8fa;}
+        --err:#8a5300;--err-bg:#fff4e0;--skip:#656d76;--skip-bg:#eef1f4;--ink:#1f2328;--muted:#656d76;--line:#d0d7de;--card:#fff;--bg:#f6f8fa;}
   *{box-sizing:border-box;}
   body{margin:0;background:var(--bg);color:var(--ink);font-family:"Microsoft YaHei","Segoe UI",system-ui,sans-serif;font-size:14px;line-height:1.5;}
   .wrap{max-width:1100px;margin:0 auto;padding:24px 16px 64px;}
@@ -189,6 +196,7 @@ _CSS = """
   .stat{flex:1;min-width:110px;border:1px solid var(--line);border-radius:8px;padding:10px 14px;}
   .stat .n{font-size:24px;font-weight:700;} .stat .l{color:var(--muted);font-size:12px;}
   .stat.pass .n{color:var(--pass);} .stat.fail .n{color:var(--fail);} .stat.skip .n{color:var(--skip);}
+  .stat.err .n{color:var(--err);}
   .toolbar{display:flex;gap:8px;align-items:center;margin:0 0 12px;flex-wrap:wrap;}
   .toolbar input{flex:1;min-width:180px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;}
   .btn{padding:7px 14px;border:1px solid var(--line);background:var(--card);border-radius:20px;cursor:pointer;font-size:13px;}
@@ -199,10 +207,13 @@ _CSS = """
   tr:last-child td{border-bottom:none;}
   tr.row-failed{background:var(--fail-bg);}
   tr.row-failed:hover{background:#f8d7d3;}
+  tr.row-error{background:var(--err-bg);}
+  tr.row-error:hover{background:#ffe9c4;}
   tr.row-skipped{background:var(--skip-bg);}
   tr.row-skipped:hover{background:#e3e7eb;}
   .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;}
   .badge.pass{color:var(--pass);background:var(--pass-bg);} .badge.fail{color:var(--fail);background:var(--fail-bg);}
+  .badge.error{color:var(--err);background:var(--err-bg);}
   .badge.skipped{color:var(--skip);background:var(--skip-bg);}
   .mod{display:inline-block;padding:1px 8px;border-radius:6px;background:#eef1f4;color:var(--muted);font-size:12px;}
   .case{font-weight:600;} .title{font-size:13px;color:#3b4149;margin-top:2px;} .assert{color:var(--muted);font-size:12px;margin-top:2px;}
@@ -258,13 +269,15 @@ def _render_html(summary: dict, run_dir: Path | None = None) -> str:
     rows = []
     for c in summary["cases"]:
         outcome = c["outcome"]
-        badge = {"passed": "通过", "failed": "失败", "skipped": "跳过"}.get(outcome, outcome)
+        badge = {"passed": "通过", "failed": "失败", "error": "错误", "skipped": "跳过"}.get(outcome, outcome)
         data_uri = _embed(c["screenshot"], run_dir) if c["screenshot"] else None
         img = (f'<img class="thumb" alt="final" src="{data_uri}">'
                if data_uri else '<span class="noimg">无截图</span>')
-        err = f'<div class="err">{html.escape(c["assertion"])}</div>' if (outcome == "failed" and c["assertion"]) else ""
+        # failed / error 都把原文摊开：error 是 setup 崩了，堆栈就是唯一线索
+        broken = outcome in (OUTCOME_FAILED, OUTCOME_ERROR)
+        err = f'<div class="err">{html.escape(c["assertion"])}</div>' if (broken and c["assertion"]) else ""
         title_line = f'<div class="title">{html.escape(c["title"])}</div>' if c.get("title") else ""
-        assert_line = f'<div class="assert">{html.escape(c["assertion"]) or "—"}</div>' if outcome != "failed" else ""
+        assert_line = f'<div class="assert">{html.escape(c["assertion"]) or "—"}</div>' if not broken else ""
         rows.append(
             f'<tr class="row-{outcome}" data-s="{outcome}" data-text="{html.escape(c["module"] + " " + c["case"] + " " + c.get("title", ""))}">'
             f'<td><span class="badge {outcome}">{badge}</span></td>'
@@ -305,6 +318,7 @@ def _render_html(summary: dict, run_dir: Path | None = None) -> str:
       <div class="stat"><div class="n">{summary["total"]}</div><div class="l">用例总数</div></div>
       <div class="stat pass"><div class="n">{summary["passed"]}</div><div class="l">通过</div></div>
       <div class="stat fail"><div class="n">{summary["failed"]}</div><div class="l">失败</div></div>
+      <div class="stat err"><div class="n">{summary.get("errors", 0)}</div><div class="l">错误（没跑起来）</div></div>
       <div class="stat skip"><div class="n">{summary["skipped"]}</div><div class="l">跳过</div></div>
       <div class="stat"><div class="n">{rate}%</div><div class="l">通过率</div></div>
     </div>
@@ -314,6 +328,7 @@ def _render_html(summary: dict, run_dir: Path | None = None) -> str:
     <button class="btn active" data-f="all">全部</button>
     <button class="btn" data-f="passed">只看通过</button>
     <button class="btn" data-f="failed">只看失败</button>
+    <button class="btn" data-f="error">只看错误</button>
   </div>
   <table id="tbl">
     <thead><tr><th style="width:90px">结果</th><th style="width:90px">模块</th><th>用例 / 关键断言</th><th style="width:70px">耗时</th><th style="width:130px">终态截图</th></tr></thead>

@@ -226,11 +226,28 @@ def cmd_aggregate(args) -> int:
             summary = _read_json(summary_file)
             if not summary:
                 continue
-            # 同一节点多轮 result 合并：后面的覆盖前面的同名用例
+            # 同一节点多轮 result 合并：后面的覆盖前面的同名用例。
+            #
+            # ⚠️ **合并是刻意的**：一个节点可能这轮跑 launch、下轮跑 settings，覆盖要跨轮累积。
+            # 但"覆盖"只在**新那轮有记录**时发生 —— 新那轮没跑到（没投这个套件、或那条用例
+            # setup 就崩了没进记录）时，老记录会**留在矩阵里冒充最新结果**。
+            # 所以每格都记下它来自哪一轮（case_run），报告里标出来，别让人误读。
             bucket = nodes_data.setdefault(node_dir.name, {"profile": summary.get("profile") or {},
                                                             "cases": {}, "runs": [],
+                                                            "case_run": {}, "run_meta": {},
                                                             "credentials": {}})
-            bucket["runs"].append(summary.get("run"))
+            run_name = summary.get("run") or run_dir.name
+            bucket["runs"].append(run_name)
+            bucket["run_meta"][run_name] = {
+                "finished_at": summary.get("finished_at") or "",
+                "passed": summary.get("passed", 0),
+                "failed": summary.get("failed", 0),
+                "errors": summary.get("errors", 0),
+                "skipped": summary.get("skipped", 0),
+                "total": summary.get("total", 0),
+            }
+            # 目录名按 `节点_日期_时刻[_n]` 排，字典序≈时间序，所以最后一条就是最新一轮
+            bucket["latest_run"] = run_name
             # 凭据状态来自节点随证据回传的 node_env.json（farm_agent 写）。
             # **必须真的读它**：报告的「凭据」列是测试人员区分「没配凭据」和
             # 「用例本身在跳过」的唯一依据（见《测试机操作手册》第四部分）。
@@ -240,6 +257,7 @@ def cmd_aggregate(args) -> int:
                 bucket["credentials"] = creds
             for case in summary.get("cases") or []:
                 bucket["cases"][case["nodeid"]] = case
+                bucket["case_run"][case["nodeid"]] = run_name
 
     for node, bucket in nodes_data.items():
         if not bucket.get("credentials") and node in fallback_creds:
@@ -252,15 +270,28 @@ def cmd_aggregate(args) -> int:
     out.write_text(_render_matrix(nodes_data), encoding="utf-8")
     print(f"汇总报告：{out}")
     print(f"覆盖节点 {len(nodes_data)} 台，用例 {len({c for v in nodes_data.values() for c in v['cases']})} 条")
+    for node in sorted(nodes_data):
+        runs = nodes_data[node].get("runs", [])
+        if len(runs) > 1:
+            print(f"  {node}：跨 {len(runs)} 轮合并（最新 {nodes_data[node].get('latest_run')}）"
+                  "，报告里带 ° 的格子来自更早轮次")
+    err_nodes = []
+    for node in sorted(nodes_data):
+        n_err = sum(1 for c in nodes_data[node]["cases"].values() if c.get("outcome") == "error")
+        if n_err:
+            err_nodes.append(f"{node} {n_err} 条")
+    if err_nodes:
+        print(f"⚠ 有「错误」（setup 崩了、用例根本没执行）：{'; '.join(err_nodes)}")
+        print("  这类不是用例失败，去看该轮 run 目录里的 report.html 拿堆栈和截图。")
     no_creds = sorted(n for n, v in nodes_data.items() if not (v.get("credentials") or {}))
     if no_creds:
         print(f"⚠ 这些节点没拿到凭据状态（报告里凭据列会全 ✗，别据此判断用例是否真跑）：{', '.join(no_creds)}")
     return 0
 
 
-_OUTCOMES = ("passed", "failed", "skipped")
-_SYMBOL = {"passed": "✓", "failed": "✗", "skipped": "–"}
-_COLOR = {"passed": "#1a7f37", "failed": "#c62828", "skipped": "#9aa0a6"}
+_OUTCOMES = ("passed", "failed", "error", "skipped")
+_SYMBOL = {"passed": "✓", "failed": "✗", "error": "!", "skipped": "–"}
+_COLOR = {"passed": "#1a7f37", "failed": "#c62828", "error": "#8a5300", "skipped": "#9aa0a6"}
 
 
 def _cred_cell(creds: dict, key: str) -> str:
@@ -275,7 +306,12 @@ def _cred_cell(creds: dict, key: str) -> str:
 
 
 def _render_matrix(nodes_data: dict) -> str:
-    """节点 × 用例矩阵：一眼看出「哪台机器挂在哪条用例」，那是兼容性结论的形态。"""
+    """节点 × 用例矩阵：一眼看出「哪台机器挂在哪条用例」，那是兼容性结论的形态。
+
+    ⚠️ 每格都标**来源轮次**（鼠标悬停可见），来自更早轮次的还会带一个 `°`。
+    不标的话，合并跨轮结果会让人把老结果当最新结果读 —— 2026-09-22 就踩过：
+    unit 有 188 条用例 setup 崩了没进记录，矩阵里那一格留着上一轮的 ✓，整行看着全绿。
+    """
     all_cases = sorted({c for v in nodes_data.values() for c in v["cases"]})
     nodes = sorted(nodes_data)
 
@@ -284,15 +320,25 @@ def _render_matrix(nodes_data: dict) -> str:
     for nodeid in all_cases:
         cells = []
         for node in nodes:
-            case = nodes_data[node]["cases"].get(nodeid)
+            bucket = nodes_data[node]
+            case = bucket["cases"].get(nodeid)
             if case is None:
                 cells.append('<td class="na">·</td>')
                 continue
             outcome = case.get("outcome", "")
             symbol = _SYMBOL.get(outcome, "?")
             color = _COLOR.get(outcome, "#000")
-            title = html.escape((case.get("assertion") or "")[:200])
-            cells.append(f'<td style="color:{color}" title="{title}">{symbol}</td>')
+            src = bucket.get("case_run", {}).get(nodeid, "")
+            meta = bucket.get("run_meta", {}).get(src, {})
+            carried = bool(src) and src != bucket.get("latest_run")
+            tip = f"来源轮次: {src}（{meta.get('finished_at', '')}）"
+            if carried:
+                tip += " · 本节点最新一轮没跑到这条，用的是更早轮次的结果"
+            assertion = (case.get("assertion") or "").strip()
+            if assertion:
+                tip += " · " + assertion[:200]
+            mark = '<span class="carry">°</span>' if carried else ""
+            cells.append(f'<td style="color:{color}" title="{html.escape(tip)}">{symbol}{mark}</td>')
         short = nodeid.split("::")[-1]
         module = nodeid.split("::")[0]
         rows.append(f'<tr><td class="case"><div>{html.escape(short)}</div>'
@@ -311,6 +357,26 @@ def _render_matrix(nodes_data: dict) -> str:
             + "</tr>"
         )
 
+    # 轮次表：把"这个节点的结论是哪几轮拼出来的"摊开，矩阵里的 ° 才有处可查
+    run_rows = []
+    for node in nodes:
+        bucket = nodes_data[node]
+        for run_name in bucket.get("runs", []):
+            meta = bucket.get("run_meta", {}).get(run_name, {})
+            latest = " ← 最新" if run_name == bucket.get("latest_run") else ""
+            run_rows.append(
+                f"<tr><td>{html.escape(node)}</td>"
+                f"<td>{html.escape(run_name)}{latest}</td>"
+                f"<td>{html.escape(str(meta.get('finished_at', '')))}</td>"
+                f"<td>{meta.get('total', 0)}</td>"
+                f'<td style="color:{_COLOR["passed"]}">{meta.get("passed", 0)}</td>'
+                f'<td style="color:{_COLOR["failed"]}">{meta.get("failed", 0)}</td>'
+                f'<td style="color:{_COLOR["error"]}">{meta.get("errors", 0)}</td>'
+                f"<td>{meta.get('skipped', 0)}</td></tr>"
+            )
+    if not run_rows:
+        run_rows.append('<tr><td colspan="8" class="na">没有可汇总的 run</td></tr>')
+
     totals = {n: {o: sum(1 for c in nodes_data[n]["cases"].values() if c.get("outcome") == o)
                   for o in _OUTCOMES} for n in nodes}
 
@@ -328,16 +394,33 @@ def _render_matrix(nodes_data: dict) -> str:
  th{{background:#eef1f4;font-size:12px;color:#656d76;position:sticky;top:0;}}
  td.case{{text-align:left;min-width:260px;}} .mod{{color:#9aa0a6;font-size:11px;}}
  .na{{color:#c9ced3;}}
+ .carry{{color:#9aa0a6;font-size:11px;margin-left:1px;}}
+ .lg-pass{{color:#1a7f37;}} .lg-fail{{color:#c62828;}}
+ .lg-err{{color:#8a5300;}} .lg-skip{{color:#9aa0a6;}}
+ .note{{background:#fff8e6;border:1px solid #f0d9a0;border-radius:8px;padding:10px 12px;color:#6b5300;margin-bottom:14px;}}
  .tbl-scroll{{overflow-x:auto;}}
 </style></head><body><div class="wrap">
 <h1>多机汇总 · 节点 × 用例矩阵</h1>
 <div class="meta">生成于 {html.escape(datetime.now().isoformat(timespec='seconds'))} &nbsp;·&nbsp;
 节点 {len(nodes)} 台 &nbsp;·&nbsp; 用例 {len(all_cases)} 条 &nbsp;·&nbsp;
-✓ 通过 &nbsp; ✗ 失败 &nbsp; – 跳过 &nbsp; · 未跑到</div>
+<span class="lg-pass">✓ 通过</span> &nbsp;
+<span class="lg-fail">✗ 失败</span> &nbsp;
+<span class="lg-err">! 错误（setup 崩了，用例没执行）</span> &nbsp;
+<span class="lg-skip">– 跳过</span> &nbsp; · 未跑到 &nbsp; ° 来自更早轮次</div>
 
-<h2>各节点统计</h2>
-<div class="tbl-scroll"><table><thead><tr><th>节点</th><th>通过</th><th>失败</th><th>跳过</th></tr></thead><tbody>
-{"".join(f'<tr><td>{html.escape(n)}</td><td style="color:{_COLOR["passed"]}">{totals[n]["passed"]}</td><td style="color:{_COLOR["failed"]}">{totals[n]["failed"]}</td><td>{totals[n]["skipped"]}</td></tr>' for n in nodes)}
+<div class="note"><b>这张表是跨轮次合并的。</b>一个节点可能这轮跑 launch、下轮跑 settings，
+所以同一个节点不同用例可能来自不同 run。鼠标悬停任意一格可看<b>它来自哪一轮</b>；
+带 <b>°</b> 的格子表示<b>本节点最新一轮没跑到这条</b>，用的是更早轮次的结果 —— 别当最新结论读。
+各轮的明细见下面「轮次」表。</div>
+
+<h2>各节点统计（跨轮合并后）</h2>
+<div class="tbl-scroll"><table><thead><tr><th>节点</th><th>通过</th><th>失败</th><th>错误</th><th>跳过</th></tr></thead><tbody>
+{"".join(f'<tr><td>{html.escape(n)}</td><td style="color:{_COLOR["passed"]}">{totals[n]["passed"]}</td><td style="color:{_COLOR["failed"]}">{totals[n]["failed"]}</td><td style="color:{_COLOR["error"]}">{totals[n]["error"]}</td><td>{totals[n]["skipped"]}</td></tr>' for n in nodes)}
+</tbody></table></div>
+
+<h2>轮次</h2>
+<div class="tbl-scroll"><table><thead><tr><th>节点</th><th>轮次</th><th>完成时间</th><th>用例</th><th>通过</th><th>失败</th><th>错误</th><th>跳过</th></tr></thead><tbody>
+{"".join(run_rows)}
 </tbody></table></div>
 
 <h2>节点环境</h2>
