@@ -273,7 +273,7 @@ def test_every_unit_file_is_selected_by_the_unit_marker():
 
 
 
-# ---------------- 测试函数不许重名（重名 = 前一份静默不跑）----------------
+# ---------------- 模块顶层名字不许重名（重名 = 前一份静默不生效）----------------
 #
 # 2026-09-22 清出来的实例：`test_bootstrap_policy.py` 里有 **4 个测试函数被定义了两次**，
 # 是整块粘贴事故。这次 4 对**恰好逐字相同**，所以没丢断言 —— 纯死代码。
@@ -282,27 +282,76 @@ def test_every_unit_file_is_selected_by_the_unit_marker():
 # 于是**第一份根本不执行**。只要两份**不完全一样**（改了一处、漏改另一处），
 # 就是一条**静默不执行的守卫** —— 屏幕全绿、断言没跑，本项目最怕的那种假绿。
 #
-# 所以判据取「**重名即红**」，不区分内容是否相同：内容相同只是"暂时无害"，
+# 所以判据取「**重名即红**」，不区分内容：内容相同只是"暂时无害"，
 # 而区分内容需要人去读，读的人会漏。4 对逐字相同的都能藏一个月，何况不一样的。
 #
-# 只查**模块顶层**的 `def test_*`：类里的方法重名是另一回事（且本仓库的测试都是函数式）。
-# 跨文件重名不管 —— 那本来就是允许的（`pytestmark` 按文件生效）。
+# 仓库里**没有任何 linter**（无 pyproject / ruff / flake8，requirements 只有 5 个包），
+# 所以这类「静默覆盖」没有任何现成工具兜底 —— 手写守卫就是唯一的兜底。
+#
+# 覆盖范围（2026-09-22 从"只扫 tests/ 的 `def test_*`"推广）：
+#   - 根：`hall_auto/` `tools/` `tests/`
+#   - 种类：模块顶层的 函数 / 类 / 赋值（含注解赋值）—— 常量被写两遍同样是静默覆盖
+# 只管**模块顶层**：`if/else` 两分支各赋一次是正常写法，不算。
+# 跨文件重名不管 —— 那本来就允许（`pytestmark` 按文件生效）。
+
+_SOURCE_ROOTS = ("hall_auto", "tools", "tests")
 
 
-def test_no_test_function_is_defined_twice_in_the_same_file():
+def _module_python_files():
+    out = []
+    for root in _SOURCE_ROOTS:
+        out += sorted(p for p in (REPO_ROOT / root).rglob("*.py") if "__pycache__" not in p.parts)
+    return out
+
+
+def test_no_top_level_name_is_defined_twice_in_a_module():
     offenders: list[str] = []
-    for f in sorted((REPO_ROOT / "tests").rglob("*.py")):
+    for f in _module_python_files():
         seen: dict[str, list[int]] = {}
         for node in ast.parse(f.read_text(encoding="utf-8")).body:
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 seen.setdefault(node.name, []).append(node.lineno)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        seen.setdefault(t.id, []).append(node.lineno)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                seen.setdefault(node.target.id, []).append(node.lineno)
         for name, linenos in seen.items():
             if len(linenos) > 1:
                 rel = f.relative_to(REPO_ROOT).as_posix()
                 offenders.append(f"{rel}::{name}（行 {', '.join(map(str, linenos))}）")
 
     assert not offenders, (
-        "同一个文件里测试函数重名 —— **前一份永远不跑**（后一份覆盖它）。"
-        "内容一样就删掉重复的那份；内容不一样更要命：那是一条静默不执行的守卫。\n  "
+        "同一个模块里顶层名字被定义了两次 —— **只有最后一份生效，前一份静默不跑**。"
+        "测试函数重名 = 一条不执行的守卫；常量重名 = 值跟你写的不一样。\n  "
+        + "\n  ".join(sorted(offenders))
+    )
+
+
+def test_no_duplicate_keys_in_dict_literals():
+    """字面量里同一个 key 写两遍 —— Python **静默保留最后一个**，不报错、不警告。
+
+    最坏的情况是配置表：`{"a": 1, "a": 2}` 看着有两条，实际只有一条，
+    屏幕上没有任何提示。所以按「重复即红」锁死。
+    """
+    offenders: list[str] = []
+    for f in _module_python_files():
+        for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys: dict[str, list[int]] = {}
+            for k in node.keys:
+                if isinstance(k, ast.Constant) and isinstance(
+                    k.value, (str, int, float, bool, type(None))
+                ):
+                    keys.setdefault(repr(k.value), []).append(k.lineno)
+            for key, linenos in keys.items():
+                if len(linenos) > 1:
+                    rel = f.relative_to(REPO_ROOT).as_posix()
+                    offenders.append(f"{rel}:{linenos[0]}  key {key} 写了 {len(linenos)} 次")
+
+    assert not offenders, (
+        "dict 字面量里同一个 key 出现了多次 —— Python 只留最后一个，**前面那个静默消失**。\n  "
         + "\n  ".join(sorted(offenders))
     )
