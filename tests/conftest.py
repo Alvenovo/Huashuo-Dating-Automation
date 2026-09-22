@@ -30,8 +30,11 @@ def pytest_addoption(parser):
     parser.addoption(
         "--evidence",
         choices=[MODE_ALL, MODE_FAILURE],
-        default=MODE_ALL,
-        help="证据采集策略：all=成功失败都留证（默认）；failure-only=只留失败",
+        default=MODE_FAILURE,
+        help=(
+            "证据采集策略：failure-only=只留失败（默认）；all=成功失败都留证。"
+            "想让通过的用例也留原图时，显式加 --evidence=all。"
+        ),
     )
     parser.addoption(
         "--evidence-keep-days",
