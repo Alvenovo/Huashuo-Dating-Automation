@@ -33,6 +33,7 @@
     HALL_TEST_USER=13800000000
     HALL_TEST_PASSWORD=xxxx
     HALL_MS_USER=someone@outlook.com
+    HALL_BIND_PHONE=13800000000   # 绑定手机号弹窗要填的号；留空 = 回退到 HALL_TEST_USER
     HALL_SHARE_USER=hallshare
     HALL_SHARE_PASSWORD=xxxx
 

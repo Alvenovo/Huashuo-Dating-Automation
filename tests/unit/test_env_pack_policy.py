@@ -29,6 +29,46 @@ def test_parse_env_text_basic():
     assert parsed["HALL_TEST_PASSWORD"] == "secret123", "等号两侧空白要去掉"
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_bind_phone_prefers_its_own_var_then_falls_back_to_the_login_number(monkeypatch, tmp_path):
+    """绑定手机号弹窗要填的号：`HALL_BIND_PHONE` 优先，否则**回退到登录测试号**。
+
+    回退是刻意的：绝大多数情况下「要绑的号」就是「登录用的号」，
+    这样新机不用额外配一项。少了回退，新机上弹窗只会**静默跳过**
+    （代码里只打一行字，报告上一片绿 —— 最容易漏掉的那种失败）。
+    """
+    from hall_auto.config import load_config
+
+    # 用最小 yaml 造 cfg：Config 是 frozen dataclass，手工 __new__ 之后赋不进字段。
+    cfg_path = tmp_path / "min.yaml"
+    cfg_path.write_text("display_name_contains: 华硕大厅\n", encoding="utf-8")
+    cfg = load_config(cfg_path)
+
+    monkeypatch.delenv("HALL_BIND_PHONE", raising=False)
+    monkeypatch.setenv("HALL_TEST_USER", "13800000000")
+    monkeypatch.setenv("HALL_TEST_PASSWORD", "pw")
+    assert cfg.bind_phone() == "13800000000", "没配 HALL_BIND_PHONE 时应回退到登录号"
+
+    monkeypatch.setenv("HALL_BIND_PHONE", "13900000000")
+    assert cfg.bind_phone() == "13900000000", "配了就该用配的那个号"
+
+    monkeypatch.delenv("HALL_BIND_PHONE", raising=False)
+    monkeypatch.delenv("HALL_TEST_USER", raising=False)
+    assert cfg.bind_phone() == "", "两个都没有时返回空串（调用方据此跳过绑定）"
+
+
+def test_bootstrap_template_offers_the_bind_phone_slot():
+    """`farm_node.env` 模板里必须有 `HALL_BIND_PHONE`。
+
+    没这一行，操作的人根本不知道有这个开关 —— 新机上绑定弹窗就只会被静默跳过。
+    模板是**唯一**告知渠道（`bootstrap_machine.py` 生成，每台机器一份）。
+    """
+    src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
+    assert "HALL_BIND_PHONE=" in src, "farm_node.env 模板丢了 HALL_BIND_PHONE 这一项"
+
+
 def test_parse_env_text_last_wins():
     """重复键后者覆盖前者 —— 便于文件末尾临时覆盖。"""
     parsed = env_pack.parse_env_text("K=1\nK=2\n")

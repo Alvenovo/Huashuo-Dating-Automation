@@ -1687,6 +1687,8 @@ def step_node_env_template() -> Step:
         "HALL_MS_USER=",
         "# 改密码往返用例（只在 -m manual 人在环时用）",
         "HALL_TEST_NEW_PASSWORD=",
+        "# 登录后「绑定手机号」弹窗要填的号（没绑过的账号才弹）；留空 = 回退到 HALL_TEST_USER",
+        "HALL_BIND_PHONE=",
         "",
         "# --- 共享盘取包（取不到包时才需要；也可用 net use /persistent:yes 代替）---",
         "HALL_SHARE_USER=",

@@ -217,3 +217,202 @@ def test_submit_does_not_type_keys_when_the_window_is_not_in_front():
         with pytest.raises(login.LaunchError):
             login.submit_microsoft_code(object(), "123456")
     assert typed == [], f"窗口不在前台还敲了键盘：{typed}"
+
+
+# ---------------------------------------------------------------------------
+# 【发送验证码】必须"点了 + 确认发出去了"
+#
+# 2026-09-22 新机实测：脚本没点发送验证码就回来问人要码，人只能自己去点一下。
+# 根因是原来那个实现**只点一下、不验证** —— webview 上 `invoke()` / `click_input()`
+# 都可能静默失败，于是"没点"和"点了"在代码里长得一模一样。
+#
+# 成功判据取「代码输入框出现」：那是页面上唯一与"码已发出"一一对应的可观测变化
+# （按钮本身点完会消失/变倒计时，`request_sms_code` 早就不拿按钮状态当判据了）。
+# ---------------------------------------------------------------------------
+
+
+class _Ctl:
+    """只提供 `_ms_otp_send_candidates` 读到的两个字段。"""
+
+    def __init__(self, name: str, control_type: str = ""):
+        self.element_info = SimpleNamespace(name=name, control_type=control_type)
+
+
+@pytest.mark.unit
+def test_send_code_prefers_button_over_text():
+    """**关键保护**：同名节点里 `Button` 必须排在 `Text` 前面。
+
+    webview 里按钮常常是 `Button(发送验证码)` 套一层 `Text(发送验证码)`。
+    先命中里面那个 Text 时 `invoke()` 必失败、`click_input()` 又只认矩形 ——
+    点了跟没点一样，**而且不报错**。
+    """
+    nodes = [
+        _Ctl("发送验证码", "Text"),
+        _Ctl("发送验证码", "Button"),
+        _Ctl("发送验证码", "Button"),
+        _Ctl("发送登录代码", "Text"),  # 页面上别处的文案，不该入选
+    ]
+    with mock.patch.object(login, "_ms_nodes", return_value=nodes):
+        picked = login._ms_otp_send_candidates(object())
+    assert [n.element_info.control_type for n in picked] == ["Button", "Button", "Text"]
+
+
+@pytest.mark.unit
+def test_send_code_fails_loudly_when_the_code_box_never_shows_up():
+    """**关键保护**：点了但代码框没出现 → **必须抛错**，不能当成功返回。
+
+    不抛就是这个 bug 本身：脚本静默返回、接着问人要一个**根本没发出去**的码。
+    """
+    with (
+        mock.patch.object(login, "_ms_otp_send_candidates", return_value=[object()]),
+        mock.patch.object(login, "_press_button", return_value=True),
+        mock.patch.object(login, "_bring_to_front", return_value=True),
+        mock.patch.object(login, "microsoft_code_input", return_value=None),
+        mock.patch.object(login, "dump_microsoft_tree", return_value=""),
+        mock.patch.object(login.time, "sleep"),
+        mock.patch.object(login, "MICROSOFT_OTP_SEND_TIMEOUT_SEC", 0),
+        mock.patch.object(login, "MICROSOFT_OTP_PAGE_TIMEOUT_SEC", 0),
+    ):
+        with pytest.raises(login.LaunchError) as exc:
+            login.microsoft_send_code(object())
+    assert "代码输入框没出现" in str(exc.value)
+
+
+@pytest.mark.unit
+def test_send_code_succeeds_once_the_code_box_shows_up():
+    """正常路径：点完代码框出现就返回。"""
+    boxes = iter([None, object()])  # 第一次是"点之前没有框"，第二次是"点完有了"
+    with (
+        mock.patch.object(login, "_ms_otp_send_candidates", return_value=[object()]),
+        mock.patch.object(login, "_press_button", return_value=True),
+        mock.patch.object(login, "_bring_to_front", return_value=True),
+        mock.patch.object(login, "microsoft_code_input", lambda _w: next(boxes, object())),
+        mock.patch.object(login.time, "sleep"),
+        mock.patch.object(login, "MICROSOFT_OTP_SEND_TIMEOUT_SEC", 0),
+    ):
+        login.microsoft_send_code(object())  # 不抛即通过
+
+
+@pytest.mark.unit
+def test_send_code_raises_when_no_send_button_exists():
+    """连按钮都找不到时，报错要带上"找到过几个同名节点"，别只报一句「点不到」。"""
+    with (
+        mock.patch.object(login, "_ms_otp_send_candidates", return_value=[]),
+        mock.patch.object(login, "dump_microsoft_tree", return_value=""),
+        mock.patch.object(login.time, "sleep"),
+        mock.patch.object(login, "MICROSOFT_OTP_SEND_TIMEOUT_SEC", 0),
+    ):
+        with pytest.raises(login.LaunchError) as exc:
+            login.microsoft_send_code(object())
+    assert "整棵树里没有这个名字" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 登录后「绑定手机号」弹窗
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_bind_confirm_names_never_contain_the_dialog_title_word():
+    """**关键保护**：确定按钮的名字候选里不许有「绑定」。
+
+    弹窗标题就是「绑定手机号」—— 按名字搜会把标题那块 `Text` 当成按钮，
+    点下去什么都没发生，而脚本以为提交过了（比报错更难查）。
+    """
+    assert not any("绑定" in n for n in login._BIND_CONFIRM_NAMES), login._BIND_CONFIRM_NAMES
+
+
+@pytest.mark.unit
+def test_bind_signature_needs_a_control_not_just_the_text():
+    """**关键保护**：光有「绑定手机号」文案不算弹窗，必须有手机号框或发送按钮。
+
+    弹窗可能是主窗口下的子窗 —— 只按文案认，会命中主窗口里别处的字样，
+    于是把主窗口当成弹窗、在里面乱点。
+    """
+    with (
+        mock.patch.object(login, "_names_of", return_value=["绑定手机号", "华硕应用商店"]),
+        mock.patch.object(login, "bind_phone_field", return_value=None),
+        mock.patch.object(login, "bind_send_button", return_value=None),
+    ):
+        assert login._bind_signature(object()) is False
+
+    with (
+        mock.patch.object(login, "_names_of", return_value=["绑定手机号"]),
+        mock.patch.object(login, "bind_phone_field", return_value=object()),
+        mock.patch.object(login, "bind_send_button", return_value=None),
+    ):
+        assert login._bind_signature(object()) is True
+
+
+@pytest.mark.unit
+def test_bind_popup_absent_is_not_a_failure():
+    """没弹 = 账号已绑过，是**正常情况**，不能报错。"""
+    with mock.patch.object(login, "find_bind_dialog", return_value=None):
+        assert login.handle_bind_phone_popup(1, "13800000000", lambda _p: "123456") == "absent"
+
+
+@pytest.mark.unit
+def test_bind_popup_closes_itself_when_no_phone_is_configured():
+    """没配号码时：关掉弹窗 + 返回 skipped。
+
+    关掉是关键 —— 模态窗留着会把后面每条用例都卡住（点不动用户区、退不了登录）。
+    """
+    closed: list[bool] = []
+    with (
+        mock.patch.object(login, "find_bind_dialog", return_value=object()),
+        mock.patch.object(login, "close_bind_dialog", lambda _s: closed.append(True) or True),
+    ):
+        assert login.handle_bind_phone_popup(1, "", lambda _p: "123456") == "skipped"
+    assert closed, "没配号码也必须把弹窗关掉"
+
+
+@pytest.mark.unit
+def test_bind_popup_closes_itself_even_when_a_step_blows_up():
+    """**关键保护**：任何一步挂掉都要把模态弹窗收掉，再让异常往上抛。
+
+    不收的话，用例失败信息会指向绑定弹窗，但**后面每条用例**都跟着一起挂 ——
+    真因被埋在一串同形的失败里。
+    """
+    closed: list[bool] = []
+
+    def _boom(*_a, **_k):
+        raise login.LaunchError("绑定手机号：找不到手机号输入框")
+
+    with (
+        mock.patch.object(login, "find_bind_dialog", return_value=object()),
+        mock.patch.object(login, "close_bind_dialog", lambda _s: closed.append(True) or True),
+        mock.patch.object(login, "fill_bind_phone", _boom),
+    ):
+        with pytest.raises(login.LaunchError):
+            login.handle_bind_phone_popup(1, "13800000000", lambda _p: "123456")
+    assert closed, "挂了也得把绑定弹窗关掉"
+
+
+@pytest.mark.unit
+def test_bind_popup_reports_bound_on_the_happy_path():
+    """正常路径：填号 → 问人要码 → 提交 → 返回 bound。"""
+    asked: list[str] = []
+    with (
+        mock.patch.object(login, "find_bind_dialog", return_value=object()),
+        mock.patch.object(login, "fill_bind_phone", lambda _s, _p: None),
+        mock.patch.object(login, "submit_bind_code", lambda _s, _c: None),
+    ):
+        status = login.handle_bind_phone_popup(
+            1, "13800000000", lambda prompt: asked.append(prompt) or "654321"
+        )
+    assert status == "bound"
+    assert asked, "没有问人要验证码"
+    assert "13800000000" in asked[0], f"提示语里应带号码，好让人核对：{asked[0]}"
+
+
+@pytest.mark.unit
+def test_bind_popup_gives_up_and_closes_when_the_human_presses_enter():
+    """人回车放弃 → 关弹窗 + skipped，绝不留下模态窗。"""
+    closed: list[bool] = []
+    with (
+        mock.patch.object(login, "find_bind_dialog", return_value=object()),
+        mock.patch.object(login, "fill_bind_phone", lambda _s, _p: None),
+        mock.patch.object(login, "close_bind_dialog", lambda _s: closed.append(True) or True),
+    ):
+        assert login.handle_bind_phone_popup(1, "13800000000", lambda _p: "") == "skipped"
+    assert closed

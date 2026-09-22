@@ -384,11 +384,31 @@ def login_with_password_value(pid: int, user: str, password: str) -> str:
     raise LaunchError("登录：提交后未进入已登录态")
 
 
-def _ms_nodes(ms_win):
+def _descendants(win) -> list:
+    """任意 UIA 根节点的后代；元素失效/树在变时返回空表。
+
+    **不抛**是刻意的：调用方大多是"轮询直到出现"的循环，偶发 COMError 应该
+    等价于"这一轮没找到"，而不是把整轮用例崩掉。
+    """
     try:
-        return list(ms_win.descendants())
+        return list(win.descendants())
     except Exception:
         return []
+
+
+def _names_of(win) -> list[str]:
+    """根节点下所有节点的 name（清洗过）。给"靠文案认窗口/认弹窗"的场合用。"""
+    out: list[str] = []
+    for node in _descendants(win):
+        try:
+            out.append(popup_text(node.element_info.name or ""))
+        except Exception:
+            continue
+    return out
+
+
+def _ms_nodes(ms_win):
+    return _descendants(ms_win)
 
 
 def _ms_by_aid(ms_win, aid: str):
@@ -523,25 +543,96 @@ def _ms_by_name(ms_win, keyword: str, exact: bool = False):
     return None
 
 
-def microsoft_send_code(ms_win) -> None:
-    """在「我们向 <邮箱> 发送登录代码。」页点【发送验证码】，触发微软把码发到邮箱。
+def _ms_otp_send_candidates(ms_win) -> list:
+    """「发送验证码」的候选节点，**Button 优先，Text 垫底**。
 
-    点完按钮会从控件树里消失/变成倒计时态，所以**不以按钮状态判成功** ——
-    与 `request_sms_code` 同一个口径：以「邮箱真收到码」为准，下一步等代码框。
+    为什么分先后：webview 里一个按钮常常是 `Button(名=发送验证码)` 里再套一层
+    `Text(名=发送验证码)`。命中里面那个 Text 时 `invoke()` 必然失败，
+    `click_input()` 又只认矩形 —— 点了跟没点一样，**而且不报错**。
+    外层那个 Button 才是能 invoke 的。
+
+    先一次遍历拿全部节点、再在内存里挑（同 `_press_submit_once`）：
+    每个候选各扫一遍整棵树的话，webview 上一轮就是好几秒。
     """
+    buttons: list = []
+    others: list = []
+    for node in _ms_nodes(ms_win):
+        try:
+            name = popup_text(node.element_info.name or "")
+            ctype = node.element_info.control_type or ""
+        except Exception:
+            continue
+        if "发送验证码" in name or "send code" in name.lower():
+            (buttons if ctype == "Button" else others).append(node)
+    return buttons + others
+
+
+def microsoft_send_code(ms_win) -> None:
+    """在「我们向 <邮箱> 发送登录代码。」页点【发送验证码】，**并确认真的发出去了**。
+
+    成功判据是「代码输入框出现」—— 这是页面上唯一与"码已发出"一一对应的可观测变化
+    （按钮本身点完会消失/变倒计时态，`request_sms_code` 早就不拿按钮状态当判据了）。
+
+    **为什么必须验**：webview 上 `invoke()` / `click_input()` 都可能**静默失败**，
+    不验的话现场表现是「脚本压根没点发送，却直接回来问我要码」——
+    人只能自己去点一下，而且看不出哪里不对（2026-09-22 新机实测就是这个）。
+    等不到代码框就落盘控件树再抛错，报错里带上所有候选节点，
+    别让人凭一句「点不到」猜。
+    """
+    # 点之前代码框就在 → 这一页可能已经发过码，验证不了"这次点生效"，不硬判。
+    already = microsoft_code_input(ms_win) is not None
+
     deadline = time.time() + MICROSOFT_OTP_SEND_TIMEOUT_SEC
-    while time.time() < deadline:
-        for node in _ms_nodes(ms_win):
+    seen: list[str] = []
+    clicked = False
+    # **do-while**：先试一次再判超时。写成 `while time.time() < deadline` 的话，
+    # 超时给 0 时一轮都不跑（测试里就是这么撞出来的），而且"第一轮"本来就该跑。
+    while not clicked:
+        for node in _ms_otp_send_candidates(ms_win):
             try:
-                name = popup_text(node.element_info.name or "")
+                info = node.element_info
+                seen.append(f"{info.control_type or '?'} aid={info.automation_id or '-'}")
             except Exception:
-                continue
-            if "发送验证码" in name or "send code" in name.lower():
-                if not _press_button(node):
-                    node.click_input()
-                return
+                seen.append("? aid=-")
+            # `invoke()` 不依赖前台，但退化的 `click_input()` 依赖 ——
+            # 窗口在后面时点击会落到盖住它的那个窗口上（大厅被遮挡时实测就是这样）。
+            # 复用 `_bring_to_front`（它会**确认**真拿到了前台，不只是调一下 set_focus）。
+            _bring_to_front(ms_win)
+            if _press_button(node):
+                clicked = True
+                break
+        if clicked or time.time() >= deadline:
+            break
         time.sleep(0.5)
-    raise LaunchError(f"微软登录：等不到【发送验证码】按钮（{MICROSOFT_OTP_SEND_TIMEOUT_SEC}s）")
+
+    if not clicked:
+        dumped = dump_microsoft_tree(ms_win, "等不到可点的【发送验证码】")
+        raise LaunchError(
+            f"微软登录：等不到可点的【发送验证码】按钮（{MICROSOFT_OTP_SEND_TIMEOUT_SEC}s）"
+            + (f"，找到过 {len(seen)} 个同名节点：{seen}" if seen else "，整棵树里没有这个名字")
+            + (f"，控件树已落盘：{dumped}" if dumped else "")
+        )
+
+    if already:
+        return
+
+    if (
+        wait_microsoft_code_input(
+            ms_win,
+            timeout_sec=MICROSOFT_OTP_PAGE_TIMEOUT_SEC,
+            required=False,  # 超时要自己拼更准的报错（"点了没生效"≠"没找到按钮"）
+        )
+        is not None
+    ):
+        return
+
+    dumped = dump_microsoft_tree(ms_win, "点了【发送验证码】但代码输入框没出现")
+    raise LaunchError(
+        "微软登录：点了【发送验证码】，但代码输入框没出现"
+        f"（{MICROSOFT_OTP_PAGE_TIMEOUT_SEC}s）—— 多半是点没生效（webview 静默失败），"
+        "人也没收到码，先别去邮箱等"
+        + (f"，控件树已落盘：{dumped}" if dumped else "")
+    )
 
 
 def microsoft_code_input(ms_win):
@@ -564,13 +655,28 @@ def microsoft_code_input(ms_win):
     return edits[0] if len(edits) == 1 else None
 
 
-def wait_microsoft_code_input(ms_win):
-    deadline = time.time() + MICROSOFT_OTP_PAGE_TIMEOUT_SEC
+def wait_microsoft_code_input(
+    ms_win,
+    timeout_sec: float | None = None,
+    *,
+    required: bool = True,
+):
+    """等代码输入框。超时行为由 `required` 决定，**因为两个调用方的需求正好相反**：
+
+    - `submit_microsoft_code`：**必须**有框才填得进去，超时是硬失败 → `required=True`（默认）。
+    - `microsoft_send_code`：把"框出现"当**发送成功**的证据，超时要自己拼一句更准的报错
+      （"点了但没生效"和"压根没找到按钮"是两回事）→ `required=False`，超时返回 None。
+    """
+    if timeout_sec is None:
+        timeout_sec = MICROSOFT_OTP_PAGE_TIMEOUT_SEC
+    deadline = time.time() + timeout_sec
     while time.time() < deadline:
         node = microsoft_code_input(ms_win)
         if node is not None:
             return node
         time.sleep(0.5)
+    if not required:
+        return None
     dumped = dump_microsoft_tree(ms_win, "等不到验证码输入框（aid 可能被微软改版）")
     raise LaunchError(
         "微软登录：点【发送验证码】后等不到代码输入框"
@@ -730,3 +836,369 @@ def wait_microsoft_logged_in(pid: int) -> str:
             return popup_text(_by_aid(pid, "Button", "UserInfoPart").element_info.name)
         time.sleep(0.5)
     raise LaunchError("微软登录：提交后未进入已登录态")
+
+
+# ---------------------------------------------------------------------------
+# 登录后「绑定手机号」弹窗（2026-09-22 新机实测新增）
+# ---------------------------------------------------------------------------
+#
+# 现象：在**没绑过手机号**的机器/账号上，登录成功后会弹一个绑定手机号的弹窗，
+# 挡在主界面前面。它和登录弹窗一样是「大厅自己弹的覆盖层」。
+#
+# 为什么放在登录流程里、而不是单开一条用例：**它就是登录流程的一部分**。
+# 不处理它，后面所有步骤都会被这个模态窗卡住；而且它必须在 `logout()` **之前**
+# 处理 —— 模态窗不关，「点用户区 → 退出登录」根本点不动。
+#
+# ⚠️ **控件定位目前是按大厅既有弹窗的命名习惯推的**（登录弹窗 `MobileInputBox` /
+# 忘记密码页 `MobileInput` / 短信页 `CodeInput` + `CodeSendBtn`），
+# **2026-09-22 还没在真机上探过壳**。所以这里刻意做了三件事：
+#   ① 每个控件都按「先 aid 全等、再名字包含」两轮找；
+#   ② 找不到就 `dump_bind_tree()` 落盘**整进程的控件树**再抛错 ——
+#      拿到那棵树就能把 aid 补准，不用让一线重跑一次抓；
+#   ③ 任何失败路径都尽力**关掉弹窗**，绝不把它留在屏幕上连累后面的用例。
+# 探壳补进 `项目知识库/探壳结论.md` 之后，这段注释就可以降级成一句指路。
+
+BIND_DIALOG_TIMEOUT_SEC = 8  # 登录成功后等弹窗出现；没弹 = 已经绑过，不是失败
+BIND_CONTROL_TIMEOUT_SEC = 10  # 弹窗已出现，等里面某个控件变成可交互
+BIND_SUBMIT_TIMEOUT_SEC = 20  # 点「确定」后等弹窗消失（提交要过网络）
+
+# 认「这就是绑定手机号弹窗」的文案特征。**必须带"绑定"二字** ——
+# 只认"手机号"会误命中登录弹窗（那上面也写着手机号）。
+_BIND_MARKERS = ("绑定手机号", "绑定手机", "手机号绑定", "完善手机号", "绑定账号")
+
+# aid 取自大厅既有弹窗的命名习惯，名字关键字是 aid 失配时的退路。
+_BIND_PHONE_AIDS = ("MobileInput", "MobileInputBox", "PhoneInput", "BindMobileInput", "TelInput")
+_BIND_CODE_AIDS = ("CodeInput", "CodeInputBox", "SmsCodeInput", "VerifyCodeInput")
+_BIND_SEND_AIDS = ("CodeSendBtn", "SendBtn", "GetCodeBtn", "CodeSendButton")
+_BIND_SEND_NAMES = ("获取验证码", "发送验证码", "获取短信验证码", "获取校验码")
+_BIND_CONFIRM_AIDS = ("ConfirmBtn", "SetBtn", "BindBtn", "OkBtn", "SubmitBtn")
+# ⚠️ 确认按钮的**名字候选里刻意不放"绑定"**：弹窗标题就是「绑定手机号」，
+# 按名字搜会把标题那块 Text 当成按钮 —— 点下去什么都没发生，而脚本以为提交过了。
+_BIND_CONFIRM_NAMES = ("确定", "确认", "提交", "完成")
+_BIND_CANCEL_AIDS = ("CancelBtn", "closebtn")
+_BIND_CANCEL_NAMES = ("取消", "关闭", "以后再说", "暂不", "跳过")
+
+
+def _bind_dump_path():
+    from pathlib import Path
+
+    return Path(__file__).resolve().parent.parent / "reports" / "bind_ui_dump"
+
+
+def dump_bind_tree(pid: int, reason: str) -> str:
+    """把**本进程所有顶层窗**的控件树落盘（含 control_type / aid / name / 矩形）。
+
+    比 `dump_microsoft_tree` 宽：绑定弹窗可能是主窗口下的子 Window，
+    也可能是独立顶层窗，全落下来才能一次看清它挂在哪、控件叫什么。
+    """
+    from datetime import datetime
+
+    lines = [
+        f"# {reason}",
+        f"# {datetime.now().isoformat(timespec='seconds')}",
+        f"# pid={pid}",
+    ]
+    for h in _top_hwnds():
+        if _hwnd_pid(h) != pid:
+            continue
+        try:
+            win = UIAWrapper(UIAElementInfo(h))
+        except Exception:
+            continue
+        try:
+            title = win.window_text()
+        except Exception:
+            title = ""
+        lines.append(f"===== hwnd={h} visible={_hwnd_visible(h)} title={title!r} =====")
+        for node in _descendants(win):
+            try:
+                info = node.element_info
+                try:
+                    rect = node.rectangle()
+                    box = f"({rect.left},{rect.top},{rect.width()}x{rect.height()})"
+                except Exception:
+                    box = "-"
+                lines.append(
+                    f"{info.control_type or '?':14} aid={info.automation_id or '':30} "
+                    f"name={popup_text(info.name or '')[:100]!r:104} {box}"
+                )
+            except Exception:
+                continue
+
+    target = _bind_dump_path() / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return str(target)
+    except OSError:
+        return ""
+
+
+def _bind_snapshot(scope) -> list[tuple[str, str, str, object]]:
+    """(aid, control_type, name, node) 四元组快照。**一次遍历拿全**，
+    后面的候选匹配全在内存里做 —— 每个候选各扫一遍整棵树的话，
+    这个弹窗上轮询几轮就把超时耗光了。"""
+    out: list[tuple[str, str, str, object]] = []
+    for node in _descendants(scope):
+        try:
+            info = node.element_info
+            out.append(
+                (
+                    info.automation_id or "",
+                    info.control_type or "",
+                    popup_text(info.name or ""),
+                    node,
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _bind_find(scope, aids: tuple[str, ...], names: tuple[str, ...], control_types=None):
+    """弹窗里找一个控件：**先 aid 全等、再名字包含**；都找不到返回 None。"""
+    snapshot = _bind_snapshot(scope)
+
+    def _ok(ctype: str) -> bool:
+        return control_types is None or ctype in control_types
+
+    for aid in aids:
+        for node_aid, ctype, _name, node in snapshot:
+            if node_aid == aid and _ok(ctype):
+                return node
+    for keyword in names:
+        for _aid, ctype, name, node in snapshot:
+            if keyword in name and _ok(ctype):
+                return node
+    return None
+
+
+def _bind_find_button(scope, aids: tuple[str, ...], names: tuple[str, ...]):
+    """按钮类控件：**先只认 `Button`，再放开任意类型**。
+
+    大厅的按钮常常是 `Button` 里套一层 `Text`；但两种都可能出现，
+    所以先严格后宽松。宽松那轮是退路，不放在前面 —— 否则会先把
+    同名的一行说明文字当成按钮点下去。
+    """
+    return _bind_find(scope, aids, names, ("Button",)) or _bind_find(scope, aids, names, None)
+
+
+def bind_phone_field(scope):
+    return _bind_find(scope, _BIND_PHONE_AIDS, (), ("Edit",))
+
+
+def bind_code_field(scope):
+    return _bind_find(scope, _BIND_CODE_AIDS, (), ("Edit",))
+
+
+def bind_send_button(scope):
+    return _bind_find_button(scope, _BIND_SEND_AIDS, _BIND_SEND_NAMES)
+
+
+def bind_confirm_button(scope):
+    return _bind_find_button(scope, _BIND_CONFIRM_AIDS, _BIND_CONFIRM_NAMES)
+
+
+def bind_cancel_button(scope):
+    return _bind_find_button(scope, _BIND_CANCEL_AIDS, _BIND_CANCEL_NAMES)
+
+
+def _bind_signature(scope) -> bool:
+    """这个窗口现在看起来是不是「绑定手机号弹窗」。
+
+    要求**同时**满足：有绑定文案 + 有一个手机号框或发送按钮。
+    只看文案会误命中主窗口里别处的字样（弹窗是主窗口子窗时尤其危险）。
+    """
+    if not any(m in n for n in _names_of(scope) for m in _BIND_MARKERS):
+        return False
+    return bind_phone_field(scope) is not None or bind_send_button(scope) is not None
+
+
+def find_bind_dialog(pid: int, timeout_sec: float = BIND_DIALOG_TIMEOUT_SEC):
+    """等「绑定手机号」弹窗出现；没出现返回 None。
+
+    **没弹不是失败** —— 已经绑过手机号的账号不会再弹，那是正常情况。
+    """
+    deadline = time.time() + timeout_sec
+    while True:
+        for h in _top_hwnds():
+            if not _hwnd_visible(h) or _hwnd_pid(h) != pid:
+                continue
+            try:
+                scope = UIAWrapper(UIAElementInfo(h))
+            except Exception:
+                continue
+            if _bind_signature(scope):
+                return scope
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
+
+
+def fill_bind_phone(scope, phone: str) -> None:
+    """填手机号 → 点「获取验证码」。
+
+    填号用 `set_edit_text` + 真键盘补一遍：大厅的输入框是自绘的，
+    只改 ValuePattern 时界面上的 React/自绘层未必收到 input 事件，
+    按钮可能一直停在不可点状态（微软那个 OTP 页就是这么坑的，见 `submit_microsoft_code`）。
+    """
+    box = None
+    deadline = time.time() + BIND_CONTROL_TIMEOUT_SEC
+    while time.time() < deadline and box is None:
+        box = bind_phone_field(scope)
+        if box is None:
+            time.sleep(0.5)
+    if box is None:
+        dumped = dump_bind_tree(_scope_pid(scope), "找不到绑定弹窗的手机号输入框")
+        raise LaunchError(
+            "绑定手机号：找不到手机号输入框"
+            + (f"，控件树已落盘：{dumped}" if dumped else "")
+        )
+
+    box.set_edit_text(phone)
+    try:
+        box.set_focus()
+        box.type_keys("^a")
+        box.type_keys(phone, with_spaces=True)
+    except Exception:
+        pass  # 退路失败不致命，set_edit_text 大概率已经进去了
+
+    send = None
+    deadline = time.time() + BIND_CONTROL_TIMEOUT_SEC
+    while time.time() < deadline and send is None:
+        send = bind_send_button(scope)
+        if send is None:
+            time.sleep(0.5)
+    if send is None:
+        dumped = dump_bind_tree(_scope_pid(scope), "找不到绑定弹窗的「获取验证码」按钮")
+        raise LaunchError(
+            "绑定手机号：找不到「获取验证码」按钮"
+            + (f"，控件树已落盘：{dumped}" if dumped else "")
+        )
+    if not _press_button(send):
+        dumped = dump_bind_tree(_scope_pid(scope), "「获取验证码」按钮点不动")
+        raise LaunchError(
+            "绑定手机号：「获取验证码」按钮点不动"
+            + (f"，控件树已落盘：{dumped}" if dumped else "")
+        )
+
+
+def submit_bind_code(scope, code: str) -> None:
+    """填短信验证码 → 点确定 → **等弹窗真的消失**才算成功。"""
+    box = bind_code_field(scope)
+    if box is None:
+        dumped = dump_bind_tree(_scope_pid(scope), "找不到绑定弹窗的验证码输入框")
+        raise LaunchError(
+            "绑定手机号：找不到验证码输入框"
+            + (f"，控件树已落盘：{dumped}" if dumped else "")
+        )
+    box.set_edit_text(code)
+    try:
+        box.set_focus()
+        box.type_keys("^a")
+        box.type_keys(code, with_spaces=True)
+    except Exception:
+        pass
+
+    confirm = None
+    deadline = time.time() + BIND_CONTROL_TIMEOUT_SEC
+    while time.time() < deadline and confirm is None:
+        confirm = bind_confirm_button(scope)
+        if confirm is None:
+            time.sleep(0.5)
+    if confirm is None:
+        dumped = dump_bind_tree(_scope_pid(scope), "找不到绑定弹窗的确定按钮")
+        raise LaunchError(
+            "绑定手机号：找不到确定/绑定按钮"
+            + (f"，控件树已落盘：{dumped}" if dumped else "")
+        )
+    if not _press_button(confirm):
+        dumped = dump_bind_tree(_scope_pid(scope), "绑定弹窗的确定按钮点不动")
+        raise LaunchError(
+            "绑定手机号：确定按钮点不动"
+            + (f"，控件树已落盘：{dumped}" if dumped else "")
+        )
+
+    pid = _scope_pid(scope)
+    deadline = time.time() + BIND_SUBMIT_TIMEOUT_SEC
+    while time.time() < deadline:
+        if find_bind_dialog(pid, timeout_sec=0) is None:
+            return
+        time.sleep(0.5)
+
+    dumped = dump_bind_tree(pid, "点了确定但绑定弹窗没消失")
+    raise LaunchError(
+        "绑定手机号：点了确定，但弹窗没消失"
+        f"（{BIND_SUBMIT_TIMEOUT_SEC}s）—— 验证码可能不对，或按钮没点生效"
+        + (f"，控件树已落盘：{dumped}" if dumped else "")
+    )
+
+
+def _scope_pid(scope) -> int:
+    """从 scope 窗口反查 pid。取不到返回 0（落盘/轮询会因此退化成空转，不抛）。"""
+    try:
+        return int(scope.element_info.process_id)
+    except Exception:
+        return 0
+
+
+def close_bind_dialog(scope) -> bool:
+    """尽力关掉绑定弹窗，**关不掉返回 False、不抛**。
+
+    为什么要兜：模态窗留在屏幕上会把**后面每一条**用例都卡住
+    （2026-09-22 微软登录窗就是这么连累短信那条的）。
+    收尾失败不该盖掉用例本身那个真正的失败。
+    """
+    for finder in (bind_cancel_button,):
+        try:
+            btn = finder(scope)
+        except Exception:
+            btn = None
+        if btn is not None and _press_button(btn):
+            return True
+    try:
+        win32gui.PostMessage(scope.handle, 0x0010, 0, 0)  # WM_CLOSE
+        return True
+    except Exception:
+        return False
+
+
+def handle_bind_phone_popup(pid: int, phone: str, ask_code, timeout_sec: float = BIND_DIALOG_TIMEOUT_SEC) -> str:
+    """登录后如果弹了「绑定手机号」，自动走完：填号 → 获取验证码 → 问人要码 → 确定。
+
+    返回：
+      `"absent"`  —— 没弹（账号已绑过）。**正常情况，不是失败。**
+      `"bound"`   —— 绑好了。
+      `"skipped"` —— 弹了但没绑成：没配手机号，或人回车放弃了。
+
+    `ask_code` 是**回调**（测试里传 `_ask_code`），这里不 `input()` ——
+    全项目只有测试文件那一处读 stdin，那一处负责「先切窗口再问人」，
+    散着写会漏掉切窗口而且**不报错**（守卫：`tests/unit/test_manual_loop_policy.py`）。
+
+    ⚠️ 号码走环境变量（`HALL_BIND_PHONE`，回退 `HALL_TEST_USER`），**不落盘、不进 git**。
+    """
+    scope = find_bind_dialog(pid, timeout_sec=timeout_sec)
+    if scope is None:
+        return "absent"
+
+    if not phone:
+        close_bind_dialog(scope)
+        print(
+            "⚠️ 弹出了绑定手机号弹窗，但没配号码（HALL_BIND_PHONE / HALL_TEST_USER 都是空）"
+            "—— 已关掉弹窗，本次不绑。"
+        )
+        return "skipped"
+
+    try:
+        fill_bind_phone(scope, phone)
+        code = ask_code(f"已向 {phone} 发送绑定验证码。输入手机收到的验证码（直接回车放弃绑定）: ")
+        if not code:
+            close_bind_dialog(scope)
+            print("⚠️ 人工放弃绑定手机号（验证码已发出），已关掉弹窗。")
+            return "skipped"
+        submit_bind_code(scope, code)
+        return "bound"
+    except Exception:
+        # 任何一步挂了都要把弹窗收掉 —— 否则后面每条用例都点不动。
+        close_bind_dialog(scope)
+        raise

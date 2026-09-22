@@ -131,7 +131,10 @@ SUITES: dict[str, Suite] = {
         paths=("tests/launch/test_p1_login.py",),
         marker=MARKER_MANUAL,
         parallel="serial",
-        needs="人在环：需交互式终端 + HALL_TEST_USER/PASSWORD/NEW_PASSWORD；会真发短信、真改密码",
+        needs=(
+            "人在环：需交互式终端 + HALL_TEST_USER/PASSWORD/NEW_PASSWORD；"
+            "会真发短信、真改密码、登录后可能真绑手机号（HALL_BIND_PHONE，缺省回退 HALL_TEST_USER）"
+        ),
         farm_safe=False,  # 永不进无人值守农场
         # 2026-09-22 真机踩出：不加 `-s` 时这三条**永远 skip**，整套人在环等于不存在。
         # 详见 build_command 里的实测记录。

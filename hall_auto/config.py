@@ -190,6 +190,17 @@ class Config:
         stored = ((self.raw.get("accounts") or {}).get("microsoft") or {})
         return os.environ.get("HALL_MS_USER") or str(stored.get("email") or "")
 
+    def bind_phone(self) -> str:
+        """登录后「绑定手机号」弹窗要填的号码。
+
+        **默认回退到登录测试号**（`HALL_TEST_USER` / `config.local.yaml`）——
+        绝大多数情况下"要绑的号"就是"登录用的号"，这样新机不用额外配一项。
+        要绑**另一个**号时才单独设 `HALL_BIND_PHONE`。
+
+        只走环境变量 / 已忽略的本机配置，**不落盘、不进 git**（红线：测试号不进仓库）。
+        """
+        return os.environ.get("HALL_BIND_PHONE") or self.test_account()[0]
+
 
 def _read_yaml(path: Path) -> dict:
     if not path.is_file():

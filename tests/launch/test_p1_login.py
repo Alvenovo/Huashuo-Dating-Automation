@@ -10,6 +10,7 @@ from hall_auto.login import (
     _by_aid,
     _by_name,
     close_microsoft_login,
+    handle_bind_phone_popup,
     login_dialog_open,
     login_field_aids,
     login_with_password,
@@ -67,6 +68,25 @@ def _ask_code(prompt: str) -> str:
     """
     focus_console()
     return input(prompt).strip()
+
+
+def _bind_phone_if_prompted(cfg, pid) -> str:
+    """登录成功后处理「绑定手机号」弹窗（**没绑过的账号才弹**）。
+
+    为什么塞在登录用例里、而不是单开一条：
+    1. 它**就是登录流程的一部分** —— 在没绑过的账号上，登录成功紧接着就弹；
+    2. 必须排在 `logout()` **之前** —— 模态弹窗不关，「点用户区 → 退出登录」根本点不动，
+       而后面每条用例开头都要 `logout()`，会被它一路卡住。
+
+    号码走 `HALL_BIND_PHONE`，没配就回退到 `HALL_TEST_USER`（见 `Config.bind_phone`）。
+    没弹返回 `"absent"`，**那是正常情况不是失败**。
+    """
+    status = handle_bind_phone_popup(pid, cfg.bind_phone(), _ask_code)
+    if status == "bound":
+        print("✅ 绑定手机号弹窗：已自动填号 → 点获取验证码 → 提交成功。")
+    elif status == "absent":
+        print("（没有绑定手机号弹窗 —— 该账号已绑过，正常）")
+    return status
 
 
 @pytest.fixture(scope="module")
@@ -182,6 +202,9 @@ def test_microsoft_login_code_manual(cfg, ready_pid):
     会真发登录代码到邮箱。和短信登录同一个口径：只在交互式终端跑
     （非 tty 自动 skip），免得发了码却没人回填、把账号卡在半路。
     邮箱走 HALL_MS_USER，不落盘、不进 git。
+
+    **登录成功后**如果弹出「绑定手机号」（没绑过的账号才弹），会接着自动
+    填号 → 点获取验证码 → 问人要短信码 → 提交（见 `_bind_phone_if_prompted`）。
     """
     email = cfg.microsoft_account()
     if not email:
@@ -208,6 +231,9 @@ def test_microsoft_login_code_manual(cfg, ready_pid):
         name = wait_microsoft_logged_in(ready_pid)
         assert logged_in(ready_pid), "提交验证码后仍未进入已登录态"
         assert "已登录" in name, f"已登录态用户区文案异常: {name!r}"
+        # 没绑过手机号的账号，登录成功后会弹绑定弹窗 —— 它挡着主界面，
+        # 不在这里处理掉，下面的 logout() 就点不动（模态窗）。
+        _bind_phone_if_prompted(cfg, ready_pid)
     finally:
         logout(ready_pid)
         close_microsoft_login(ready_pid)  # 挂在中途也要把登录窗收掉，别连累下一条
@@ -222,6 +248,10 @@ def test_sms_login_manual(cfg, ready_pid):
     会真发短信。只在交互式终端跑（无人值守时 stdin 不是 tty，自动 skip，
     不会发了短信却没人回填）。手机号走 HALL_TEST_USER，不落盘。
     2026-09-16 已按此流程人工实跑通过（尾号 1935，回填后进入已登录态）。
+
+    **登录成功后**如果弹出「绑定手机号」（没绑过的账号才弹），会接着自动
+    填号 → 点获取验证码 → 问人要短信码 → 提交（见 `_bind_phone_if_prompted`），
+    所以这台机器上这条最多要人工回填 **两个** 短信码。
     """
     user, _ = cfg.test_account()
     if not user:
@@ -235,6 +265,8 @@ def test_sms_login_manual(cfg, ready_pid):
     name = login_with_sms_code(ready_pid, code)
     assert logged_in(ready_pid)
     assert user[-5:] in name, f"已登录态应带手机号尾号: {name!r}"
+    # 同微软那条：没绑过的账号会弹绑定弹窗，必须在 logout 之前处理掉。
+    _bind_phone_if_prompted(cfg, ready_pid)
     logout(ready_pid)
     assert not logged_in(ready_pid)
 
