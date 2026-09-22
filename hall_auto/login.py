@@ -20,6 +20,7 @@ MICROSOFT_PAGE_TIMEOUT_SEC = 20  # WebView 里邮箱框出现（实测 ~1.7s，�
 MICROSOFT_SSO_TIMEOUT_SEC = 25  # 点磁贴/提交后回到大厅已登录态
 MICROSOFT_OTP_SEND_TIMEOUT_SEC = 15  # 「我们向 <邮箱> 发送登录代码。」页上【发送验证码】按钮出现
 MICROSOFT_OTP_PAGE_TIMEOUT_SEC = 30  # 点【发送验证码】后代码输入框出现（微软发信有网络往返）
+MICROSOFT_OTP_SUBMIT_TIMEOUT_SEC = 12  # 填完码后提交按钮变可点（页面校验 + 重渲染，别抓一次快照就下结论）
 
 # 「邮箱验证码页」的文本特征。**这一页必须排在 account_picker 之前判** ——
 # 它的正文是「我们向 3330859445@qq.com 发送登录代码。」，**含邮箱**，
@@ -42,6 +43,11 @@ _MICROSOFT_OTP_MARKERS = (
 _MS_OTP_INPUT_AIDS = ("idTxtBx_SAOTCC_OTC", "idTxtBx_SAOTCC_OTC2")
 _MS_OTP_SUBMIT_AIDS = ("idSubmit_SAOTCC_Continue", "idSIButton9")
 _MS_OTP_SUBMIT_NAMES = ("验证", "继续", "下一步", "提交", "Verify", "Continue", "Next")
+
+# 提交按钮的**排除词**。上面 `_MS_OTP_SUBMIT_NAMES` 里有「验证」这种宽词，
+# 而这一页同时挂着【发送验证码】—— 不排掉就会去点"重发"而不是"提交"：
+# 按钮点下去了、看着像成功，实际码又发了一遍，人白等一个。
+_MS_OTP_SUBMIT_AVOID = ("发送", "重新", "获取", "send", "resend", "get new")
 
 
 def _is_microsoft_otp_page(name: str) -> bool:
@@ -428,6 +434,35 @@ def open_microsoft_login(pid: int):
     return _wait_microsoft_window(pid, before)
 
 
+def close_microsoft_login(pid: int) -> bool:
+    """关掉可能还开着的微软登录窗（内嵌 `webBrowser` 面板的那个顶层窗）。
+
+    为什么需要：人在环用例中途挂掉时，这个窗会**留在屏幕上**。
+    它是大厅进程里的独立顶层窗，后面用例去操作大厅登录弹窗时会撞上它 ——
+    2026-09-22 实测：微软那条挂在提交按钮上，紧跟着的短信那条就报
+    「切到页签 '短信验证码登录' 后界面没就绪」，看着像短信的毛病，其实是被连累的。
+    `logout()` 兜不住这种情况：它只在"已登录"时才动作。
+
+    关不掉返回 False，**不抛** —— 收尾失败不该盖掉用例本身那个真正的失败。
+    """
+    closed = False
+    for h in _top_hwnds():
+        if not _hwnd_visible(h) or _hwnd_pid(h) != pid:
+            continue
+        try:
+            win = UIAWrapper(UIAElementInfo(h))
+        except Exception:
+            continue
+        if _ms_by_aid(win, "webBrowser") is None:
+            continue
+        try:
+            win32gui.PostMessage(h, 0x0010, 0, 0)  # WM_CLOSE
+            closed = True
+        except Exception:
+            continue
+    return closed
+
+
 def submit_microsoft_email(ms_win, email: str) -> None:
     """微软登录窗填邮箱（i0116）并点「下一步」（idSIButton9）。"""
     box = None
@@ -543,21 +578,115 @@ def wait_microsoft_code_input(ms_win):
     )
 
 
+def _press_submit_once(ms_win, seen: list[str]) -> bool:
+    """找一轮提交按钮并点它；这一轮没成返回 False。
+
+    **先一次遍历拿全部控件，再在内存里挑** —— 原来每个候选各调一次
+    `_ms_by_aid` / `_ms_by_name`，那俩内部都是一次全树遍历；
+    9 个候选 = 9 次遍历，webview 上一轮就是好几秒，轮询两下就把超时耗光了。
+
+    `seen` 记下**找到过**的候选：报错时能一眼分清"压根没找到"和"找到了点不动" ——
+    这两种的下一步排查方向完全相反。
+    """
+    snapshot: list[tuple[str, str, object]] = []
+    for node in _ms_nodes(ms_win):
+        try:
+            info = node.element_info
+            snapshot.append((info.automation_id or "", popup_text(info.name or ""), node))
+        except Exception:
+            continue
+
+    for aid in _MS_OTP_SUBMIT_AIDS:
+        for node_aid, _text, node in snapshot:
+            if node_aid != aid:
+                continue
+            if aid not in seen:
+                seen.append(aid)
+            if _press_button(node):
+                return True
+
+    for keyword in _MS_OTP_SUBMIT_NAMES:
+        for _aid, text, node in snapshot:
+            if keyword not in text:
+                continue
+            low = text.lower()
+            if any(bad in text or bad in low for bad in _MS_OTP_SUBMIT_AVOID):
+                continue  # 这是【发送验证码】那类，点下去是重发，不是提交
+            if keyword not in seen:
+                seen.append(keyword)
+            if _press_button(node):
+                return True
+    return False
+
+
+def _wait_submit(ms_win, seen: list[str]) -> bool:
+    deadline = time.time() + MICROSOFT_OTP_SUBMIT_TIMEOUT_SEC
+    while time.time() < deadline:
+        if _press_submit_once(ms_win, seen):
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def _bring_to_front(win) -> bool:
+    """把窗口提到前台，并**确认它真拿到了前台**。
+
+    确认这一步不能省：后面要往输入框敲真键盘，敲错窗口就是往别人窗口里打字 ——
+    刚被 `focus_console()` 提到最前的终端就是最可能的受害者。
+    """
+    try:
+        win.set_focus()
+    except Exception:
+        pass
+    try:
+        return win32gui.GetForegroundWindow() == int(win.handle)
+    except Exception:
+        return False
+
+
 def submit_microsoft_code(ms_win, code: str) -> None:
-    """填邮箱收到的验证码并提交。"""
+    """填邮箱收到的验证码并提交。
+
+    2026-09-22 真机报「点不到提交按钮」，根因是**只抓一次快照就下结论**。
+    三个坑叠在一起：
+
+      ① 按钮要等页面校验完才变可点 —— 抓一次就放弃，太早。
+      ② `set_edit_text` 走 UIA ValuePattern，webview 里的 React 输入框
+         **收不到 input 事件**，它自己的 state 还是空 → 按钮一直 disabled。
+         现场表现就是「按钮明明在，就是点不动」。真键盘事件走另一条路，React 认。
+      ③ 提交按钮的候选里有「验证」这种宽词，会撞上【发送验证码】——
+         点下去看着成功，实际是重发，人白等一个码（已用 `_MS_OTP_SUBMIT_AVOID` 排掉）。
+
+    所以流程：填 → **轮询**等可点 → 还不行补真键盘再轮询 → 最后兜一手回车。
+    """
     box = wait_microsoft_code_input(ms_win)
     box.set_edit_text(code)
-    for aid in _MS_OTP_SUBMIT_AIDS:
-        node = _ms_by_aid(ms_win, aid)
-        if node is not None and _press_button(node):
+    seen: list[str] = []
+
+    if _wait_submit(ms_win, seen):
+        return
+
+    # 走到这说明「填了但点不动」，最可能是 webview 没收到输入事件。
+    # ⚠️ 补键盘前必须确认窗口真在前台，否则键盘会敲到别的窗口上。
+    if _bring_to_front(ms_win):
+        try:
+            box.set_edit_text("")
+            box.type_keys("^a")  # 全选，免得和 set_edit_text 填的值拼在一起
+            box.type_keys(code, with_spaces=True)
+        except Exception:
+            pass
+        if _wait_submit(ms_win, seen):
             return
-    for keyword in _MS_OTP_SUBMIT_NAMES:
-        node = _ms_by_name(ms_win, keyword)
-        if node is not None and _press_button(node):
+        try:
+            box.type_keys("{ENTER}")  # 不少 OTP 页回车即提交
             return
+        except Exception:
+            pass
+
     dumped = dump_microsoft_tree(ms_win, "找不到代码提交按钮")
     raise LaunchError(
         "微软登录：填了验证码但点不到提交按钮"
+        f"（找到过的候选：{'、'.join(seen) if seen else '一个都没找到'}）"
         + (f"，控件树已落盘：{dumped}" if dumped else "")
     )
 

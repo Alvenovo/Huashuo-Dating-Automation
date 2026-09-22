@@ -4,10 +4,12 @@ import sys
 
 import pytest
 
+from hall_auto.console import focus_console
 from hall_auto.launch import start_fresh, wait_main_window, wait_until_ready
 from hall_auto.login import (
     _by_aid,
     _by_name,
+    close_microsoft_login,
     login_dialog_open,
     login_field_aids,
     login_with_password,
@@ -50,6 +52,21 @@ def _require_interactive_tty(what: str) -> None:
             f"非交互式终端：{what}。"
             r"请跑 tools\farm_agent.py --local login-manual（或自己终端 pytest -m manual -s）"
         )
+
+
+def _ask_code(prompt: str) -> str:
+    """**先把终端抢到前台**，再读一行。
+
+    脚本操作大厅时会把大厅窗口顶到前台，终端被压在后面 —— 不切窗口的话，
+    人收完码还得自己 Alt+Tab 找回来。点完「发送验证码」立刻把终端提到最前，
+    人只管收码、输码。
+
+    全文件只有这一处 `input()`，是刻意的：让"问人之前先切窗口"变成**结构性的**，
+    而不是散在四处、少写一次就多一次「码发了、人却在别的窗口里干等」。
+    `focus_console()` 拿不到窗口就返回 False，**不该因此失败** —— 人手动切一下即可。
+    """
+    focus_console()
+    return input(prompt).strip()
 
 
 @pytest.fixture(scope="module")
@@ -171,24 +188,29 @@ def test_microsoft_login_code_manual(cfg, ready_pid):
         pytest.skip("缺微软邮箱：设置 HALL_MS_USER")
     _require_interactive_tty("微软验证码要人工开邮箱取码")
     logout(ready_pid)
-    ms_win = open_microsoft_login(ready_pid)
-    submit_microsoft_email(ms_win, email)
-    state = wait_microsoft_state(ready_pid, ms_win, email)
-    if state == "account_picker":
-        pytest.skip("这台机器走的是账号选择器免密分支（无验证码可收），请跑 test_microsoft_login_sso")
-    if state != "email_otp":
-        pytest.skip(f"微软没走邮箱验证码分支（当前 {state}）")
-    microsoft_send_code(ms_win)
-    code = input("微软已向配置的邮箱发送登录代码。输入邮箱收到的验证码（直接回车放弃）: ").strip()
-    if not code:
-        pytest.skip("人工放弃回填（登录代码已发出）")
-    submit_microsoft_code(ms_win, code)
+    # 整条流程裹在 try/finally 里：挂在哪一步都不能把微软登录窗留在屏幕上 ——
+    # 它是大厅进程里的独立顶层窗，留着会把**下一条**用例卡死。
+    # 2026-09-22 实测：这条挂在提交按钮上，紧跟着的 test_sms_login_manual 就报
+    # 「切到页签 '短信验证码登录' 后界面没就绪」—— 那不是它的毛病，是被这条连累的。
     try:
+        ms_win = open_microsoft_login(ready_pid)
+        submit_microsoft_email(ms_win, email)
+        state = wait_microsoft_state(ready_pid, ms_win, email)
+        if state == "account_picker":
+            pytest.skip("这台机器走的是账号选择器免密分支（无验证码可收），请跑 test_microsoft_login_sso")
+        if state != "email_otp":
+            pytest.skip(f"微软没走邮箱验证码分支（当前 {state}）")
+        microsoft_send_code(ms_win)
+        code = _ask_code("微软已向配置的邮箱发送登录代码。输入邮箱收到的验证码（直接回车放弃）: ")
+        if not code:
+            pytest.skip("人工放弃回填（登录代码已发出）")
+        submit_microsoft_code(ms_win, code)
         name = wait_microsoft_logged_in(ready_pid)
         assert logged_in(ready_pid), "提交验证码后仍未进入已登录态"
         assert "已登录" in name, f"已登录态用户区文案异常: {name!r}"
     finally:
         logout(ready_pid)
+        close_microsoft_login(ready_pid)  # 挂在中途也要把登录窗收掉，别连累下一条
     assert not logged_in(ready_pid), "还原登出后应回到未登录态"
 
 
@@ -207,7 +229,7 @@ def test_sms_login_manual(cfg, ready_pid):
     _require_interactive_tty("短信登录要人工回填验证码")
     logout(ready_pid)
     request_sms_code(ready_pid, user)
-    code = input("输入手机收到的短信验证码（直接回车放弃）: ").strip()
+    code = _ask_code("输入手机收到的短信验证码（直接回车放弃）: ")
     if not code:
         pytest.skip("人工放弃回填（验证码已发出）")
     name = login_with_sms_code(ready_pid, code)
@@ -247,7 +269,7 @@ def test_forgot_password_reset_manual(cfg, ready_pid):
         )
     assert _by_name(ready_pid, "Text", "忘记密码", exact=True) is not None, "忘记密码页缺标题「忘记密码」"
     request_forgot_sms(ready_pid, user)
-    code1 = input("【第1次·改成新密码】输入手机收到的重置验证码（回车放弃）: ").strip()
+    code1 = _ask_code("【第1次·改成新密码】输入手机收到的重置验证码（回车放弃）: ")
     if not code1:
         pytest.skip("人工放弃（验证码已发出，密码尚未修改）")
     # 提交一旦发出，密码就可能已变 NEW；放进 try，让 finally 的还原程兜住提交本身报错的情况
@@ -261,7 +283,7 @@ def test_forgot_password_reset_manual(cfg, ready_pid):
         logout(ready_pid)
         open_forgot_password_page(ready_pid)
         request_forgot_sms(ready_pid, user)
-        code2 = input("【第2次·还原原密码】输入手机收到的重置验证码（回车放弃还原）: ").strip()
+        code2 = _ask_code("【第2次·还原原密码】输入手机收到的重置验证码（回车放弃还原）: ")
         if not code2:
             raise AssertionError(
                 "还原中断：账户可能停在【新密码】，请用 HALL_TEST_NEW_PASSWORD 登录后手动改回原密码！"
