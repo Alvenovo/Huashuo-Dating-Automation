@@ -388,6 +388,85 @@ def test_checklist_does_not_use_the_venv_before_bootstrap(doc_texts):
     )
 
 
+# 2026-09-22 用户**真跑**时踩出来的文档缺陷（不是代码缺陷）：
+# 《新机操作清单》第 3 步让人「新开管理员窗口」设环境变量，可新窗口的当前目录是
+# `C:\WINDOWS\system32` —— Windows 的规定，**不继承**你原来那个窗口。
+# 紧接着的第 3.5 步探针用的是**相对路径** `tools\probe_av_quarantine.py`，真机报的是：
+#
+#     can't open file 'C:\WINDOWS\system32\tools\probe_av_quarantine.py'
+#
+# 读起来像「探针被杀了 / 脚本丢了」，真因只是当前目录不对 —— 又一条「报错指向错误方向」。
+# 规则：**管理员窗口那个代码块里必须自带 `cd` 回仓库根**；相对路径命令所在代码块同理
+# （有人会从别处跳回来单敲那一条，见第 12 步的报错对照表）。
+#
+# 锚点用**带空格赋值的那一整行**：附录速查表里的 `$env:HALL_SHARE_USER="hallshare"`
+# 是无空格连写，不该被这条规则管（速查表是给已经会的人抄的，本来就不含 `cd`）。
+_ADMIN_ENV_LINE = '$env:HALL_SHARE_USER = "hallshare"'
+_REPO_CD = "cd C:\\Users\\你的用户名\\Desktop\\Huashuo-Dating-Automation"
+_PROBE_CMD = "tools\\probe_av_quarantine.py"
+
+
+def _fenced_blocks_list(text: str) -> list[str]:
+    """按 ``` 切成**一个个**代码块（`_fenced_blocks` 的逐块版）。
+
+    判断"这条命令能不能照抄"必须**逐块**看：`cd` 落在上一个代码块里、跟命令不在一块，
+    跳着读文档的人就会漏掉 —— 2026-09-22 真机踩的正是这个。
+    """
+    out: list[str] = []
+    cur: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            if inside:
+                out.append("\n".join(cur))
+                cur = []
+            inside = not inside
+            continue
+        if inside:
+            cur.append(line)
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def test_admin_window_blocks_cd_back_to_the_repo(doc_texts):
+    """设共享盘变量那个（管理员窗口）代码块必须自带 `cd` 回仓库根。
+
+    管理员窗口是**全新窗口**，当前目录是 `C:\\WINDOWS\\system32`，而后面
+    `tools\\...` 全是相对路径。缺了 `cd`，下一步报的是「找不到文件」——
+    看着像脚本没了，实际只是当前目录不对。
+    """
+    for name, text in doc_texts.items():
+        blocks = [b for b in _fenced_blocks_list(text) if _ADMIN_ENV_LINE in b]
+        assert blocks, f"{name} 里找不到「设共享盘变量」的代码块 —— 守卫前提没了，先修守卫"
+        for block in blocks:
+            assert _REPO_CD in block, (
+                f"{name} 的「设共享盘变量」代码块里没有 `cd` 回仓库根目录：\n"
+                f"---\n{block}\n---\n"
+                "新开的管理员窗口当前目录是 C:\\WINDOWS\\system32（Windows 规定，不继承旧窗口），"
+                "而后面 `tools\\...` 全是相对路径 —— 不 cd 就会报"
+                "「can't open file 'C:\\WINDOWS\\system32\\tools\\probe_av_quarantine.py'」，"
+                "读起来像探针丢了，真因只是当前目录不对"
+            )
+
+
+def test_probe_command_blocks_cd_back_to_the_repo(doc_texts):
+    """探针命令所在代码块必须自带 `cd` —— 它会被从别处跳回来单独敲。
+
+    第 12 步的报错对照表就写着「先跑探针确认」，照做的人当前目录不保证是仓库根。
+    """
+    for name, text in doc_texts.items():
+        for block in _fenced_blocks_list(text):
+            if _PROBE_CMD not in block:
+                continue
+            assert _REPO_CD in block, (
+                f"{name} 里 `{_PROBE_CMD}` 所在代码块没有 `cd`：\n"
+                f"---\n{block}\n---\n"
+                "这条命令会被从别处跳回来单独敲，当前目录不保证是仓库根；"
+                "在 C:\\WINDOWS\\system32 下敲会报「找不到文件」，把人引向「脚本丢了」这个错方向"
+            )
+
+
 # 2026-09-22 同一次复核查出的**版本口径错**：
 # 离线 `wheelhouse` 是给 Python 3.12 打的（`cp312` 的 wheel + `python-3.12.10-amd64.exe`），
 # 而清单第 1 步让人从 python.org 下「64 位安装包」——今天打开给的是 3.13/3.14。
