@@ -271,3 +271,38 @@ def test_every_unit_file_is_selected_by_the_unit_marker():
         "要么给每条用例加 `@pytest.mark.unit`：\n  " + "\n  ".join(sorted(naked))
     )
 
+
+
+# ---------------- 测试函数不许重名（重名 = 前一份静默不跑）----------------
+#
+# 2026-09-22 清出来的实例：`test_bootstrap_policy.py` 里有 **4 个测试函数被定义了两次**，
+# 是整块粘贴事故。这次 4 对**恰好逐字相同**，所以没丢断言 —— 纯死代码。
+#
+# 但**不能因此就认为它无害**：Python 里后一份覆盖前一份，pytest 又是按属性收集的，
+# 于是**第一份根本不执行**。只要两份**不完全一样**（改了一处、漏改另一处），
+# 就是一条**静默不执行的守卫** —— 屏幕全绿、断言没跑，本项目最怕的那种假绿。
+#
+# 所以判据取「**重名即红**」，不区分内容是否相同：内容相同只是"暂时无害"，
+# 而区分内容需要人去读，读的人会漏。4 对逐字相同的都能藏一个月，何况不一样的。
+#
+# 只查**模块顶层**的 `def test_*`：类里的方法重名是另一回事（且本仓库的测试都是函数式）。
+# 跨文件重名不管 —— 那本来就是允许的（`pytestmark` 按文件生效）。
+
+
+def test_no_test_function_is_defined_twice_in_the_same_file():
+    offenders: list[str] = []
+    for f in sorted((REPO_ROOT / "tests").rglob("*.py")):
+        seen: dict[str, list[int]] = {}
+        for node in ast.parse(f.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                seen.setdefault(node.name, []).append(node.lineno)
+        for name, linenos in seen.items():
+            if len(linenos) > 1:
+                rel = f.relative_to(REPO_ROOT).as_posix()
+                offenders.append(f"{rel}::{name}（行 {', '.join(map(str, linenos))}）")
+
+    assert not offenders, (
+        "同一个文件里测试函数重名 —— **前一份永远不跑**（后一份覆盖它）。"
+        "内容一样就删掉重复的那份；内容不一样更要命：那是一条静默不执行的守卫。\n  "
+        + "\n  ".join(sorted(offenders))
+    )

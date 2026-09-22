@@ -1613,52 +1613,6 @@ def test_wheelhouse_dir_name_is_consistent_across_three_places(bm):
     assert bm.WHEELHOUSE_SHARE_SUBDIR == "wheelhouse"
 
 
-def test_wheelhouse_dir_is_gitignored():
-    """**`wheelhouse/` 必须在 .gitignore 里。**
-
-    为什么是硬要求：`tools/fetch_wheelhouse.py` 的默认落点就是 `<仓库>/wheelhouse`，
-    跑一次就是十几~上百 MB 的 `.whl`。不忽略的话，下一个 `git add -A` 就会把它提交进去
-    —— 体积大到可能直接把 push 卡死，而且事后要改历史才清得掉。
-
-    这类"跑一次就污染仓库"的产物必须靠 gitignore 挡，**不能靠人记得**。
-    """
-    text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
-    entries = {
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    }
-    assert "wheelhouse/" in entries or "wheelhouse" in entries, (
-        f"fetch_wheelhouse.py 的默认落点没被忽略：{sorted(entries)}"
-    )
-
-
-def test_wheelhouse_dir_name_is_consistent_across_three_places(bm):
-    """产出目录名在三处必须一致：`fetch_wheelhouse.py` 的默认落点、
-    `bootstrap` 的查找名、共享盘子目录名。
-
-    不一致的后果很隐蔽：有网机器产出的东西，无网机器**找不到**，而且不报错 ——
-    只是日志里一句"没有离线 wheelhouse"，然后转头去连 pip 源（无网机器上必然失败）。
-    一线会以为是网络问题，实际是两边目录名对不上。
-    """
-    import importlib.util
-
-    path = REPO_ROOT / "tools" / "fetch_wheelhouse.py"
-    spec = importlib.util.spec_from_file_location("fetch_wheelhouse_under_test", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    produced = module.main.__globals__  # 只为拿 REPO_ROOT，不执行 main
-    assert produced["REPO_ROOT"] == bm.REPO_ROOT, "两边算出的仓库根不一致"
-
-    # 产出方默认写到 REPO_ROOT/"wheelhouse"（源码里的字面量），消费方按常量找
-    src = path.read_text(encoding="utf-8")
-    assert 'REPO_ROOT / "wheelhouse"' in src, "产出方的默认落点变了，要同步消费方与 .gitignore"
-    assert bm.WHEELHOUSE_LOCAL_DIRNAME == "wheelhouse"
-    assert bm.WHEELHOUSE_SHARE_SUBDIR == "wheelhouse"
-
-
 # ---------------- 第 12 步自检：失败要说清是哪几条 ----------------
 
 
@@ -1870,36 +1824,6 @@ def test_selftest_still_red_after_retry_is_real_failure(bm, tmp_path, monkeypatc
     joined = "\n".join(st.detail)
     assert "不是偶发" in joined, joined
     assert "仍未过：tests/unit/a.py::test_one" in joined, joined
-
-
-def test_selftest_names_the_known_av_quarantine(bm, tmp_path, monkeypatch):
-    """重跑也红、但红的是 `[Errno 22]` -> 明说"这是杀软误杀，别去改代码"。
-
-    2026-09-21 首台真机就是踩在这个形态上：`Errno 22` 看起来像"共享盘拷贝的 bug"，
-    实际是 Defender 把进程刚写出的临时文件判毒（`GetLastError=225`，见 运行手册 坑 6）。
-    报错必须能指向**下一步该动哪儿**，否则一线只会去改 `fetch.py`。
-    """
-    red = ("FAILED tests/unit/a.py::test_one - OSError: [Errno 22] Invalid argument\n"
-           "1 failed, 9 passed in 3s\n")
-    st, _ = _selftest_with_sequence(
-        bm, monkeypatch, tmp_path, [_fake_run(returncode=1, stdout=red)],
-    )
-
-    joined = "\n".join(st.detail)
-    assert st.ok is False, "环境问题也是问题：这台机器现在确实跑不了这几条，不能判绿"
-    assert "杀软误杀" in joined, joined
-    assert "225" in joined and "坑 6" in joined, joined
-
-
-def test_selftest_does_not_blame_av_for_other_failures(bm, tmp_path, monkeypatch):
-    """普通断言失败不许挂到"杀软"头上 —— 误导比不报更坏。"""
-    red = "FAILED tests/unit/a.py::test_one - AssertionError: 逻辑真的错了\n1 failed, 9 passed in 3s\n"
-    st, _ = _selftest_with_sequence(
-        bm, monkeypatch, tmp_path, [_fake_run(returncode=1, stdout=red)],
-    )
-
-    assert st.ok is False
-    assert "杀软" not in "\n".join(st.detail)
 
 
 def test_selftest_names_the_known_av_quarantine(bm, tmp_path, monkeypatch):
