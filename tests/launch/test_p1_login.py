@@ -32,6 +32,26 @@ from hall_auto.login import (
 from hall_auto.product import stop_main_process
 
 
+def _require_interactive_tty(what: str) -> None:
+    """人在环用例的统一门禁：stdin 不是真终端就 skip，绝不发码/改密码。
+
+    ⚠️ **默认捕获下 `sys.stdin` 被 pytest 换成 `DontReadFromInput`，`isatty()` 恒为 False**
+    —— 所以这个 skip 不是"偶发"，是"**没加 `-s` 就必发**"：三条人在环用例会一句不落地全 skip，
+    而 `farm_agent` 照打「退出码 0」，看着像「跑过了、只是没到条件」，实际是这套功能从没执行过。
+    就算绕过这个守卫，`input()` 也会抛
+    `OSError: pytest: reading from stdin while output is captured! Consider using -s.`
+
+    `-s` 由套件定义自己带（`hall_auto/suites.py` 的 `build_command`，`login-manual` 标了
+    `interactive=True`），所以走 `farm_agent --local login-manual` 自动就有；
+    手敲 pytest 必须自己加。实测对照见 `build_command` 的注释。
+    """
+    if not sys.stdin.isatty():
+        pytest.skip(
+            f"非交互式终端：{what}。"
+            r"请跑 tools\farm_agent.py --local login-manual（或自己终端 pytest -m manual -s）"
+        )
+
+
 @pytest.fixture(scope="module")
 def ready_pid(cfg):
     """登录弹窗/用户菜单会顶掉主窗口句柄，所以趁窗口健康时记下 pid，后面一律按进程找控件。"""
@@ -149,8 +169,7 @@ def test_microsoft_login_code_manual(cfg, ready_pid):
     email = cfg.microsoft_account()
     if not email:
         pytest.skip("缺微软邮箱：设置 HALL_MS_USER")
-    if not sys.stdin.isatty():
-        pytest.skip("非交互式终端：微软验证码要人工开邮箱取码，请在自己终端跑 -m manual")
+    _require_interactive_tty("微软验证码要人工开邮箱取码")
     logout(ready_pid)
     ms_win = open_microsoft_login(ready_pid)
     submit_microsoft_email(ms_win, email)
@@ -185,8 +204,7 @@ def test_sms_login_manual(cfg, ready_pid):
     user, _ = cfg.test_account()
     if not user:
         pytest.skip("缺手机号：设置 HALL_TEST_USER")
-    if not sys.stdin.isatty():
-        pytest.skip("非交互式终端：短信登录要人工回填验证码，请在自己终端跑 -m manual")
+    _require_interactive_tty("短信登录要人工回填验证码")
     logout(ready_pid)
     request_sms_code(ready_pid, user)
     code = input("输入手机收到的短信验证码（直接回车放弃）: ").strip()
@@ -218,8 +236,7 @@ def test_forgot_password_reset_manual(cfg, ready_pid):
         pytest.skip("缺凭据：设置 HALL_TEST_USER / HALL_TEST_PASSWORD / HALL_TEST_NEW_PASSWORD")
     if new_password == old_password:
         pytest.skip("新密码与原密码相同，往返验证证明不了密码真被改过；换一个不同的 HALL_TEST_NEW_PASSWORD")
-    if not sys.stdin.isatty():
-        pytest.skip("非交互式终端：改密码要人工回填两次验证码，请在自己终端跑 -m manual")
+    _require_interactive_tty("改密码要人工回填两次验证码")
 
     # 第一程 OLD -> NEW
     logout(ready_pid)

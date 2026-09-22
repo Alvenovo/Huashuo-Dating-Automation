@@ -493,13 +493,17 @@ def main() -> int:
         log = REPO_ROOT / "reports" / "farm" / f"local_{args.local}.log"
         # 人在环套件用 --local 跑时**必须交互**：它的全部意义就是让人在终端输验证码，
         # 输出被重定向进日志的话提示语到不了终端，人只能干等。
-        # 判据用 farm_safe 而不是硬写 login-manual：以后再加人在环套件不用改这里。
+        # 判据取套件自己的 `interactive`（不是硬写 login-manual，也不是反推 farm_safe）：
+        # 以后再加人在环套件只要在 SUITES 里标上就行。
+        # ⚠️ 光这里不重定向**还不够** —— pytest 自己那层捕获要套件定义带的 `-s` 才关得掉，
+        # 否则 `sys.stdin.isatty()` 恒 False，三条用例全 skip 还打「退出码 0」。
+        # 2026-09-22 真机踩过，见 hall_auto/suites.py 的 build_command。
         rc, _creds = run_suite(
             args.local,
             args.shard_id,
             args.shard_count,
             log,
-            interactive=not get_suite(args.local).farm_safe,
+            interactive=get_suite(args.local).interactive,
         )
         print(f"套件 {args.local} 退出码 {rc}，日志 {log}")
         return rc

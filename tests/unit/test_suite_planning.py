@@ -214,3 +214,51 @@ def test_resolve_suite_names_can_mix_keyword_and_names():
     """`all,install` 这种混写：关键字展开后仍保序，且不重复。"""
     names = suites.resolve_suite_names("all,unit")
     assert names == list(suites.FULL_RUN_SUITES)
+
+
+@pytest.mark.unit
+def test_interactive_suite_gets_dash_s():
+    """**关键保护**：人在环套件的 pytest 命令必须带 `-s`。
+
+    2026-09-22 真机踩出：pytest 默认捕获会把 `sys.stdin` 换成 `DontReadFromInput`，
+    于是测试体里的 `sys.stdin.isatty()` **恒为 False** —— 三条人在环用例全 skip，
+    而 `farm_agent` 照打「退出码 0」，看着像「跑过了、只是没到条件」，
+    **实际是这套功能从没执行过**。就算绕过那个守卫，`input()` 也会抛
+    `OSError: pytest: reading from stdin while output is captured! Consider using -s.`
+
+    这条红了**别改断言**，去改 `hall_auto/suites.py` 的 `build_command`。
+    """
+    argv = suites.build_command(get_suite("login-manual"))
+    assert "-s" in argv, f"人在环套件没带 -s，整套会静默全 skip：{argv}"
+
+
+@pytest.mark.unit
+def test_only_interactive_suites_get_dash_s():
+    """反向锁：`-s` 只给人在环套件。
+
+    无人值守套件带上 `-s`，pytest 就不再捕获它的输出，证据目录里的输出段会变空 ——
+    不致命，但等于白白多出「这轮为什么没输出」一个排查方向。
+    """
+    for name, suite in SUITES.items():
+        has_dash_s = "-s" in suites.build_command(suite)
+        assert has_dash_s is suite.interactive, (
+            f"{name}: 命令里 -s={has_dash_s}，但 interactive={suite.interactive} —— 两边对不上"
+        )
+
+
+@pytest.mark.unit
+def test_interactive_suites_are_never_farm_safe():
+    """人在环 ⇒ 绝不进无人值守农场。两个标记互斥。
+
+    写反了的后果是农场卡死：节点无人应答却问了「要不要参与人在环」，
+    或者反过来 —— 人在环套件被当成无人值守投出去，节点在 `input()` 上永久阻塞。
+    """
+    for name, suite in SUITES.items():
+        if suite.interactive:
+            assert not suite.farm_safe, f"{name} 标了 interactive 却还是 farm_safe"
+
+
+@pytest.mark.unit
+def test_login_manual_keeps_its_interactive_flag():
+    """`login-manual` 的 interactive 位别被顺手删掉 —— 删了 `-s` 就没了，整套静默失效。"""
+    assert get_suite("login-manual").interactive is True

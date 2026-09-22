@@ -47,6 +47,9 @@ class Suite:
     max_concurrent  limited 时的并发上限；serial 恒为 1
     needs       运行前提（写给人看，缺则整套 skip / 报错）
     farm_safe   是否能进无人值守农场。manual（人在环）永远 False。
+    interactive 需要真人守着的交互式终端。会给 pytest 加 `-s`（**不加必挂**，
+                理由见 `build_command`），调用方也不该重定向它的 stdout。
+                必然 `farm_safe=False` —— 两者互斥，有守卫锁着。
     """
 
     name: str
@@ -56,6 +59,7 @@ class Suite:
     max_concurrent: int = 0
     needs: str = ""
     farm_safe: bool = True
+    interactive: bool = False
 
     def concurrency(self) -> int:
         """本套件允许的最大并发机器数。"""
@@ -129,6 +133,9 @@ SUITES: dict[str, Suite] = {
         parallel="serial",
         needs="人在环：需交互式终端 + HALL_TEST_USER/PASSWORD/NEW_PASSWORD；会真发短信、真改密码",
         farm_safe=False,  # 永不进无人值守农场
+        # 2026-09-22 真机踩出：不加 `-s` 时这三条**永远 skip**，整套人在环等于不存在。
+        # 详见 build_command 里的实测记录。
+        interactive=True,
     ),
     "settings": Suite(
         name="settings",
@@ -217,6 +224,24 @@ def build_command(suite: Suite, *, shard: int = 1, of: int = 1, extra: list[str]
     这两个自定义选项（在 tests/conftest.py 里实现）。
     """
     argv = [*suite.paths, "-m", suite.marker, "-v"]
+    if suite.interactive:
+        # `-s` 是**必需项，不是可选优化**。2026-09-22 真机实测（`--local login-manual`）：
+        #
+        #   pytest 默认捕获会把 `sys.stdin` 换成 `DontReadFromInput`，于是测试体里的
+        #   `sys.stdin.isatty()` **恒为 False** —— 三条人在环用例一句不落地全 skip，
+        #   而 `farm_agent` 照打「退出码 0」，看着像「跑过了、只是没到条件」，
+        #   实际是**这套功能从没被执行过**。
+        #   就算跳过守卫，`input()` 也会抛
+        #   `OSError: pytest: reading from stdin while output is captured! Consider using -s.`
+        #
+        # 实测对照（同一台机、同一条探针用例）：
+        #   默认捕获 → type(sys.stdin)=DontReadFromInput，isatty()=False，input() 抛 OSError
+        #   加 `-s`   → type(sys.stdin)=TextIOWrapper，    isatty()=True， input() 正常读
+        #
+        # 所以这条**不能靠"人记得加 -s"**：必须由套件定义自己带上，
+        # 否则 `farm_agent --local login-manual` 这条路永远是假的。
+        # 守卫：tests/unit/test_suite_planning.py。
+        argv.append("-s")
     if of > 1:
         argv += [f"--shard-id={shard}", f"--shard-count={of}"]
     if extra:

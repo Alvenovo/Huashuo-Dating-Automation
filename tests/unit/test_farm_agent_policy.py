@@ -496,8 +496,14 @@ def test_manual_suite_matches_the_one_dispatch_refuses_to_send():
     """
     from hall_auto.suites import get_suite
 
-    assert get_suite(farm_agent.MANUAL_SUITE).farm_safe is False
+    suite = get_suite(farm_agent.MANUAL_SUITE)
+    assert suite.farm_safe is False
     assert farm_agent.MANUAL_SUITE == "login-manual"
+    # 还必须是 interactive —— 人在环这条链路上它管两件事：`run_suite` 不重定向 stdout，
+    # 以及 `build_command` 给 pytest 带 `-s`。少了 `-s`，pytest 默认捕获会让
+    # `sys.stdin.isatty()` 恒 False，三条用例全 skip 却照报「退出码 0」，
+    # **整套静默失效**（2026-09-22 真机踩过）。
+    assert suite.interactive is True
 
 
 def _boom_if_called(*_args, **_kwargs):
