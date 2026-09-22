@@ -556,3 +556,111 @@ def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
     manual = [r for r in receipt["results"] if r["suite"] == farm_agent.MANUAL_SUITE]
     assert manual and manual[0].get("interactive") is True
 
+
+# ---------- 人在环提示语的**内容** ----------
+#
+# 提示语是人在环**唯一的预告**：人照着它准备手机和邮箱。
+# 它写错一个字，现场就是「码发了、人却没在等」，而终端上看着一切正常。
+# 2026-09-22 用户指出两处：① 微软那条**不只**要邮箱码，登录成功后还会弹
+# 「绑定手机号」再要 1 个短信码；② 报码顺序和实际执行顺序是反的。
+
+# 每条用例「主要收哪种码」的期望关键词。**不是**穷举，是防「标签写串行」：
+# 微软那条如果被写成只要短信，人就不会去开邮箱。
+_EXPECTED_CODE_KIND = {
+    "test_microsoft_login_code_manual": "邮箱",
+    "test_sms_login_manual": "短信",
+    "test_forgot_password_reset_manual": "密码",
+}
+
+
+def _manual_test_order_in_source() -> list[str]:
+    """按**文件顺序**取出 `tests/launch/test_p1_login.py` 里 `-m manual` 的用例名。
+
+    **为什么要读源码而不是写死**：提示语的顺序必须等于 pytest 的实际执行顺序，
+    而 pytest 不改文件顺序。写死的话，以后谁调整了用例位置，
+    提示语会静默地和实际顺序对不上 —— 正是本轮修的那个 bug 的成因。
+    """
+    import ast
+
+    src = (REPO_ROOT / "tests" / "launch" / "test_p1_login.py").read_text(encoding="utf-8")
+    names: list[str] = []
+    for node in ast.parse(src).body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        marks = {
+            dec.attr
+            for dec in node.decorator_list
+            if isinstance(dec, ast.Attribute) and isinstance(dec.value, ast.Attribute)
+        }
+        if {"login", "manual"} <= marks:
+            names.append(node.name)
+    return names
+
+
+def _prompt_text(monkeypatch) -> str:
+    """把提示语整段抓下来（回空串 = 不参与，不触发任何后续动作）。
+
+    ⚠️ **不能用 `capsys`**：`_pretend_terminal` 把 `sys.stdout` 换成了自己的
+    `_Tty`，提示语全写进那个 StringIO，pytest 的捕获里一个字都没有
+    （本轮真踩了一次：断言报 `'绑定手机号' in ''`）。所以直接读那个 sink。
+    """
+    sink = _Tty()
+    monkeypatch.setattr(farm_agent.sys, "stdin", _Tty())
+    monkeypatch.setattr(farm_agent.sys, "stdout", sink)
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    assert farm_agent.ask_manual_participation() is False
+    return sink.getvalue()
+
+
+def test_manual_prompt_order_matches_the_test_file(monkeypatch):
+    """报码顺序必须**等于** `test_p1_login.py` 里 `-m manual` 用例的文件顺序。
+
+    原来提示语把「短信登录」写在「微软登录」前面，实际跑的是微软先 ——
+    人按提示先掏手机，第一条要的却是邮箱码。
+    """
+    out = _prompt_text(monkeypatch)
+
+    declared = [name for name, _label in farm_agent.MANUAL_SEQUENCE]
+    assert declared == _manual_test_order_in_source(), (
+        "MANUAL_SEQUENCE 的顺序与 test_p1_login.py 里 -m manual 用例的文件顺序不一致："
+        f"提示语={declared}"
+    )
+
+    # 顺序断言之外还要锁「标签没写串行」：微软那条必须提邮箱，不是只提短信。
+    for name, label in farm_agent.MANUAL_SEQUENCE:
+        assert _EXPECTED_CODE_KIND[name] in label, f"{name} 的标签没提它主要收哪种码：{label}"
+
+    # 提示语必须真按这个顺序打出来（不是常量躺着没人用）
+    positions = [out.index(label) for _name, label in farm_agent.MANUAL_SEQUENCE]
+    assert positions == sorted(positions), "提示语没按 MANUAL_SEQUENCE 的顺序打印"
+    assert len(positions) == len(farm_agent.MANUAL_SEQUENCE)
+
+
+def test_manual_prompt_warns_about_the_bind_sms_code(monkeypatch):
+    """**关键保护**：提示语必须写明「登录成功后可能弹绑定手机号、还要再给 1 个短信码」。
+
+    用户 2026-09-22 指出：微软那条**不只**要邮箱码 —— 邮箱验证通过、登录成功后，
+    没绑过号的账号会弹「绑定手机号」，脚本自动填号 + 自动点「获取验证码」，
+    然后**还要人再给 1 个短信码**。提示语漏掉它，人只准备了邮箱、手机不在手边，
+    就卡在那个弹窗上（模态窗，还挡着后面每条用例）。
+    """
+    out = _prompt_text(monkeypatch)
+
+    assert "绑定手机号" in out, "提示语没提「绑定手机号」弹窗"
+    assert "短信码" in out, "提示语没提要额外再给 1 个短信码"
+    # 「会弹窗」但不说要码等于没说 —— 断言这两件事在同一句里
+    warning = "".join(farm_agent._MANUAL_BIND_WARNING)
+    assert "绑定手机号" in warning and "短信码" in warning
+    for line in farm_agent._MANUAL_BIND_WARNING:
+        assert line in out, f"绑定提示没打进终端：{line!r}"
+
+
+def test_manual_prompt_says_which_codes_need_a_phone(monkeypatch):
+    """手机必须在手边 —— 否则人只拿邮箱来，第 2 条开始就废了。
+
+    这一条防的是「把绑定码从提示里删掉」这类回退：只要还要求手机，
+    就必须有那句提醒；哪天真的不需要手机了，这条会红，提醒改文档而不是静默。
+    """
+    out = _prompt_text(monkeypatch)
+    assert "手机" in out
+

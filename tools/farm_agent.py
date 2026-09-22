@@ -318,6 +318,28 @@ def run_suite(
 # 与 suites.py 的 farm_safe=False 是同一条约束的两侧，改一边要改另一边。
 MANUAL_SUITE = "login-manual"
 
+# 人在环要跑的用例，**顺序就是终端里报码的顺序**，也**必须**是
+# `tests/launch/test_p1_login.py` 里 `-m manual` 选中那三条的**文件顺序**（pytest 不改顺序）。
+#
+# 为什么把「顺序」也做成常量：提示语原来把「短信登录」写在「微软登录」前面，
+# 与实际执行顺序相反 —— 人照着提示准备，第一条就撞上没预告的邮箱码，
+# 而那时手机可能还在充电。守卫会拿真实文件顺序来对（见 test_farm_agent_policy.py）。
+MANUAL_SEQUENCE: tuple[tuple[str, str], ...] = (
+    ("test_microsoft_login_code_manual", "微软登录     —— 1 个邮箱验证码（发到 HALL_MS_USER 那个邮箱）"),
+    ("test_sms_login_manual", "短信登录     —— 1 个手机短信验证码（会真发短信）"),
+    ("test_forgot_password_reset_manual", "忘记密码往返 —— 2 个手机短信验证码（会真把测试号密码改两次再改回）"),
+)
+
+# 「绑定手机号」弹窗要额外收的码。**必须写在提示语里**（2026-09-22 用户指出）：
+# 微软那条**不只**要邮箱码 —— 邮箱验证通过、登录成功后，没绑过号的账号会弹绑定弹窗，
+# 脚本自动填号并点「获取验证码」，然后**还要人再给 1 个短信码**。
+# 提示语漏掉它的话，人手边只有邮箱、没手机，就卡在弹窗上了。
+_MANUAL_BIND_WARNING: tuple[str, ...] = (
+    "  ⚠ 手机要备在手边：第 1 条不止要邮箱码 —— 邮箱验证通过、登录成功后会弹",
+    "     「绑定手机号」（没绑过的账号才弹）：脚本自动填号 + 自动点「获取验证码」，",
+    "     然后**再向你要 1 个短信码**。第 2 条同理。绑过号的账号一条都不多要。",
+)
+
 # 认「能」的回复。中文单字必须显式列出来：`input().lower()` 对「能」没影响，
 # 但只认 y/yes 的话，按需求回「能」的人会被当成拒绝。
 _MANUAL_YES = frozenset({"能", "可以", "好", "是", "行", "y", "yes", "ok", "1"})
@@ -352,10 +374,11 @@ def ask_manual_participation() -> bool:
         return False
     print("\n" + "=" * 62, flush=True)
     print("自动套件已跑完。是否现在参与人在环？", flush=True)
-    print("  参与后会在本终端依次向你要这几个验证码：", flush=True)
-    print("    1) 短信登录        —— 1 个手机短信验证码（会真发短信）", flush=True)
-    print("    2) 微软登录        —— 1 个邮箱验证码（发到 HALL_MS_USER 那个邮箱）", flush=True)
-    print("    3) 忘记密码往返    —— 2 个手机短信验证码（会真把测试号密码改两次再改回）", flush=True)
+    print("  参与后按**下面这个顺序**向你要码（顺序固定，别按别的顺序准备）:", flush=True)
+    for idx, (_name, label) in enumerate(MANUAL_SEQUENCE, 1):
+        print(f"    {idx}) {label}", flush=True)
+    for line in _MANUAL_BIND_WARNING:
+        print(line, flush=True)
     print("=" * 62, flush=True)
     try:
         answer = input("输入「能」开始（直接回车跳过）: ").strip().lower()

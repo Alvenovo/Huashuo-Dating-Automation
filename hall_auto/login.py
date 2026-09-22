@@ -196,7 +196,19 @@ def login_field_aids(pid: int) -> dict[str, str]:
 
 
 def logout(pid: int) -> None:
-    """已登录时点用户区会开独立菜单窗（标题「华硕应用商店」），内有退出登录。"""
+    """已登录时点用户区会开独立菜单窗（标题「华硕应用商店」），内有退出登录。
+
+    **先收掉可能还开着的「绑定手机号」模态弹窗**（2026-09-22 补）：
+    那个弹窗挡在主界面前面，用户区点不动 → 这里会抛「退出登录：点不开用户菜单」，
+    看着像登出功能坏了，实际是被模态窗挡着。
+    **不在这里兜的话，只有人在环那两条会处理它** —— 无人值守的 SSO 那条
+    （`test_microsoft_login_sso`）登进去就弹、弹完直接走 finally 里的 logout，
+    报的是登出失败，**与真缺陷同形**。
+    放在 `logout()` 里而不是逐条用例加，是因为它被每条登录用例开头结尾都调用，
+    一处改完全都盖住（这也是 `close_bind_dialog` 那段注释说的「模态窗连累后面每一条」）。
+    """
+    if dismiss_bind_dialog(pid):
+        print("（退出登录前先关掉了残留的「绑定手机号」弹窗 —— 它挡着用户区）")
     if not logged_in(pid):
         return
     entry = _by_aid(pid, "Button", "UserInfoPart")
@@ -1161,6 +1173,21 @@ def close_bind_dialog(scope) -> bool:
         return True
     except Exception:
         return False
+
+
+def dismiss_bind_dialog(pid: int, timeout_sec: float = 0.0) -> bool:
+    """弹了绑定手机号就关掉，**不绑**。返回是否真关掉了一个。
+
+    **给无人值守的场合用**：那里没人能输短信码，`handle_bind_phone_popup` 那条
+    「填号 → 发码 → 问人要码」的路走不通，只能把它关掉、别让它挡着后续用例。
+
+    `timeout_sec` 默认 **0** = 只探一次、不等待。这里要的是「顺手清掉残留」，
+    不是「等它出现」—— 等待会把每条登出用例都拖慢 `BIND_DIALOG_TIMEOUT_SEC`。
+    """
+    scope = find_bind_dialog(pid, timeout_sec=timeout_sec)
+    if scope is None:
+        return False
+    return close_bind_dialog(scope)
 
 
 def handle_bind_phone_popup(pid: int, phone: str, ask_code, timeout_sec: float = BIND_DIALOG_TIMEOUT_SEC) -> str:

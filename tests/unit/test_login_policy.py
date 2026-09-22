@@ -416,3 +416,60 @@ def test_bind_popup_gives_up_and_closes_when_the_human_presses_enter():
     ):
         assert login.handle_bind_phone_popup(1, "13800000000", lambda _p: "") == "skipped"
     assert closed
+
+
+@pytest.mark.unit
+def test_dismiss_bind_dialog_is_a_single_non_blocking_probe():
+    """`dismiss_bind_dialog` 默认**不等待**（timeout=0），弹了才关、没弹返回 False。
+
+    等待会把每条登出用例都拖慢一个 `BIND_DIALOG_TIMEOUT_SEC` —— 它的用途是
+    「顺手清掉残留」，不是「等它出现」。
+    """
+    seen: list[float] = []
+    with mock.patch.object(login, "find_bind_dialog", lambda _pid, timeout_sec=0.0: seen.append(timeout_sec) or None):
+        assert login.dismiss_bind_dialog(1) is False
+    assert seen == [0.0], f"默认必须是一次非阻塞探针，实际 timeout={seen}"
+
+    closed: list[bool] = []
+    with (
+        mock.patch.object(login, "find_bind_dialog", lambda _pid, timeout_sec=0.0: object()),
+        mock.patch.object(login, "close_bind_dialog", lambda _s: closed.append(True) or True),
+    ):
+        assert login.dismiss_bind_dialog(1) is True
+    assert closed
+
+
+@pytest.mark.unit
+def test_logout_dismisses_leftover_bind_dialog_before_touching_the_user_area():
+    """**关键保护**：`logout()` 必须**先**收掉残留的「绑定手机号」模态弹窗，再点用户区。
+
+    为什么这条值得单锁：无人值守的 SSO 那条（`test_microsoft_login_sso`）登进去
+    就可能弹这个窗，它挡着用户区 → 直接点会抛「退出登录：点不开用户菜单」，
+    **与"登出功能坏了"同形**，排查方向全错。人在环那两条会自己处理弹窗，
+    所以这个假红只在无人值守那条上出现 —— 最难归因的一类。
+    """
+    order: list[str] = []
+    with (
+        mock.patch.object(
+            login, "dismiss_bind_dialog", lambda _pid, timeout_sec=0.0: order.append("dismiss") or True
+        ),
+        mock.patch.object(login, "logged_in", lambda _pid: True),
+        # 点不到用户区 → 抛 LaunchError，用来证明 dismiss 已经先跑过了
+        mock.patch.object(login, "_by_aid", lambda *a, **k: order.append("by_aid") or None),
+    ):
+        with pytest.raises(login.LaunchError):
+            login.logout(1)
+    assert order == ["dismiss", "by_aid"], f"必须先收弹窗再点用户区，实际顺序 {order}"
+
+
+@pytest.mark.unit
+def test_logout_still_returns_early_when_already_logged_out():
+    """已登出时 `logout()` 仍然直接返回 —— 不能因为加了清弹窗就多跑一趟点击。"""
+    pressed: list = []
+    with (
+        mock.patch.object(login, "dismiss_bind_dialog", lambda _pid, timeout_sec=0.0: False),
+        mock.patch.object(login, "logged_in", lambda _pid: False),
+        mock.patch.object(login, "_by_aid", lambda *a, **k: pressed.append(a) or None),
+    ):
+        login.logout(1)
+    assert pressed == []
