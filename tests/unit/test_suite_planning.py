@@ -25,6 +25,34 @@ def test_manual_suite_never_farm_safe():
 
 
 @pytest.mark.unit
+def test_login_suite_marker_excludes_manual_tests():
+    """`login` 套件的 marker 必须排除 manual —— 漏了会把农场节点卡死、还真发短信。
+
+    `test_sms_login_manual` / `test_forgot_password_reset_manual` **同时带
+    `login` + `manual` 两个 marker**，光写 `"login"` 就会被选进来。
+    唯一守卫是 `sys.stdin.isatty()`，而 `farm_agent` 起 pytest 时**只重定向了
+    stdout/stderr、没重定向 stdin** → 交互式终端下子进程 isatty 为真 → 不 skip →
+    `input()` 永久阻塞 + 真发短信，那台机器再也取不到下一个任务。
+
+    2026-09-22 实测：`-m login` 收集 17 条，其中 2 条是人在环。
+    `pytest.ini` 里也明写「manual …无人值守套件一律排除」，这条守卫让两边对齐。
+    """
+    marker = get_suite("login").marker
+    assert "not manual" in marker, (
+        f"login 套件的 marker 是 {marker!r} —— 没排除 manual。"
+        "投进农场会让节点卡在等短信验证码的 input() 上，整台机器再也取不到任务。"
+    )
+
+
+@pytest.mark.unit
+def test_login_suite_still_covers_the_plain_login_cases():
+    """排除 manual 别把普通登录用例也排掉了 —— 那是这个套件存在的理由。"""
+    marker = get_suite("login").marker
+    assert "login" in marker.replace("not manual", ""), f"marker 里没有 login：{marker!r}"
+    assert "tests/launch/test_p1_login.py" in get_suite("login").paths
+
+
+@pytest.mark.unit
 def test_server_pressure_suites_are_limited():
     """打服务端 / 厂商 CDN 的套件必须限流；不限并发会被限流产出假失败。"""
     for name in ("install", "apps-lifecycle", "login", "wb"):

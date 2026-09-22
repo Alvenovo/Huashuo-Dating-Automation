@@ -110,7 +110,13 @@ SUITES: dict[str, Suite] = {
     "login": Suite(
         name="login",
         paths=("tests/launch/test_p1_login.py", "tests/launch/test_p1_register.py"),
-        marker="login",
+        # `and not manual` 不能省：test_sms_login_manual / test_forgot_password_reset_manual
+        # **同时带 login + manual 两个 marker**，光写 "login" 会把它们选进来。
+        # 唯一守卫是 `sys.stdin.isatty()`，而 farm_agent 起 pytest 时没重定向 stdin
+        # （只重定向了 stdout/stderr）→ 子进程 isatty 为真 → 不 skip →
+        # 真发短信 + `input()` 永久阻塞 → 那台机器再也取不到下一个任务。
+        # pytest.ini 里也明写「manual …无人值守套件一律排除」，这里对齐。
+        marker="login and not manual",
         parallel="limited",
         # 已确认多机登录不互踢；限流是为了不打爆账号服务，不是防踢
         max_concurrent=5,
