@@ -23,7 +23,7 @@ MICROSOFT_OTP_PAGE_TIMEOUT_SEC = 30  # 点【发送验证码】后代码输入�
 MICROSOFT_OTP_SUBMIT_TIMEOUT_SEC = 12  # 填完码后提交按钮变可点（页面校验 + 重渲染，别抓一次快照就下结论）
 
 # 「邮箱验证码页」的文本特征。**这一页必须排在 account_picker 之前判** ——
-# 它的正文是「我们向 3330859445@qq.com 发送登录代码。」，**含邮箱**，
+# 它的正文是「我们向 <邮箱> 发送登录代码。」，**含邮箱**（真值走 HALL_MS_USER，不落盘），
 # 会被 `email in name` 那条误判成「账号选择器」：脚本去点一块纯文本（点不动），
 # 然后死等已登录态 → 报「提交后未进入已登录态」，看着像登录失败，其实是认错了页面。
 # 2026-09-22 真机截图实锤，见 reports 里那轮的 test_microsoft_login_sso/final.png。

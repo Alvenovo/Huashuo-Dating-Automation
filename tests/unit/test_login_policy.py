@@ -21,7 +21,7 @@ from hall_auto import login
 
 pytestmark = pytest.mark.unit
 
-EMAIL = "3330859445@qq.com"
+EMAIL = "someone@outlook.com"  # 假值：真邮箱只走 HALL_MS_USER，不进仓库
 
 
 class _Node:

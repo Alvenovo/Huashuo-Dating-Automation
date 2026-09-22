@@ -23,6 +23,10 @@
 
 ## 扫描范围与判据（两个都不显然，写清楚）
 
+> 下面这条只约束**机器路径**那条守卫（`os.walk` + `SKIP_DIRS`，只看可执行代码）。
+> 文件末尾的**凭据**守卫走的是 `git ls-files`（"进仓库的东西"为准），
+> 范围含文档 / YAML / 测试夹具 —— 两条的扫描集**故意不一样**，别互相套用。
+
 - 只看 **`.py` / `.ps1`**（可执行代码），且**排除 `tests/`** —— 测试里的路径是夹具数据，
   本来就可以是任意机器路径（如 `test_apps_policy.py` 里解析卸载日志用的 `C:\\Users\\admin\\...`）。
 - 只认**字符串字面量里**的路径：`"C:/Users/xxx/..."`。注释与 docstring 里提到
@@ -35,6 +39,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -354,4 +359,112 @@ def test_no_duplicate_keys_in_dict_literals():
     assert not offenders, (
         "dict 字面量里同一个 key 出现了多次 —— Python 只留最后一个，**前面那个静默消失**。\n  "
         + "\n  ".join(sorted(offenders))
+    )
+
+
+# ---------------------------------------------------------------------------
+# 凭据：仓库里只能出现占位符（2026-09-22 加）
+#
+# 这一节的**扫描范围比上面宽** —— 文档、YAML、ini 全算，而且**不排除 `tests/`**。
+# 起因就是漏在文档和测试夹具里，不是漏在可执行代码里：
+#
+#   - `项目知识库/运行手册.md`：`net user hallshare "<真口令>" /add` 写死，
+#     连同连接命令一起。仓库当时是 **public**。
+#   - `hall_auto/login.py` 的注释 + `tests/unit/test_login_policy.py` 的常量：
+#     各写了一次真实微软测试号邮箱（就是收登录验证码那个账号）。
+#
+# ## 两条守卫都**故意不含任何真值字面值**
+#
+# 把真值写进断言 = 用一个新的泄漏去防旧的泄漏，而且以后改口令还得改测试。
+# 所以只查**形状**：占位符必须是 `<...>`；邮箱 local part 不许是纯数字。
+# ---------------------------------------------------------------------------
+
+TEXT_SUFFIXES = {
+    ".py", ".ps1", ".md", ".yaml", ".yml", ".ini", ".txt", ".json", ".env", ".cfg",
+}
+
+# 共享盘**账号名**（不是凭据 —— 账号名在 `net use` 命令里本来就明文可见）。
+# 抽成常量还有个副作用：报错文案里就不会出现「账号名紧跟一个引号串」的形态，
+# 否则这条守卫会**扫到自己** —— 第一版就是这么红的（报错模板自匹配），
+# 所以连"描述那个形态"的注释也不能照写，只能像这样绕开说。
+SHARE_USER = "hallshare"
+
+# 只在账号名后面跟着引号串的地方找口令 —— 那一定是"拿这个账号去认证"。
+# `-AccountName "hallshare"`（账号名自己）不匹配：账号名与引号之间没有空白。
+_HALLSHARE_QUOTED = re.compile(rf"""{SHARE_USER}\s+["']([^"'\n]*)["']""")
+
+# 允许的形态：`<共享盘密码>` / `<新密码>` 这类占位符
+_PLACEHOLDER = re.compile(r"^<[^<>]+>$")
+
+# 邮箱 local part 是 7 位以上纯数字 —— QQ 号邮箱的形态。
+# `\b` 保证了 `alven3330859445@gmail.com`（git 身份，本地部分以字母开头）不会被误伤。
+_NUMERIC_MAILBOX = re.compile(r"\b\d{7,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _credential_scan_files() -> list[Path]:
+    """仓库里**已被 git 跟踪**的、可能带凭据的文本文件（含文档与测试夹具）。
+
+    用 `git ls-files` 而不是 `os.walk`：这条守卫只管"**进仓库**的东西"。
+    `config.local.yaml` / `farm_node.env` 这类**故意 gitignore 的本机凭据文件**
+    里写真口令是**允许的**（那正是它们存在的意义），扫进来只会变成假红，
+    然后被人把守卫删掉 —— 比没有守卫更糟。
+    """
+    proc = subprocess.run(
+        ["git", "-c", "core.quotePath=false", "ls-files", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"拿不到 git ls-files（{proc.stderr.strip()[:120]}），跳过凭据扫描")
+
+    out: list[Path] = []
+    for rel in proc.stdout.split("\0"):
+        if rel and Path(rel).suffix.lower() in TEXT_SUFFIXES:
+            out.append(REPO_ROOT / rel)
+    return sorted(out)
+
+
+def test_share_credential_is_always_a_placeholder():
+    """凡是用 `hallshare` 认证的地方，口令必须是 `<...>` 占位符。
+
+    真值只走 `HALL_SHARE_PASSWORD` / `farm_node.env`（已 gitignore）；
+    要发给测试同事的发放版由 `tools/sync_handbook.py` 现场替换占位符 ——
+    **仓库那份永远只有占位符**，这就是既有机制，别绕过它。
+    """
+    offenders: list[str] = []
+    for path in _credential_scan_files():
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for value in _HALLSHARE_QUOTED.findall(line):
+                if not _PLACEHOLDER.match(value.strip()):
+                    offenders.append(f'{rel}:{lineno}  ->  {SHARE_USER} "{value}"')
+
+    assert not offenders, (
+        "共享盘口令被写死进了仓库（它本该只走 HALL_SHARE_PASSWORD / farm_node.env）：\n  "
+        + "\n  ".join(offenders)
+        + "\n换成 `<共享盘密码>` 占位符（改密流程那个是 `<新密码>`，见 sync_handbook）。"
+        "\n口径见 AGENTS.md：密码 / 测试号 / 微软邮箱只走环境变量，不落盘、不进 git。"
+    )
+
+
+def test_no_personal_numeric_mailbox_in_repo():
+    """仓库里不许出现「local part 是纯数字」的邮箱（QQ 号邮箱的形态）。
+
+    真邮箱走 `HALL_MS_USER`；写文档和夹具时用 `someone@outlook.com` 这类假值。
+    """
+    offenders: list[str] = []
+    for path in _credential_scan_files():
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for hit in _NUMERIC_MAILBOX.findall(line):
+                offenders.append(f"{rel}:{lineno}  ->  {hit}")
+
+    assert not offenders, (
+        "仓库里出现了 QQ 号形态的个人邮箱（真实测试号邮箱只走 HALL_MS_USER）：\n  "
+        + "\n  ".join(offenders)
+        + "\n占位符用 someone@outlook.com。"
     )
