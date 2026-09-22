@@ -86,6 +86,10 @@ def test_build_env_priority_process_beats_file_beats_task(tmp_path, monkeypatch)
     env_file.write_text("HALL_NODE_ID=from-file\nHALL_TEST_USER=fileuser\n", encoding="utf-8")
 
     monkeypatch.setenv("HALL_NODE_ID", "from-process")
+    # 断言的是「凭据来自本地文件」这一层，所以先把进程里可能存在的 HALL_TEST_USER 清掉。
+    # 不清的话，在节点上跑这条必红：节点进程里带着真实测试号（人显式设的，按设计优先级最高），
+    # 文件里的 fileuser 根本轮不到 —— 那是设计行为，不是缺陷，红的是这条测试的环境隔离。
+    monkeypatch.delenv("HALL_TEST_USER", raising=False)
 
     env, notes = env_pack.build_suite_env(
         task_env={"HALL_NODE_ID": "from-task"},
