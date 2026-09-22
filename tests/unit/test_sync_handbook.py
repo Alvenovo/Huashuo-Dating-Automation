@@ -353,6 +353,66 @@ def test_both_docs_clone_into_the_expected_directory(doc_texts):
             )
 
 
+# 2026-09-22 发新机前复核查出的**顺序错**（《交付前验收.md》第 11 条）：
+# 《新机操作清单》第 3.5 步（关实时保护）让一线跑
+#     .venv\Scripts\python.exe -X utf8 tools\probe_av_quarantine.py
+# 可 `.venv` 要到**第 4 步 bootstrap** 才建出来 —— 全新机器跑到 3.5 步时它还不存在，
+# 报的是「系统找不到指定的路径」，一线会以为 Python 没装好，往错的方向查半天。
+# 探针只用标准库，任何 Python 都能跑。规则：**排在 bootstrap 之前的步骤不许引用 `.venv`**。
+_BOOTSTRAP_CMD = "tools\\bootstrap_machine.ps1"
+_VENV_PY = ".venv\\Scripts\\python.exe"
+
+
+def test_checklist_does_not_use_the_venv_before_bootstrap(doc_texts):
+    """《新机操作清单》的**代码块**里，`.venv\\Scripts\\python.exe` 只能排在 bootstrap 之后。
+
+    `.venv` 是 bootstrap 第 2 步建的。在它之前引用必然「找不到路径」，
+    而那个报错指向的是"Python 好像没装好"，跟真因（`.venv` 还没建）差着十万八千里 ——
+    正是本项目反复治的"报错指向错误方向"那一类。
+
+    **只看代码块**（同 `_fenced_blocks` 的既有口径）：正文里解释"为什么不要用它"是允许的，
+    那正是本节开头那条提示。
+    """
+    blocks = _fenced_blocks(doc_texts["新机操作清单.md"])
+    assert _BOOTSTRAP_CMD in blocks, (
+        f"清单的代码块里找不到 bootstrap 命令（`{_BOOTSTRAP_CMD}`）—— 守卫的前提没了，先修守卫"
+    )
+    bootstrap_at = blocks.index(_BOOTSTRAP_CMD)
+    early = [ln.strip() for ln in blocks[:bootstrap_at].splitlines() if _VENV_PY in ln]
+    assert not early, (
+        "《新机操作清单》在跑 bootstrap 之前就让人敲带 `.venv` 的命令：\n  "
+        + "\n  ".join(early)
+        + "\n`.venv` 要到 bootstrap 第 2 步才建出来，全新机器上这条命令必然报"
+        "「系统找不到指定的路径」，而一线会以为 Python 没装好。"
+        "探针只用标准库，改用系统 `python`"
+    )
+
+
+# 2026-09-22 同一次复核查出的**版本口径错**：
+# 离线 `wheelhouse` 是给 Python 3.12 打的（`cp312` 的 wheel + `python-3.12.10-amd64.exe`），
+# 而清单第 1 步让人从 python.org 下「64 位安装包」——今天打开给的是 3.13/3.14。
+# 有外网的机器没事（首台真机就是 Py 3.13.14 过的，所以这个坑一直没暴露），
+# **无外网的机器会在第 4 步第 2 步硬卡**，而同一份清单还写着「外网也不是必需的」。
+# 规则：两份文档都必须把版本钉到 **3.12**，不许再写「3.x」（那等于"随便装"）。
+def test_both_docs_pin_python_312(doc_texts):
+    """两份文档都要把 Python 版本钉到 3.12，且不许再出现「Python 3.x」这种模糊说法。
+
+    断言**逐行收集违规行**，不直接对整篇文档做 `in` —— 后者失败时 pytest 会把
+    整份文档当 diff 打出来（实测 479 行），真正要看的那一行反而淹了。
+    """
+    for name, text in doc_texts.items():
+        assert "Python 3.12" in text, (
+            f"{name} 没把 Python 版本钉到 3.12 —— 离线 wheelhouse 是 `cp312`，"
+            "装了 3.13/3.14 的无外网机器会在 bootstrap 第 2 步 FAIL"
+        )
+        vague = [ln.strip() for ln in text.splitlines() if "Python 3.x" in ln]
+        assert not vague, (
+            f"{name} 里还有「Python 3.x」—— 那是「版本随便」的意思，"
+            "而离线依赖包只认 3.12。一线照它装 3.13/3.14，无外网机器就卡在第 2 步，"
+            "还得回来重装一遍 Python。违规行：\n  " + "\n  ".join(vague)
+        )
+
+
 # 2026-09-21 第二台真机实测又暴露一个坑，而且是**报错指向错误方向**的那一类：
 #   节点读不到共享盘裸仓库的 pack 文件（那 3 个文件的 ACL 里没有 `hallshare`，
 #   是 `git clone --bare` 走硬链接把本地目录的 ACL 带过来的），
