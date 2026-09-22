@@ -28,8 +28,12 @@ clone 到新机器上那条命令会落空 —— 而文档正是叫新机器的
 
 ## 怎么读结论
 
-- `[1]` 那行出现 `GetLastError=225` -> 本机杀软会拦刚写出的文件，**跟代码无关**。
-- 全都 OK -> 本机没有这个问题；用例红了要去查真代码。
+**只看 `[1]` 段**（下面 `Get-MpThreat*` 是历史账本，机器好了旧记录也照样躺着）：
+
+- `[1]` 出现 `225(ERROR_VIRUS_INFECTED)@0.0s` -> **现在**会拦刚写出的文件，跟代码无关。
+  顺序：① **先更新病毒库**（`Update-MpSignature`）→ 复探；② 仍是 225 才关实时保护 /
+  加排除项。误报跟着**病毒库版本**走：2026-09-21 那批库误报，22:07 更新后自己就好了。
+- `[1]` 全是 `0(OK)@0.0s` -> 本机现在没这个问题。**别关杀软**；用例真红了要去查代码。
 - 根治办法（加 Defender 排除项）与完整链路见 `项目知识库/运行手册.md`「坑 6」。
   ⚠️ 加排除项是**安全策略变更**，要人拍板，别在跑批机器上随手加。
 """
@@ -89,8 +93,13 @@ def win32_read_code(path: Path) -> int:
     return 0
 
 
-def probe_matrix(ext: str, wait_sec: float = 20.0, step: float = 1.0) -> None:
-    """新建一个文件，然后一直读到能读为止 —— 看它多久被判毒/删掉。"""
+def probe_matrix(ext: str, wait_sec: float = 20.0, step: float = 1.0) -> set[int]:
+    """新建一个文件，然后一直读到能读为止 —— 看它多久被判毒/删掉。
+
+    **返回本次亲眼看到的错误码集合**，判读只认它。
+    下面 `Get-MpThreat*` 那些是**历史账本**：机器早就好了，旧记录也照样躺着，
+    拿它们当结论会把「现在没问题」误报成「本机杀软误杀」——2026-09-22 复测就踩了这个。
+    """
     folder = Path(tempfile.mkdtemp(prefix="av-probe-"))
     path = folder / f"payload{ext}"
     path.write_bytes(b"from-share")  # 内容无关：纯文本照样中招
@@ -104,27 +113,39 @@ def probe_matrix(ext: str, wait_sec: float = 20.0, step: float = 1.0) -> None:
         time.sleep(step)
     shown = ", ".join(f"{c}({WINERROR_HINT.get(c, '?')})@{t}s" for c, t in seen.items())
     print(f"  {ext or '(无扩展名)'}: {shown}")
+    return set(seen)
 
 
 def main() -> int:
     print("python:", sys.version.split()[0])
     print("管理员:", bool(ctypes.windll.shell32.IsUserAnAdmin()))
     print()
-    print("[1] 新建文件后立刻读，最多等 20 秒（每 1 秒探一次）")
+    print("[1] 新建文件后立刻读，最多等 20 秒（每 1 秒探一次）——**结论只看这一段**")
+    live: set[int] = set()
     for ext in (".exe", ".txt"):
-        probe_matrix(ext)
+        live |= probe_matrix(ext)
+    blocked = 225 in live
     print()
     _ps("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
         "Get-MpThreatDetection | Sort-Object InitialDetectionTime -Descending | "
         "Select-Object -First 5 InitialDetectionTime,"
         "@{n='res';e={$_.Resources -join ';'}} | Format-List | Out-String -Width 200",
-        "Defender 最近拦截记录（看资源是不是 pytest-of-* / av-probe-*）")
+        "Defender 历史拦截记录（**只是历史**，不代表现在还会拦）")
     _ps("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
         "Get-MpThreat | Select-Object ThreatID,ThreatName,SeverityID | "
         "Format-Table -AutoSize | Out-String -Width 200",
         "威胁名（2147731250 = Trojan:Win32/Bearfoos.A!ml 就是它）")
     print()
-    print("判读：上面出现 225 / Bearfoos.A!ml -> 本机杀软误杀，见 运行手册「坑 6」。")
+    if blocked:
+        print("判读：**本机现在就会拦**（[1] 段亲眼看到 225）—— 见 运行手册「坑 6」。")
+        print("     顺序：① 先更新病毒库（管理员 PowerShell `Update-MpSignature`，")
+        print("             或安全中心「检查更新」）→ 复跑本探针；")
+        print("           ② 更新后仍报 225，才关实时保护 / 加 Defender 排除项。")
+        print("     别一上来就关杀软：误报是**病毒库**的问题，换库比关防护便宜。")
+    else:
+        print("判读：**本机现在不拦**（[1] 段全是 0(OK)）—— 什么都别动，直接往下跑。")
+        print("     上面那些检出记录是**过去的**，躺着不代表现在还会拦 ——")
+        print("     误报跟着病毒库版本走（2026-09-21 那批库误报，22:07 更新后不再复现）。")
     return 0
 
 

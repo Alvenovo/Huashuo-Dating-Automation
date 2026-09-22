@@ -1260,9 +1260,14 @@ def step_write_local_config(installer_dir: Path, node: str) -> Step:
         st.log(f"已写入 {path}（node_id={existing.get('node_id')}）")
         if farm:
             st.log(f"farm_root 已落盘：{farm}（farm_agent / farm_control 会自动读，不必再设环境变量）")
+        elif existing.get("farm_root"):
+            # 这一支必须单独说清楚：没设环境变量**不等于**文件里没有。
+            # 早先这里直接报「也没写 farm_root」，可文件里明明有 —— 日志说谎会让人
+            # 以为配置被擦了，白跑一趟。
+            st.log(f"未设 HALL_FARM_ROOT，沿用已有 farm_root：{existing['farm_root']}（不必再设环境变量）")
         else:
             st.log(
-                "未设 HALL_FARM_ROOT，config.local.yaml 里也没写 farm_root —— "
+                "未设 HALL_FARM_ROOT，config.local.yaml 里也没有 farm_root —— "
                 "单机跑不受影响；多机跑批要设一次（跑过之后就会落盘）"
             )
     except Exception as exc:

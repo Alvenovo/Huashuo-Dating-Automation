@@ -692,3 +692,77 @@ def test_download_also_survives_transient_lock(cfg, tmp_path):
          mock.patch.object(fetch.time, "sleep", lambda s: None):
         fetch._download("http://example.invalid/x.exe", dest, 5, 3)
     assert dest.read_bytes() == b"downloaded"
+
+
+# ---------------- 杀软误杀的提示（Errno 22 那句话）----------------
+#
+# 这条为什么值得单锁：`[Errno 22] Invalid argument` 本身**看着像参数写错了**，
+# 2026-09-21 一线因此在"共享盘那个文件是不是坏了"上白查了两轮。
+# 所以报错里追加的那几句必须真的指到探针和坑 6，而不是指个空气。
+
+
+def test_looks_like_av_block_recognises_both_shapes():
+    """真码只有 ctypes 拿得到；走 `open()` 只剩 errno 22 —— 两种都得认。"""
+    real = OSError(22, "Invalid argument", "x.exe")
+    real.winerror = 225
+    assert fetch.looks_like_av_block(real)
+
+    plain = OSError(22, "Invalid argument", "x.exe")
+    plain.winerror = None
+    assert fetch.looks_like_av_block(plain), "open() 路径拿不到 winerror，只判 winerror 会漏"
+
+    assert not fetch.looks_like_av_block(None)
+    assert not fetch.looks_like_av_block(OSError(2, "No such file"))
+    assert not fetch.looks_like_av_block(FileNotFoundError(2, "No such file"))
+
+
+def test_av_advice_points_at_the_probe_and_the_kb(tmp_path):
+    """提示里必须同时给出**只读探针命令**和**坑 6 的坐标**，且说清先更新病毒库。"""
+    src = tmp_path / "a.exe"
+    msg = fetch._av_advice(src)
+
+    assert "probe_av_quarantine.py" in msg, "没给探针命令 —— 一线没法自查"
+    assert "运行手册.md" in msg and "坑 6" in msg, "没给知识库坐标 —— 等于没说"
+    assert str(src) in msg, "要点名报错里那个路径是**本机刚写的临时文件**，否则又会去查共享盘"
+    assert "更新病毒库" in msg, (
+        "误报跟着病毒库版本走（2026-09-21 那批库误报，22:07 更新后不再复现）—— "
+        "少了这句，一线会直接去关杀软"
+    )
+    assert "探针干净" in msg, "探针干净这一支也要写：否则提示只教人往杀软上想，真 bug 会被放过"
+
+
+# ---------------- 杀软误杀的提示（Errno 22 那句话）----------------
+#
+# 这条为什么值得单锁：`[Errno 22] Invalid argument` 本身**看着像参数写错了**，
+# 2026-09-21 一线因此在"共享盘那个文件是不是坏了"上白查了两轮。
+# 所以报错里追加的那几句必须真的指到探针和坑 6，而不是指个空气。
+
+
+def test_looks_like_av_block_recognises_both_shapes():
+    """真码只有 ctypes 拿得到；走 `open()` 只剩 errno 22 —— 两种都得认。"""
+    real = OSError(22, "Invalid argument", "x.exe")
+    real.winerror = 225
+    assert fetch.looks_like_av_block(real)
+
+    plain = OSError(22, "Invalid argument", "x.exe")
+    plain.winerror = None
+    assert fetch.looks_like_av_block(plain), "open() 路径拿不到 winerror，只判 winerror 会漏"
+
+    assert not fetch.looks_like_av_block(None)
+    assert not fetch.looks_like_av_block(OSError(2, "No such file"))
+    assert not fetch.looks_like_av_block(FileNotFoundError(2, "No such file"))
+
+
+def test_av_advice_points_at_the_probe_and_the_kb(tmp_path):
+    """提示里必须同时给出**只读探针命令**和**坑 6 的坐标**，且说清先更新病毒库。"""
+    src = tmp_path / "a.exe"
+    msg = fetch._av_advice(src)
+
+    assert "probe_av_quarantine.py" in msg, "没给探针命令 —— 一线没法自查"
+    assert "运行手册.md" in msg and "坑 6" in msg, "没给知识库坐标 —— 等于没说"
+    assert str(src) in msg, "要点名报错里那个路径是**本机刚写的临时文件**，否则又会去查共享盘"
+    assert "更新病毒库" in msg, (
+        "误报跟着病毒库版本走（2026-09-21 那批库误报，22:07 更新后不再复现）—— "
+        "少了这句，一线会直接去关杀软"
+    )
+    assert "探针干净" in msg, "探针干净这一支也要写：否则提示只教人往杀软上想，真 bug 会被放过"

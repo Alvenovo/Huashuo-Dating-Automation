@@ -774,6 +774,10 @@ def test_write_local_config_keeps_farm_root_when_env_absent(bm, tmp_path, monkey
     assert st.ok, st.detail
     text = (tmp_path / "config.local.yaml").read_text(encoding="utf-8")
     assert "//LAPTOP-VS5F7HF4/hall-farm" in text, "重跑 bootstrap 不该擦掉已落盘的农场目录"
+    # 日志不许反过来说「文件里也没写 farm_root」—— 文件里明明有，这句是假话，
+    # 会让人以为配置被擦了而白跑一趟。没设环境变量 ≠ 文件里没有，两条分支要分开报。
+    assert any("沿用已有 farm_root" in line for line in st.detail), st.detail
+    assert not any("也没写 farm_root" in line for line in st.detail), st.detail
 
 
 # ---------------- 钉住包的取用链：本地 -> 缓存 -> 共享盘 -> 下载 ----------------

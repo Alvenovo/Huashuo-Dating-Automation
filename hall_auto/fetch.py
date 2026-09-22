@@ -193,8 +193,11 @@ def _av_advice(src: Path) -> str:
         f"Windows Defender 会把进程刚写出的文件判成病毒（`Trojan:Win32/Bearfoos.A!ml`），"
         f"此后读它返回 `GetLastError=225`，Python 只显示成 `[Errno 22] Invalid argument`。"
         f"\n   报错里的 `{src}` 是**本机刚写出来的临时文件**（不是共享盘那份），所以查共享盘是白查。"
-        f"\n   先确认：`.venv\\Scripts\\python.exe -X utf8 tools\\probe_av_quarantine.py`（只读）。"
-        f"\n   处理办法见 `项目知识库/运行手册.md`「坑 6」。"
+        f"\n   先确认：`.venv\\Scripts\\python.exe -X utf8 tools\\probe_av_quarantine.py`（只读，只看 `[1]` 段）。"
+        f"\n   探针报 225 → **先更新病毒库再复探**（误报跟着病毒库版本走：2026-09-21 那批库误报，"
+        f"22:07 更新后不再复现）；更新后仍报 225，才关实时保护 / 加排除项。"
+        f"\n   探针干净 → 本机现在没这个毛病，这条 EINVAL 要按真代码 bug 查，别再往杀软上想。"
+        f"\n   完整链路见 `项目知识库/运行手册.md`「坑 6」。"
     )
 
 
