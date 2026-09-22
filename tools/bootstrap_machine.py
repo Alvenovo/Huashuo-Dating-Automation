@@ -104,6 +104,7 @@ import hashlib
 import json
 import locale
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -391,11 +392,23 @@ def _deps_probe(py: Path) -> tuple[bool, str]:
 
 
 class Step:
-    """一步铺设结果。ok=False 不中断，最后统一汇总（尽量把问题一次报全）。"""
+    """一步铺设结果。ok=False 不中断，最后统一汇总（尽量把问题一次报全）。
+
+    三档，**别混**：
+
+    - `[OK]` —— 真做成了；
+    - `[WARN]` —— 不阻塞、但**必须让人看见**。典型是「共享盘配了却连不上」：
+      早先这种情形只走 `log()`，于是打了 `[OK]`，一线会以为共享盘没问题
+      （2026-09-22 真机踩过：两条共享都连接失败，第 7 步照样 `[OK]`）；
+    - `[FAIL]` —— 计入结果行，退出码 1。
+
+    「不阻塞」和「没问题」是两件事：前者是设计，后者是结论。别用 `[OK]` 表示前者。
+    """
 
     def __init__(self, name: str):
         self.name = name
         self.ok = True
+        self.warned = False
         self.detail: list[str] = []
 
     def log(self, text: str) -> None:
@@ -405,8 +418,20 @@ class Step:
         self.ok = False
         self.detail.append(f"!! {text}")
 
+    def warn(self, text: str) -> None:
+        """不阻塞，但结果行要看得见（`[WARN]` + 汇总里单独列一遍）。"""
+        self.warned = True
+        self.detail.append(f"?? {text}")
+
     def to_dict(self) -> dict:
-        return {"step": self.name, "ok": self.ok, "detail": self.detail}
+        return {"step": self.name, "ok": self.ok, "warned": self.warned, "detail": self.detail}
+
+
+def _step_label(st: Step) -> str:
+    """`[FAIL]` 优先于 `[WARN]` —— 一步既报警又失败时，别让 WARN 把 FAIL 盖掉。"""
+    if not st.ok:
+        return "FAIL"
+    return "WARN" if st.warned else "OK"
 
 
 def say(text: str) -> None:
@@ -537,7 +562,31 @@ def _dir_reachable(directory: Path, timeout_sec: float = 3.0) -> bool:
     return box["ok"]
 
 
-def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> None:
+# `net use` 的报错随系统语言变，**只认错误码，别认文字**。
+# 这几个码都有明确的下一步 —— 比让一线对着 `rc=2` 猜强得多。
+_NET_USE_HINTS = {
+    "1219": (
+        "这台机器上还有到该服务器的连接（**隐式会话**，`net use` 里看不到）—— "
+        "在管理员 PowerShell 里跑一次 Restart-Service LanmanWorkstation -Force，再重跑本脚本"
+    ),
+    "1909": "账户被锁了（反复认证失败撞的阈值）—— 等锁定窗口过去（默认 10 分钟）再重试，别连着试",
+    "1326": "用户名或密码不对 —— 确认用的是重置后的新密码（旧映射/凭据里可能还是老的）",
+    "53": "找不到网络路径 —— 先查两台机器的代理 / VPN / TUN 是不是全关了，再查是否同网段",
+    "67": "找不到网络名 —— 配置里别写 IP（DHCP 会变），一律用机器名",
+    "5": "拒绝访问 —— 用的不是有权限的账号（共享只授权给 hallshare）",
+}
+
+# `发生系统错误 1219。` / `System error 1219 has occurred.`
+_NET_USE_ERROR_RE = re.compile(r"(?:系统错误|System error)\s*(\d{2,5})")
+
+
+def _net_use_error_code(proc: _Proc) -> str:
+    """从 `net use` 的输出里认出 Windows 错误码；认不出返回空串。"""
+    found = _NET_USE_ERROR_RE.search(f"{proc.stdout or ''}\n{proc.stderr or ''}")
+    return found.group(1) if found else ""
+
+
+def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> list[str]:
     """尽力把 `dirs` 连上（`net use`），过程通过 `log` 记下来。
 
     **抽出来是为了只写一份**：两个地方都要连共享盘 —— 第 7 步（正式连盘）和
@@ -545,6 +594,9 @@ def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> None:
     "认哪个环境变量、失败怎么报"会慢慢长歪，这类分叉本项目已经踩过几次。
 
     幂等：已可达只记一行，不重复 `net use`。
+
+    **返回没能连上的目标**（空列表 = 全都可达）。调用方据此决定要不要 `[WARN]` ——
+    早先这里返回 `None`，于是"两条共享都连不上"也只打了 `[OK]`（2026-09-22 真机踩过）。
 
     凭据**只走环境变量**（红线：不落盘、不进 git）：
         HALL_SHARE_USER / HALL_SHARE_PASSWORD
@@ -560,6 +612,7 @@ def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> None:
     user = (os.environ.get("HALL_SHARE_USER") or "").strip()
     password = os.environ.get("HALL_SHARE_PASSWORD") or ""
 
+    unreachable: list[str] = []
     for d in dirs:
         ok, why = share_reachable(Path(d))
         if ok:
@@ -567,19 +620,37 @@ def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> None:
             continue
         if not user or not password:
             log(f"{d}: 当前不可达（{why}），且未设 HALL_SHARE_USER/PASSWORD，无法自动连接")
+            unreachable.append(f"{d}（不可达且没凭据）")
             continue
         target = _unc_target(str(d))
         if not target:
             log(f"{d}: 路径格式不像 UNC（\\\\host\\share），跳过")
+            unreachable.append(f"{d}（不是 UNC）")
             continue
         cmd = ["net", "use", target, password, f"/user:{user}", "/persistent:yes"]
         proc = _run_text(cmd, check=False)
+        code = _net_use_error_code(proc)
+        if proc.returncode != 0 and code == "1219":
+            # 1219 = 同一服务器不能换用户名。**本函数前面的探针自己就会造出这种会话**：
+            # `share_reachable` 用当前 Windows 身份直访 UNC，建了一条隐式会话；
+            # 而 `net use` 只列显式映射、看不见它 —— 于是"列表是空的"和"报 1219"同时成立。
+            # 先按同一个 target 删一次再重试，别让一线自己去猜这条因果。
+            log(f"{target}: 已有到该服务器的连接（1219），先删掉再重试一次")
+            _run_text(["net", "use", target, "/delete", "/y"], check=False)
+            proc = _run_text(cmd, check=False)
+            code = _net_use_error_code(proc)
         if proc.returncode != 0:
             detail = (proc.stdout or proc.stderr or "").strip()[:160]
             log(f"{target}: 连接失败 rc={proc.returncode} {detail}")
+            if code in _NET_USE_HINTS:
+                log(f"      -> {_NET_USE_HINTS[code]}")
+            unreachable.append(f"{target}（rc={proc.returncode}）")
             continue
         ok2, why2 = share_reachable(Path(d))
         log(f"{target}: 已连接（{'可达' if ok2 else f'仍不可达：{why2}'}）")
+        if not ok2:
+            unreachable.append(f"{target}（连上但探不到：{why2}）")
+    return unreachable
 
 
 def _wheelhouse_share_dirs() -> list[Path]:
@@ -651,8 +722,14 @@ def _resolve_wheelhouse(
             tried.append(f"{directory} 不可达")
             continue
         p = Path(directory) / WHEELHOUSE_SHARE_SUBDIR
-        if p.is_dir():
-            return p, ""
+        # 这是 UNC 上的 `is_dir()` —— 同样会抛（1909/1326/5 是 EACCES 类，不吞）。
+        # 这里在"还没装依赖"的自举阶段，崩掉就等于整台机器铺不下去，必须接住。
+        try:
+            if p.is_dir():
+                return p, ""
+        except OSError as exc:
+            tried.append(f"{directory} 下探不到 {WHEELHOUSE_SHARE_SUBDIR}\\（{exc}）")
+            continue
         tried.append(f"{directory} 下没有 {WHEELHOUSE_SHARE_SUBDIR}\\")
     return None, "；".join(tried)
 
@@ -1142,6 +1219,8 @@ def step_share_login(skip: bool) -> Step:
         HALL_SHARE_PASSWORD  共享盘密码
 
     未配共享盘或未给凭据时跳过 —— 这不是错误，可能这台机器有本地包、或走下载。
+    **但"配了却连不上"必须打 `[WARN]`**：它不阻塞，可后面取包/农场会退到兜底或直接失败，
+    打了 `[OK]` 就等于告诉一线"共享盘没问题"（2026-09-22 真机踩过）。
     """
     st = Step("共享盘连接")
     if skip:
@@ -1168,7 +1247,13 @@ def step_share_login(skip: bool) -> Step:
 
     # 连接细节（认哪些环境变量、失败怎么报）统一在 _share_connect 里，
     # 第 2 步取离线 wheel 时用的是同一份 —— 避免两处慢慢长歪。
-    _share_connect(wanted, st.log)
+    unreachable = _share_connect(wanted, st.log)
+    if unreachable:
+        st.warn(
+            f"{len(unreachable)} 个共享没连上：{'；'.join(unreachable)}。"
+            "本步不阻塞（这台机器可能有本地包），但取包/农场会退到兜底或直接失败 —— "
+            "别把它当成「共享盘没问题」"
+        )
     return st
 
 
@@ -1624,6 +1709,12 @@ def step_farm_root(skip: bool) -> Step:
     `HALL_FARM_ROOT` 指向共享盘上的农场目录，控制机和所有节点共用同一个。
     目录不存在时 `farm_agent` 的 `ensure_dirs` 也会建，但**首次跑建议在这里建好**：
     免得节点以自己受限的权限往共享盘根下写，失败信息还不直观。
+
+    **`is_dir()` 和 `mkdir()` 一样会抛**（2026-09-22 真机踩出）：`pathlib` 只把
+    ENOENT 类错误（含 WinError 53 / 67）吞成 `False`，而 **1909 账户锁定 / 1326 登录失败 /
+    5 拒绝访问 是 EACCES 类，会原样重抛**。早先这里只包了 `mkdir`，于是：
+    53 那次走了干净的 `[FAIL]`，1909 这次**直接把整个脚本崩掉** ——
+    后面 4 步一步没跑、报告 JSON 也没写。**UNC 上的文件系统调用一律当会抛来写。**
     """
     st = Step("农场目录")
     if skip:
@@ -1641,18 +1732,25 @@ def step_farm_root(skip: bool) -> Step:
     root = Path(raw)
     created: list[str] = []
     failed: list[str] = []
+    hints: list[str] = []
     for sub in ("tasks", "done", "results", "logs"):
         target = root / sub
-        if target.is_dir():
-            continue
+        # `is_dir()` 必须和 `mkdir()` 一起包住 —— 见本函数 docstring 里 1909 那次的教训。
         try:
+            if target.is_dir():
+                continue
             target.mkdir(parents=True, exist_ok=True)
             created.append(sub)
         except OSError as exc:
             failed.append(f"{sub}（{exc}）")
+            code = str(getattr(exc, "winerror", "") or "")
+            if code in _NET_USE_HINTS and _NET_USE_HINTS[code] not in hints:
+                hints.append(_NET_USE_HINTS[code])
     if failed:
         st.fail(f"农场子目录建不出来：{'; '.join(failed)}")
         st.log(f"农场根：{root}（节点写不进去多半是共享盘权限/凭据没配）")
+        for hint in hints:
+            st.log(f"      -> {hint}")
         return st
     st.log(f"农场根 {root}：{'新建 ' + ', '.join(created) if created else '四个子目录齐全'}")
     return st
@@ -1749,6 +1847,8 @@ def _write_report(node: str, installer_dir: Path, steps: list[Step], *, aborted:
         "aborted_before_full_run": aborted,
         "steps": [s.to_dict() for s in steps],
         "ok": all(s.ok for s in steps),
+        # 告警单列：不阻塞，但汇总里要能看见（否则只在正文里一闪而过）
+        "warned": [s.name for s in steps if s.ok and s.warned],
     }
     out_dir = REPO_ROOT / "reports" / "bootstrap"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1756,11 +1856,15 @@ def _write_report(node: str, installer_dir: Path, steps: list[Step], *, aborted:
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     failed = [s.name for s in steps if not s.ok]
+    warned = [s.name for s in steps if s.ok and s.warned]
     say("=" * 46)
     if failed:
         say(f"结果：{len(failed)} 步有问题 -> {'; '.join(failed)}")
     else:
         say("结果：全部通过，本机已可跑批")
+    if warned:
+        # 「全部通过」和「没问题」不是一回事 —— 别让告警藏在正文里
+        say(f"注意：{len(warned)} 步有告警（不阻塞）-> {'; '.join(warned)}")
     say(f"明细：{out}")
     return 0 if not failed else 1
 
@@ -1811,7 +1915,7 @@ def main() -> int:
 
     def run(st: Step) -> Step:
         steps.append(st)
-        say(f"[{'OK' if st.ok else 'FAIL'}] {st.name}")
+        say(f"[{_step_label(st)}] {st.name}")
         for line in st.detail:
             say(f"    {line}")
         say("")

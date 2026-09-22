@@ -623,6 +623,174 @@ def test_share_login_skip_flag(bm):
     assert any("--skip-share" in line for line in st.detail)
 
 
+# ---------------- 2026-09-22 真机踩出的三个坑 ----------------
+#
+# 节点重跑 bootstrap 连续报 53 -> 1219 -> 1909，最后**整个脚本 traceback 退出**：
+# 后面 4 步（安装包准备 / 提权计划任务 / unit 自检 / 屏幕常亮）一步没跑，
+# **报告 JSON 也没写**。三个错里两个是环境（代理 TUN / 账号被锁），
+# 一个是脚本自己的毛病 —— 下面钉的是"脚本不该再犯"的那部分。
+#
+# 关键事实（本机实测，别凭印象）：`pathlib` 的 `is_dir()` / `is_file()` **不是一律吞错**。
+# 它只吞 ENOENT / ENOTDIR / EBADF / ELOOP（含映射成 ENOENT 的 WinError 53 / 67），
+# **1909 账户锁定 / 1326 登录失败 / 5 拒绝访问 是 EACCES 类，会原样重抛**。
+# 所以"UNC 上的存在性判断"必须 catch `OSError`，只包 `mkdir` 是不够的。
+
+
+def _unc_is_dir_raises(err: OSError, monkeypatch) -> None:
+    """让 **UNC 路径**的 `is_dir()` 抛指定异常（本地路径照常工作）。"""
+    real = Path.is_dir
+
+    def fake(self, *args, **kwargs):
+        if str(self).replace("/", "\\").startswith("\\\\"):
+            raise err
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_dir", fake)
+
+
+def _winerror(code: int, text: str) -> OSError:
+    err = OSError(13, f"[WinError {code}] {text}")
+    err.winerror = code
+    return err
+
+
+def test_farm_root_survives_locked_account(bm, monkeypatch):
+    """`is_dir()` 抛 1909（账户锁定）-> 干净 `[FAIL]`，**不许把整个脚本崩掉**。
+
+    这是 2026-09-22 真机那次的直接原因：`step_farm_root` 只包了 `mkdir`，
+    1909 从 `is_dir()` 冒泡出去 -> traceback 退出 -> 后面 4 步和报告全丢。
+    """
+    monkeypatch.setenv("HALL_FARM_ROOT", "//192.168.0.4/hall-farm")
+    _unc_is_dir_raises(_winerror(1909, "引用的帐户当前已锁定"), monkeypatch)
+
+    st = bm.step_farm_root(False)  # 不许抛
+
+    assert st.ok is False, "建不出目录要判失败"
+    assert bm._step_label(st) == "FAIL"
+    assert any("1909" in line for line in st.detail)
+    assert any("10 分钟" in line for line in st.detail), "要给出下一步（等锁定窗口过去）"
+
+
+def test_farm_root_hints_proxy_for_winerror_53(bm, monkeypatch):
+    """53（找不到网络路径）的提示要指向代理/TUN —— 真机那次的根因就是它。"""
+    monkeypatch.setenv("HALL_FARM_ROOT", "//192.168.0.4/hall-farm")
+    _unc_is_dir_raises(_winerror(53, "找不到网络路径"), monkeypatch)
+
+    st = bm.step_farm_root(False)
+
+    assert st.ok is False
+    assert any("代理" in line for line in st.detail)
+
+
+def test_share_connect_deletes_conflicting_session_then_retries(bm, monkeypatch):
+    """`net use` 报 1219 -> 先按**同一 target** `/delete`，再重试一次。
+
+    1219 的因果是脚本自己造的：本函数前面的探针用**当前 Windows 身份**直访 UNC，
+    建了一条隐式会话；`net use` 只列显式映射、看不见它，
+    于是换 `hallshare` 去连必被拒 —— "列表是空的"和"报 1219"可以同时成立。
+    """
+    _patch_share_env(monkeypatch, farm="")
+    cmds: list[list[str]] = []
+    state = {"use": 0, "deleted": False}
+
+    def _reach(directory, timeout_sec=5):
+        # 删掉冲突会话之前探不到，删完重连就通了 —— 和真机一致
+        return (True, "") if state["deleted"] else (False, "不可达")
+
+    def _run(cmd, **kwargs):
+        cmds.append(list(cmd))
+        if "/delete" in cmd:
+            state["deleted"] = True
+            return _fake_run(0)
+        state["use"] += 1
+        return _fake_run(2, stderr="发生系统错误 1219。") if state["use"] == 1 else _fake_run(0)
+
+    log: list[str] = []
+    with mock.patch("hall_auto.fetch.share_reachable", side_effect=_reach), \
+         mock.patch.object(bm.subprocess, "run", side_effect=_run):
+        left = bm._share_connect([Path("//192.168.0.4/hall-packages")], log.append)
+
+    assert left == [], "删掉冲突会话后重试成功 -> 不算没连上"
+    assert len(cmds) == 3, f"应该是 use -> delete -> use，实际：{cmds}"
+    assert "/delete" in cmds[1] and cmds[1][2] == cmds[0][2], "删的必须是同一个 target"
+    assert any("1219" in line for line in log)
+
+
+def test_share_connect_explains_1219_when_still_failing(bm, monkeypatch):
+    """删完还报 1219 -> 必须给出**下一步**，不是只报一句 `rc=2`。"""
+    _patch_share_env(monkeypatch, farm="")
+    log: list[str] = []
+    with mock.patch("hall_auto.fetch.share_reachable", return_value=(False, "不可达")), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run(2, stderr="发生系统错误 1219。")):
+        left = bm._share_connect([Path("//192.168.0.4/hall-packages")], log.append)
+
+    assert left, "没连上要如实返回给调用方"
+    assert any("LanmanWorkstation" in line for line in log)
+
+
+def test_share_login_warns_instead_of_fake_ok(bm, monkeypatch):
+    """配了共享盘却连不上 -> `[WARN]`，**不是 `[OK]`**。
+
+    真机那次两条共享都连接失败，第 7 步照样打 `[OK]` ——
+    「不阻塞」是设计，「没问题」是结论，别用 `[OK]` 表示前者。
+    """
+    _patch_share_env(monkeypatch)
+    with mock.patch("hall_auto.config.load_config", return_value=mock.Mock()), \
+         mock.patch("hall_auto.fetch.share_dirs", return_value=[Path("//192.168.0.4/hall-packages")]), \
+         mock.patch("hall_auto.fetch.share_reachable", return_value=(False, "超时")), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run(2, stderr="发生系统错误 53。")):
+        st = bm.step_share_login(False)
+
+    assert st.ok is True, "共享盘连不上不算铺设失败（这台机器可能有本地包）"
+    assert st.warned is True, "但必须让人看见 —— 否则一线以为共享盘没问题"
+    assert bm._step_label(st) == "WARN"
+    assert any(line.startswith("?? ") for line in st.detail)
+
+
+def test_step_label_fail_beats_warn(bm):
+    """一步既报警又失败时，`[FAIL]` 不能被 `[WARN]` 盖掉。"""
+    st = bm.Step("x")
+    st.warn("警告")
+    st.fail("失败")
+    assert bm._step_label(st) == "FAIL"
+
+
+def test_report_lists_warned_steps(bm, monkeypatch, tmp_path):
+    """告警要进报告 JSON，且**不改退出码** —— 光在正文里一闪而过不够。"""
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(bm, "is_admin", lambda: True)
+    monkeypatch.setattr(bm, "machine_profile", lambda: {"os": "test"})
+
+    st = bm.Step("共享盘连接")
+    st.warn("两条都没连上")
+    code = bm._write_report("NODE", tmp_path, [st])
+
+    assert code == 0, "告警不该把退出码弄成 1"
+    out = next((tmp_path / "reports" / "bootstrap").glob("*.json"))
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["ok"] is True
+    assert payload["warned"] == ["共享盘连接"]
+    assert payload["steps"][0]["warned"] is True
+
+
+def test_wheelhouse_probe_error_does_not_crash(bm, monkeypatch, tmp_path):
+    """共享盘 wheelhouse 的 `is_dir()` 抛异常 -> 记一句、返回「没有」，不许崩。
+
+    第 2 步跑在"还没装依赖"的时刻，这里崩掉等于整台机器铺不下去。
+    """
+    monkeypatch.delenv("HALL_PACKAGE_SHARE", raising=False)
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
+    _unc_is_dir_raises(_winerror(1909, "引用的帐户当前已锁定"), monkeypatch)
+
+    with mock.patch.object(bm, "_wheelhouse_share_dirs", return_value=[Path("//192.168.0.4/hall-packages")]), \
+         mock.patch.object(bm, "_share_connect", return_value=[]), \
+         mock.patch.object(bm, "_dir_reachable", return_value=True):
+        wh, why = bm._resolve_wheelhouse(None, None)  # 不许抛
+
+    assert wh is None
+    assert "1909" in why
+
+
 # ---------------- 内部安全工具（P2）：从共享盘自动备 ----------------
 #
 # 此前 `step_write_local_config` 把 `security.tools_dir` 指向
