@@ -17,15 +17,20 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
 
 import pytest
+
+pytestmark = pytest.mark.unit
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -863,23 +868,24 @@ def test_selftest_runs_whole_unit_suite(bm):
 # ---------------- 手册与代码的一致性（防漂移）----------------
 #
 # 这轮踩的坑就是"文档说 A、代码做 B"，而且两轮复核都只核对了名字对不对、
-# 没核对新机器上跑不跑得通。把手册那张 12 步表和 main() 的调用顺序一起钉住。
+# 没核对新机器上跑不跑得通。把手册那张 13 步表和 main() 的调用顺序一起钉住。
 
 
 _CODE_CALL_ORDER = [
     "env_check", "venv", "fixtures", "seven_zip", "write_local_config", "node_env_template",
     "share_login", "security_tools", "farm_root", "fetch_packages", "schtask", "selftest",
+    "keep_awake",
 ]
 
 _MANUAL_STEP_KEYWORDS = {
     1: "环境自检", 2: "虚拟环境", 3: "夹具", 4: "7-Zip", 5: "config.local.yaml",
     6: "farm_node.env", 7: "共享盘", 8: "安全工具", 9: "农场目录",
-    10: "安装包", 11: "计划任务", 12: "单元测试",
+    10: "安装包", 11: "计划任务", 12: "单元测试", 13: "常亮",
 }
 
 
 def test_bootstrap_main_call_order_is_locked(bm):
-    """`main()` 里 12 个步骤的调用顺序是手册那张表的依据，钉住它。"""
+    """`main()` 里 13 个步骤的调用顺序是手册那张表的依据，钉住它。"""
     import re
 
     src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
@@ -889,9 +895,9 @@ def test_bootstrap_main_call_order_is_locked(bm):
 
 
 def test_manual_bootstrap_step_table_matches_code(bm):
-    """《测试机操作手册》「脚本会依次做这 12 件事」那张表要与代码对得上。
+    """《测试机操作手册》「脚本会依次做这 13 件事」那张表要与代码对得上。
 
-    测试人员就是照着这张表判断"第几步红了该找谁"。表里写 12 步、代码跑 11 步，
+    测试人员就是照着这张表判断"第几步红了该找谁"。表里写 13 步、代码跑 11 步，
     或者顺序错位，一线会按错误的编号去查故障（上一轮真发生过：故障表写第 10 步、
     实际是第 11 步）。
     """
@@ -904,14 +910,14 @@ def test_manual_bootstrap_step_table_matches_code(bm):
     text = manual.read_text(encoding="utf-8")
     # 只取「脚本会依次做这 12 件事」那一节里的表 —— 「全流程一览」那张表在文档更前面，
     # 也是 `| 1 | ...` 开头，不切出区块会把两张表混在一起数。
-    assert "脚本会依次做这 12 件事" in text, "手册里那张 12 步表的标题变了，本用例要跟着改"
-    block = text.split("脚本会依次做这 12 件事", 1)[1].split("**预期结果**", 1)[0]
+    assert "脚本会依次做这 13 件事" in text, "手册里那张 13 步表的标题变了，本用例要跟着改"
+    block = text.split("脚本会依次做这 13 件事", 1)[1].split("**预期结果**", 1)[0]
     rows = [(int(n), body) for n, body in re.findall(r"^\| (\d+) \| ([^|]*?) \|", block, re.M)
-            if int(n) <= 12]
-    assert len(rows) == 12, f"手册 12 步表取到 {len(rows)} 行：{rows}"
+            if int(n) <= 13]
+    assert len(rows) == 13, f"手册 13 步表取到 {len(rows)} 行：{rows}"
     wrong = [n for n, body in rows if _MANUAL_STEP_KEYWORDS[n] not in body]
     assert not wrong, f"这些行与代码对不上：{wrong}（行内容：{[b for n, b in rows if n in wrong]}）"
-    assert len(_CODE_CALL_ORDER) == 12
+    assert len(_CODE_CALL_ORDER) == 13
 
 
 
@@ -1920,3 +1926,49 @@ def test_selftest_does_not_blame_av_for_other_failures(bm, tmp_path, monkeypatch
 
     assert st.ok is False
     assert "杀软" not in "\n".join(st.detail)
+
+
+# ---------------- main() 读的每个 args.X 都必须是注册过的命令行开关 ----------------
+#
+# 2026-09-22 复核「屏幕常亮」那批改动时真踩（不是假设）：
+# `step_keep_awake` 接进了 `main()`、读的是 `args.skip_keep_awake`，
+# 但 `--skip-keep-awake` **压根没注册进 argparse** —— 于是**每一次** bootstrap
+# 都在最后一步 `AttributeError: 'Namespace' object has no attribute 'skip_keep_awake'`
+# 崩掉，而且是在跑完前 12 步（十几分钟）之后才崩。
+#
+# 当时那条守卫写的是 `assert "--skip-keep-awake" in src`：docstring 里提一句就满足，
+# **看着是绿的**。这就是本项目反复踩的"假守卫" —— 判据粗到能被文案满足的守卫等于没有守卫。
+# 所以改成走 AST：只看 `main()` 里真的读了哪些 `args.<名字>`，逐个核对注册表。
+
+
+def test_every_args_attribute_used_in_main_is_registered():
+    """`main()` 里读的每个 `args.X`，argparse 里都要有对应的 `--x`。
+
+    这一类错（漏注册一个 `add_argument`）不会在 import 时报错、不会在其它单测里露头，
+    只在那一步真的跑到时才炸 —— 而它恰好排在最后。用 AST 钉死，别再靠人眼。
+    """
+    src = (REPO_ROOT / "tools" / "bootstrap_machine.py").read_text(encoding="utf-8")
+    main_fn = next(
+        (n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "main"),
+        None,
+    )
+    assert main_fn is not None, "找不到 main() —— 本用例的前提是它存在"
+
+    used = {
+        node.attr
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "args"
+    }
+    assert used, "main() 里一个 args.X 都没读到？八成是解析写错了"
+
+    # `add_argument(` 之后可能换行才写参数名（本文件就是这么排的），所以用 `\s*` 跨行。
+    registered = set(re.findall(r'add_argument\(\s*"--([a-z0-9-]+)"', src))
+
+    missing = sorted(a for a in used if a.replace("_", "-") not in registered)
+    assert not missing, (
+        "main() 读了这些 `args.` 属性，但 argparse 里没注册对应开关 —— "
+        "跑起来会在那一步 AttributeError 崩掉：\n  "
+        + "\n  ".join(f"args.{a} -> 缺 --{a.replace('_', '-')}" for a in missing)
+    )

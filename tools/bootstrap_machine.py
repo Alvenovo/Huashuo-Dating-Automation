@@ -24,6 +24,7 @@
 | 10 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
 | 11 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
 | 12 自检 | 跑 tests/unit | 可 `--skip-selftest` |
+| 13 **屏幕常亮** | 跑 `set_keep_awake.ps1 -Check` 回读电源超时值 | 跳过（不重复写备份） |
 
 **新机上最容易缺、又确实自动化不了的两样**：`Python 3.x 64 位`（要在 PATH 里）和 `Git`。
 这叫引导悖论 —— 本脚本自己就是 Python 写的、代码本身归 Git 管，没有它们脚本转不起来。
@@ -51,6 +52,17 @@
 包源机上放一次，所有节点自动取到，「N 台拷 N 次」压成「1 台拷 1 次」。
 **必须在第 7 步之后**：没认证过共享盘就取不到。
 
+第 13 步为什么由 bootstrap 直接设（而不是"只检测、让人自己跑"）：
+节点机**无人值守**，Windows 默认电源方案是显示器 10 分钟关、睡眠 30 分钟 ——
+agent 空转等任务时机器会自己睡过去，**连轮询线程一起停摆**，控制机看不到回执。
+现场表现是「投了任务没反应」，与「共享盘断了」「agent 崩了」完全同形，最费排查时间。
+组长 2026-09-18 已确认测试机无人碰屏、允许设「永不睡眠 / 不锁屏」，且该设置
+**可回滚**（原值自动备份到 `%LOCALAPPDATA%\\hall-keep-awake\\`，`-Restore` 还原）。
+所以这里判 fail 不判 warn：设不上就等于这台机器会在无人值守时睡过去。
+不要可加 `--skip-keep-awake`（那一行日志会说明后果）。
+分工：这一步是**机器级**；`hall_auto/awake.py` 是**进程级**（只在 pytest 进程活着时生效），
+两者管的不是同一段时间，见 `hall_auto/awake.py` 模块头。
+
 第 2 步的标记文件是 `.venv/.deps_ok`：装成功后写入 requirements.txt 的 SHA256，
 下次哈希一致且关键包都能 import 就跳过。标记只用于"快速跳过"，
 **不能单独作为依据**——标记可能被手工删或 venv 被清理，
@@ -72,6 +84,7 @@
     --skip-security-tools  不从共享盘准备 P2 内部安全工具
     --skip-schtask         不检查/建计划任务
     --skip-selftest        不跑 tests/unit 自检
+    --skip-keep-awake      不设「永不睡眠/永不关屏」（**节点机会中途睡过去，别随便加**）
     --no-download          不下载安装包，只用本地已有的
     --skip-share           不尝试连接共享盘
 
@@ -1640,6 +1653,84 @@ def step_farm_root(skip: bool) -> Step:
     return st
 
 
+KEEP_AWAKE_SCRIPT = REPO_ROOT / "tools" / "set_keep_awake.ps1"
+
+
+def step_keep_awake(skip: bool) -> Step:
+    """把本机设成「永不睡眠 / 永不关屏 / 关掉屏保」（机器级、持久、可回滚）。
+
+    为什么 bootstrap 要管这件事：节点机是**无人值守**的。Windows 默认电源方案是
+    显示器 10 分钟关、睡眠 30 分钟 —— agent 空转等任务时机器会自己睡过去，
+    **连轮询线程一起停摆**，控制机看不到回执。现场表现是「投了任务没反应」，
+    与「共享盘断了」「agent 崩了」长得一模一样，排查方向全错。
+    组长 2026-09-18 已确认测试机无人碰屏、允许这么设。
+
+    与 `hall_auto/awake.py` 的分工：那个是**进程级**、只在 pytest 进程活着时生效，
+    管不了「跑批前 / 两轮之间 / 跑批后」那三段空档；这里补的正是那三段。
+    两者互不替代，缺一个都会留下"机器自己睡过去"的窗口。
+
+    幂等：先 `-Check` 只读看一遍，已经是常亮就**一个设置都不改**（也不重写备份）。
+    设不上判 fail（不静默）—— 设不上就等于这台机器会在无人值守时睡过去，
+    必须让人在铺设报告里一眼看见。
+    """
+    st = Step("屏幕常亮（永不睡眠/不关屏）")
+    if skip:
+        st.log(
+            "按 --skip-keep-awake 跳过 —— 本机按默认电源方案会息屏/睡眠，"
+            "无人值守跑批可能中途停摆（表现像 agent 卡死）"
+        )
+        return st
+    if not KEEP_AWAKE_SCRIPT.is_file():
+        st.fail(f"找不到 {KEEP_AWAKE_SCRIPT}")
+        return st
+
+    def _run(extra: list[str]) -> _Proc:
+        return _run_text(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(KEEP_AWAKE_SCRIPT), *extra],
+            check=False, timeout=120,
+        )
+
+    try:
+        probe = _run(["-Check"])
+    except (OSError, subprocess.SubprocessError) as exc:
+        st.fail(f"常亮检查起不来：{exc}")
+        return st
+
+    if probe.returncode == 0:
+        st.log("已是常亮（不会息屏/睡眠、屏保已关），未改动任何设置")
+        return st
+    if probe.returncode == 3:
+        # 取不到电源信息 ≠ 已经是常亮。这里不能放过 —— 无法确认就等于无法排除
+        # "半夜睡过去"，而那种故障看起来像 agent 卡死，最费排查时间。
+        st.fail("取不到电源设置（powercfg 不可用或输出解析不了）—— 无法确认本机是否会自动睡眠")
+        for line in (probe.stdout or probe.stderr or "").splitlines()[-4:]:
+            if line.strip():
+                st.log(line.rstrip())
+        return st
+
+    st.log("本机会息屏或睡眠 → 改为常亮（可回滚，原值自动备份）")
+    try:
+        applied = _run([])
+    except (OSError, subprocess.SubprocessError) as exc:
+        st.fail(f"常亮设置起不来：{exc}")
+        return st
+    for line in (applied.stdout or "").splitlines():
+        if line.strip():
+            st.log(line.rstrip())
+    if applied.returncode == 0:
+        st.log("还原：powershell -NoProfile -ExecutionPolicy Bypass -File tools\\set_keep_awake.ps1 -Restore")
+        return st
+    if applied.returncode == 2:
+        st.fail(
+            "改电源设置需要管理员 —— 用**管理员** PowerShell 重跑本脚本；"
+            "不提权的话这台机器会在无人值守时睡过去（表现为投了任务没反应）"
+        )
+    else:
+        st.fail(f"常亮设置没生效（rc={applied.returncode}，明细见上）")
+    return st
+
+
 def _write_report(node: str, installer_dir: Path, steps: list[Step], *, aborted: bool = False) -> int:
     """把本次铺设结果落盘并打印结论。返回进程退出码。"""
     payload = {
@@ -1686,6 +1777,11 @@ def main() -> int:
     )
     parser.add_argument("--skip-schtask", action="store_true")
     parser.add_argument("--skip-selftest", action="store_true")
+    parser.add_argument(
+        "--skip-keep-awake",
+        action="store_true",
+        help="不设「永不睡眠/永不关屏」（节点机会中途睡过去，别随便加）",
+    )
     parser.add_argument("--skip-share", action="store_true", help="不尝试连接共享盘")
     parser.add_argument("--skip-farm", action="store_true", help="不检查/创建农场目录结构")
     parser.add_argument("--no-download", action="store_true", help="不下载安装包，只用本地已有的")
@@ -1762,6 +1858,9 @@ def main() -> int:
     run(step_fetch_packages(allow_download=not args.no_download))
     run(step_schtask(args.skip_schtask))
     run(step_selftest(args.skip_selftest))
+    # 放最后：前面的步骤跑完（可能十几分钟）再看机器会不会自己睡过去。
+    # 判 fail 不判 warn —— 没设上就等于无人值守时机器会中途睡过去。
+    run(step_keep_awake(args.skip_keep_awake))
 
     return _write_report(node, installer_dir, steps)
 

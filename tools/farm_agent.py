@@ -63,6 +63,16 @@
 
 `--once` 同理：农场不可达时**不能**打「无任务，退出」再返回 0（那是假绿），
 改为返回 `3`。退出码约定：`0` 正常／`2` 任务被拒收／`3` 农场不可达。
+
+## 常亮（节点无人值守的前提）
+
+`main()` 一进来就 `keep_awake_for_process()`（`hall_auto/awake.py`）：agent 活着期间
+不许息屏、不许睡眠。**不设的话**，空转等任务那几小时里机器会按默认电源方案睡过去，
+轮询线程一起停摆 —— 表现与「共享盘断了」一模一样，是同一类误导。
+
+这一层只覆盖 agent 自己的生命周期；**跑批开始前 / 两轮之间 / 跑批结束后**那三段空档
+要靠机器级那层（`tools/set_keep_awake.ps1`，bootstrap 会顺手设上）。
+两层分工见 `hall_auto/awake.py` 模块头。
 """
 
 from __future__ import annotations
@@ -80,6 +90,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from hall_auto.awake import keep_awake_for_process  # noqa: E402
 from hall_auto.dpi import is_interactive_session, machine_profile, node_id  # noqa: E402
 from hall_auto.env_pack import (  # noqa: E402
     NODE_ENV_EVIDENCE_NAME,
@@ -345,6 +356,18 @@ def main() -> int:
     parser.add_argument("--shard-id", type=int, default=1)
     parser.add_argument("--shard-count", type=int, default=1)
     args = parser.parse_args()
+
+    # 节点机无人值守：agent 空转等任务时可能一等等几小时，机器若按默认电源方案
+    # （显示器 10 分钟关、睡眠 30 分钟）睡过去，**这个轮询线程会一起停摆** ——
+    # 控制机看不到回执，现场表现与「共享盘断了」「agent 崩了」完全同形，排查方向全错。
+    # 这里用进程级常亮兜住 agent 自己的生命周期（零权限、退出自动失效）；
+    # 机器级那层（改电源方案，覆盖 agent 没在跑的空档）见 tools/set_keep_awake.ps1。
+    if not keep_awake_for_process():
+        print(
+            "[提示] 常亮设置未生效（SetThreadExecutionState 调用失败）——"
+            "本机若会息屏/睡眠，agent 空转期间可能停摆",
+            file=sys.stderr, flush=True,
+        )
 
     node = node_id()
 
