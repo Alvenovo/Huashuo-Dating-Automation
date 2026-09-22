@@ -16,12 +16,14 @@ from hall_auto.login import (
     logged_in,
     logout,
     microsoft_pick_account,
+    microsoft_send_code,
     open_forgot_password_page,
     open_login_dialog,
     open_microsoft_login,
     request_forgot_sms,
     request_sms_code,
     submit_forgot_reset,
+    submit_microsoft_code,
     submit_microsoft_email,
     switch_login_tab,
     wait_microsoft_logged_in,
@@ -89,11 +91,12 @@ def test_microsoft_login_sso(cfg, ready_pid):
     """微软账号登录：填邮箱→下一步→点缓存账号磁贴走 SSO 免密→断言已登录→finally 还原登出。
 
     设计边界（主流程自动化设计.md）：微软账号测到系统/WebView 登录窗为止；
-    出现密码页(i0118)或 MFA 则标记人工、不算脚本失败（skip）。
+    出现密码页(i0118) / MFA / 邮箱验证码页则标记人工、不算脚本失败（skip）。
     本机有缓存的 Windows/MS 会话时，点「下一步」直接出账号选择器，可免密 SSO，
-    所以这条在专用机上能无人值守跑通；无缓存会话的机器会落到 password 分支 skip。
+    所以这条在专用机上能无人值守跑通；无缓存会话的机器会落到 password / email_otp 分支 skip。
     邮箱走 HALL_MS_USER（或 config.local.yaml 的 accounts.microsoft.email），不进 git、不进对话。
     2026-09-16 探针实跑通过：SSO 后用户区=已登录用户 61935，logout 还原成未登录。
+    2026-09-22 真机改走「发送登录代码到邮箱」→ 落 email_otp 分支 skip（见下）。
     """
     email = cfg.microsoft_account()
     if not email:
@@ -106,13 +109,64 @@ def test_microsoft_login_sso(cfg, ready_pid):
         pytest.skip("微软要密码(i0118)：本机无缓存 MS 会话，需人工在自己终端输入，标记人工")
     if state == "mfa":
         pytest.skip("微软要二次验证(MFA)：按设计标记人工，不算脚本失败")
+    if state == "email_otp":
+        # 2026-09-22 真机新增分支：微软不再直接出账号选择器，而是
+        # 「我们向 <邮箱> 发送登录代码。」页（带【发送验证码】按钮），码发到邮箱。
+        # 要人开邮箱取码 → 人在环，无人值守**不算失败**（早先误判成 account_picker，
+        # 去点一块纯文本然后死等已登录态，报的是「提交后未进入已登录态」，方向全错）。
+        # 收码流程在 test_microsoft_login_code_manual（-m manual）。
+        pytest.skip(
+            "微软要邮箱验证码：需人工开邮箱取码，标记人工；"
+            "收码流程见 test_microsoft_login_code_manual（-m manual）"
+        )
     if state == "waiting":
-        pytest.fail("微软登录点「下一步」后没到任何已知分支（picker/password/mfa）")
+        pytest.fail("微软登录点「下一步」后没到任何已知分支（picker/password/mfa/email_otp）")
     try:
         if state == "account_picker":
             microsoft_pick_account(ms_win, email)
         name = wait_microsoft_logged_in(ready_pid)
         assert logged_in(ready_pid), "SSO 后仍未进入已登录态"
+        assert "已登录" in name, f"已登录态用户区文案异常: {name!r}"
+    finally:
+        logout(ready_pid)
+    assert not logged_in(ready_pid), "还原登出后应回到未登录态"
+
+
+@pytest.mark.login
+@pytest.mark.manual
+def test_microsoft_login_code_manual(cfg, ready_pid):
+    """微软登录·邮箱验证码人在环用例：点【发送验证码】→ 人工开邮箱取码回填 → 断言已登录 → 还原登出。
+
+    2026-09-22 真机发现：这台机器点微软入口、填邮箱、点「下一步」后，
+    **不再直接出账号选择器**，而是「我们向 <邮箱> 发送登录代码。」页
+    （带【发送验证码】按钮），码发到 HALL_MS_USER 那个邮箱，需要真人去收。
+    无人值守那条（test_microsoft_login_sso）遇到这一页只 skip，真收码走这条。
+
+    会真发登录代码到邮箱。和短信登录同一个口径：只在交互式终端跑
+    （非 tty 自动 skip），免得发了码却没人回填、把账号卡在半路。
+    邮箱走 HALL_MS_USER，不落盘、不进 git。
+    """
+    email = cfg.microsoft_account()
+    if not email:
+        pytest.skip("缺微软邮箱：设置 HALL_MS_USER")
+    if not sys.stdin.isatty():
+        pytest.skip("非交互式终端：微软验证码要人工开邮箱取码，请在自己终端跑 -m manual")
+    logout(ready_pid)
+    ms_win = open_microsoft_login(ready_pid)
+    submit_microsoft_email(ms_win, email)
+    state = wait_microsoft_state(ready_pid, ms_win, email)
+    if state == "account_picker":
+        pytest.skip("这台机器走的是账号选择器免密分支（无验证码可收），请跑 test_microsoft_login_sso")
+    if state != "email_otp":
+        pytest.skip(f"微软没走邮箱验证码分支（当前 {state}）")
+    microsoft_send_code(ms_win)
+    code = input("微软已向配置的邮箱发送登录代码。输入邮箱收到的验证码（直接回车放弃）: ").strip()
+    if not code:
+        pytest.skip("人工放弃回填（登录代码已发出）")
+    submit_microsoft_code(ms_win, code)
+    try:
+        name = wait_microsoft_logged_in(ready_pid)
+        assert logged_in(ready_pid), "提交验证码后仍未进入已登录态"
         assert "已登录" in name, f"已登录态用户区文案异常: {name!r}"
     finally:
         logout(ready_pid)

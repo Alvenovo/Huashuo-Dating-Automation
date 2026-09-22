@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
@@ -397,4 +398,155 @@ def test_once_still_clean_when_farm_ok_and_no_task(root, monkeypatch, capsys):
 
     assert farm_agent.main() == 0
     assert "无任务，退出" in capsys.readouterr().out
+
+
+# ---------- 人在环门禁 ----------
+#
+# 需求是「自动套件跑完后在终端问一句能不能参与人在环，回『能』就依次收验证码」。
+# 这里锁的是**不能问的场合**：问了没人答，这个常驻 agent 会永久卡在 `input()`，
+# 而控制机只看到「执行中」—— 与节点死机同形，是最坏的一类挂起。
+
+
+class _Tty(io.StringIO):
+    """够用的假终端：有 write/flush，且 isatty 为真。"""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class _NotTty(io.StringIO):
+    def isatty(self) -> bool:
+        return False
+
+
+def _pretend_terminal(monkeypatch, *, stdin: bool = True, stdout: bool = True) -> None:
+    """把 stdin / stdout 换成假终端。
+
+    ⚠️ **必须在测试函数体里调，不能做成 fixture**：pytest 的全局捕获会在 setup 之后、
+    call 之前把 `sys.stdout` 换成它自己的对象，fixture 里设的值会被冲掉 ——
+    症状是「单跑能过、整跑就挂」（本轮真的踩了一次）。测试体里设的值才活到断言那一刻。
+    """
+    monkeypatch.setattr(farm_agent.sys, "stdin", _Tty() if stdin else _NotTty())
+    monkeypatch.setattr(farm_agent.sys, "stdout", _Tty() if stdout else _NotTty())
+
+
+def test_manual_prompt_silent_when_stdin_is_not_a_terminal(monkeypatch):
+    """**关键保护**：stdin 不是终端（计划任务 / 管道）→ 连问都不许问。
+
+    判据是 `isatty()` 而不是「有没有加 --no-manual」：默认就该是安全的，
+    忘了加参数的无人值守节点不能因为漏一个开关就把自己锁死。
+    """
+    _pretend_terminal(monkeypatch, stdin=False)
+    asked: list = []
+    monkeypatch.setattr("builtins.input", lambda *a: asked.append(a) or "能")
+
+    assert farm_agent.ask_manual_participation() is False
+    assert asked == [], "stdin 不是终端时连 input() 都不该调"
+
+
+def test_manual_prompt_silent_when_stdout_is_redirected(monkeypatch):
+    """stdout 被重定向（`... --loop > log.txt`）→ 提示语到不了人眼前，也不能问。
+
+    这种场合人只看到 agent 不动了，与 stdin 那条是**同一种挂起、不同原因**，
+    所以两个都必须是终端的判据，缺一不可。
+    """
+    _pretend_terminal(monkeypatch, stdout=False)
+    asked: list = []
+    monkeypatch.setattr("builtins.input", lambda *a: asked.append(a) or "能")
+
+    assert farm_agent.ask_manual_participation() is False
+    assert asked == [], "stdout 被重定向时连 input() 都不该调"
+
+
+def test_manual_prompt_accepts_the_documented_answer(monkeypatch):
+    """需求原话是「我回复能」—— 中文「能」必须被认，不能只认 y/yes。"""
+    _pretend_terminal(monkeypatch)
+    for answer in ("能", "可以", "好", "是", "行", "y", "YES", "ok"):
+        monkeypatch.setattr("builtins.input", lambda *a, _ans=answer: _ans)
+        assert farm_agent.ask_manual_participation() is True, answer
+
+
+def test_manual_prompt_treats_empty_and_other_replies_as_no(monkeypatch):
+    """直接回车 / 别的回复 = 跳过，不能当成同意（会真发短信、真改密码）。"""
+    _pretend_terminal(monkeypatch)
+    for answer in ("", "   ", "不", "no", "n", "算了吧"):
+        monkeypatch.setattr("builtins.input", lambda *a, _ans=answer: _ans)
+        assert farm_agent.ask_manual_participation() is False, answer
+
+
+def test_manual_prompt_survives_closed_stdin(monkeypatch):
+    """`isatty()` 为真 ≠ 有人在 —— 本项目已踩过这个坑（farm_agent 起 pytest 时
+    只重定向 stdout/stderr，子进程 `isatty()` 为真，于是真发短信 + `input()` 永久阻塞）。
+    stdin 关着时必须当成不参与，不能抛也不能挂。
+    """
+    _pretend_terminal(monkeypatch)
+
+    def _closed(*_args):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _closed)
+    assert farm_agent.ask_manual_participation() is False
+
+
+def test_manual_suite_matches_the_one_dispatch_refuses_to_send():
+    """人在环阶段跑的套件必须**正好**是 `dispatch` 拒投的那一个。
+
+    两边漂移的后果很具体：要么控制机投得进来（节点卡死），
+    要么人在环阶段跑的不是同一批用例（收的码对不上用例）。
+    """
+    from hall_auto.suites import get_suite
+
+    assert get_suite(farm_agent.MANUAL_SUITE).farm_safe is False
+    assert farm_agent.MANUAL_SUITE == "login-manual"
+
+
+def _boom_if_called(*_args, **_kwargs):
+    raise AssertionError("--no-manual 下不该问人在环")
+
+
+def test_manual_phase_is_skipped_with_no_manual_flag(root, monkeypatch):
+    """`--no-manual` 下，就算人真在终端前也不问（计划任务脚本化调用要能显式关掉）。"""
+    _write_task(root, "R01", _task())
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once", "--no-manual"])
+    monkeypatch.setattr(farm_agent, "run_suite", lambda *a, **k: (0, {}))
+    # 证据快照/新目录发现都指向真实 reports/evidence —— 不拦掉会真去 copytree 一整个目录
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+    # 人就在终端前（门禁放行）—— 此时唯一能拦住提问的只有 --no-manual 本身
+    monkeypatch.setattr(farm_agent, "_manual_capable", lambda: True)
+    monkeypatch.setattr(farm_agent, "ask_manual_participation", _boom_if_called)
+
+    assert farm_agent.main() == 0
+
+
+def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
+    """回「能」→ 人在环套件要被真的执行一次，且**标 interactive**。
+
+    标 interactive 是回执的一部分：汇总时要能区分「无人值守跑的」和
+    「真人守着收码跑的」，否则要人输验证码的用例和纯自动用例在报告里长得一样。
+    """
+    _write_task(root, "R01", _task())
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+
+    calls: list[tuple] = []
+
+    def _fake_run_suite(name, sid, scount, log, *, task_env=None, interactive=False):
+        calls.append((name, interactive))
+        return 0, {}
+
+    monkeypatch.setattr(farm_agent, "run_suite", _fake_run_suite)
+    monkeypatch.setattr(farm_agent, "ask_manual_participation", lambda: True)
+
+    assert farm_agent.main() == 0
+    assert ("launch", False) in calls, "任务里的自动套件要先跑"
+    assert (farm_agent.MANUAL_SUITE, True) in calls, "回「能」后人在环套件要以交互模式跑"
+    receipt = json.loads((root / "done" / "R01_T1.json").read_text(encoding="utf-8"))
+    manual = [r for r in receipt["results"] if r["suite"] == farm_agent.MANUAL_SUITE]
+    assert manual and manual[0].get("interactive") is True
 

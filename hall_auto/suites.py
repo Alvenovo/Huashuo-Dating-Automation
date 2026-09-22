@@ -162,6 +162,48 @@ def get_suite(name: str) -> Suite:
     return SUITES[name]
 
 
+# 「全量档」：一次投完**无人值守能跑的全部**套件。
+#
+# 为什么要有它：`dispatch --suites` 要人肉打套件名，漏一个就表现为
+# 「跑着跑着停了」—— 节点跑完手上的活就回轮询，看起来像卡死，实际是没人投。
+# 全量档把「这次要跑什么」从人的记忆里拿出来，一条命令投完。
+#
+# 刻意**不含**这三个，理由不是省事：
+#   install / apps-lifecycle  要管理员 + HALL_ALLOW_INSTALL=1，而 farm_agent 是非提权的
+#                             （把 agent 整体提权会改掉 launch/login 的权限上下文）→ 投了必挂
+#   login-manual              人在环，farm_safe=False，永不进无人值守农场
+FULL_RUN_SUITES: tuple[str, ...] = (
+    "unit",
+    "launch",
+    "apps-detect",
+    "login",
+    "settings",
+    "security",
+    "wb",
+)
+
+# --suites 的展开关键字。写成元组是故意的：两个词都认，但只在这一处定义，
+# 免得 `all` 在 dispatch 里、`full` 在别处，两边漂移。
+FULL_RUN_KEYWORDS: frozenset[str] = frozenset({"all", "full"})
+
+
+def resolve_suite_names(raw: str) -> list[str]:
+    """把命令行 `--suites` 的值展开成套件名列表。
+
+    `all` / `full`（大小写不敏感）→ 全量档；其余按逗号切分、去空、**保序去重**。
+    去重不能省：`--suites launch,launch` 会让节点把同一个套件跑两遍，
+    而回执里两条同名记录看起来像「跑了两轮」，排查时会被带偏。
+    """
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    names: list[str] = []
+    for token in tokens:
+        expanded = FULL_RUN_SUITES if token.lower() in FULL_RUN_KEYWORDS else (token,)
+        for name in expanded:
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def farm_suites() -> list[Suite]:
     """可进无人值守农场的套件（排除人在环）。"""
     return [s for s in SUITES.values() if s.farm_safe]

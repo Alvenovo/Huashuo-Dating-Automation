@@ -268,11 +268,16 @@ def run_suite(
     log_path: Path,
     *,
     task_env: dict[str, str] | None = None,
+    interactive: bool = False,
 ) -> tuple[int, dict[str, bool]]:
     """跑一个套件。返回 (退出码, 本轮凭据状态)。
 
     凭据状态一并返回，是因为调用方写回执时要用它 —— 再算一遍 `build_suite_env`
     没有意义（同参数必得同结果），还会多读一次节点凭据文件。
+
+    `interactive=True` 用于人在环套件：**stdout 不能重定向**。这些用例靠 `input()`
+    的提示语告诉人「现在去收哪个码」，重定向进日志文件的话提示语到不了终端，
+    人会干等 —— 而日志里看着一切正常，最难查的一类故障。
     """
     py = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
     if not py.is_file():
@@ -284,17 +289,78 @@ def run_suite(
     env, notes = build_suite_env(task_env=task_env, node_env_path=NODE_ENV_PATH)
     creds = credential_status(env)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as fh:
-        fh.write(f"\n===== {datetime.now().isoformat(timespec='seconds')} {' '.join(argv)} =====\n")
-        for note in notes:
-            fh.write(f"[env] {note}\n")
-        fh.write(
-            "[env] 凭据：密码登录={password_login} 微软SSO={microsoft_sso} "
-            "改密码={change_password} 共享盘={share_creds}\n".format(**creds)
-        )
-        fh.flush()
-        proc = subprocess.run(argv, cwd=str(REPO_ROOT), env=env, stdout=fh, stderr=subprocess.STDOUT, check=False)
+    header = (
+        f"\n===== {datetime.now().isoformat(timespec='seconds')} {' '.join(argv)} =====\n"
+        + "".join(f"[env] {note}\n" for note in notes)
+        + "[env] 凭据：密码登录={password_login} 微软SSO={microsoft_sso} "
+        "改密码={change_password} 共享盘={share_creds}\n".format(**creds)
+    )
+    if interactive:
+        # 先把「这段没落日志」记进日志，免得以后有人翻日志以为用例没跑。
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(header)
+            fh.write("[env] 人在环：本段输出直接打到终端（提示语要让人看见），故不落本日志；")
+            fh.write("用例结果仍在证据目录的 summary.json / report.html 里\n")
+            fh.flush()
+        proc = subprocess.run(argv, cwd=str(REPO_ROOT), env=env, check=False)
+    else:
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(header)
+            fh.flush()
+            proc = subprocess.run(
+                argv, cwd=str(REPO_ROOT), env=env, stdout=fh, stderr=subprocess.STDOUT, check=False
+            )
     return proc.returncode, creds
+
+
+# 人在环套件：只能跑在「有真人守着的交互式终端」里，且**永不进农场任务文件**。
+# 与 suites.py 的 farm_safe=False 是同一条约束的两侧，改一边要改另一边。
+MANUAL_SUITE = "login-manual"
+
+# 认「能」的回复。中文单字必须显式列出来：`input().lower()` 对「能」没影响，
+# 但只认 y/yes 的话，按需求回「能」的人会被当成拒绝。
+_MANUAL_YES = frozenset({"能", "可以", "好", "是", "行", "y", "yes", "ok", "1"})
+
+
+def _manual_capable() -> bool:
+    """能不能问人在环 —— 人既看得见提示（stdout 是终端）又答得了（stdin 是终端）。
+
+    单独抽出来是为了**只有一个判据**：调用处再写一遍 `isatty()` 的话，
+    迟早出现「问了但人不该看见」或「该问却没问」的半边修。
+    守卫：tests/unit/test_farm_agent_policy.py（注入法验过能红）。
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def ask_manual_participation() -> bool:
+    """问一句要不要现在参与人在环。**不是「人能看见又能回答」的环境就不问，直接 False。**
+
+    判据要**两个都成立**，缺一不可：
+      - `stdin.isatty()`：能回答。无人值守节点（计划任务）里 stdin 不是控制台，
+        问了没人答 → 这个常驻 agent 会永久卡在 `input()` 上，
+        而控制机只看到「执行中」，与节点死机同形，是最坏的一类挂起。
+      - `stdout.isatty()`：能看见。输出被重定向进文件时，提示语到不了人眼前，
+        人只看到 agent 不动了 —— 同一种挂起，只是原因不同。
+
+    ⚠️ **`isatty()` 为真 ≠ 有人在**：本项目已踩过一次（bootstrap 第 7 步的探针
+    先用当前身份建了隐式会话那类问题之外，`farm_agent` 起 pytest 时只重定向
+    stdout/stderr、不重定向 stdin，子进程 `isatty()` 为真 → 真发短信 + `input()`
+    永久阻塞）。所以这里还兜一层 `EOFError`：stdin 关着就当成不参与。
+    """
+    if not _manual_capable():
+        return False
+    print("\n" + "=" * 62, flush=True)
+    print("自动套件已跑完。是否现在参与人在环？", flush=True)
+    print("  参与后会在本终端依次向你要这几个验证码：", flush=True)
+    print("    1) 短信登录        —— 1 个手机短信验证码（会真发短信）", flush=True)
+    print("    2) 微软登录        —— 1 个邮箱验证码（发到 HALL_MS_USER 那个邮箱）", flush=True)
+    print("    3) 忘记密码往返    —— 2 个手机短信验证码（会真把测试号密码改两次再改回）", flush=True)
+    print("=" * 62, flush=True)
+    try:
+        answer = input("输入「能」开始（直接回车跳过）: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in _MANUAL_YES
 
 
 def evidence_snapshot() -> set[str]:
@@ -348,6 +414,53 @@ def _write_node_env(run_dir: Path, node: str, task_id: str, suite: str, creds: d
         print(f"  凭据状态写入证据失败（汇总报告凭据列会不准）：{exc}", file=sys.stderr)
 
 
+def execute_suite(
+    name: str,
+    shard_id: int,
+    shard_count: int,
+    *,
+    root: Path,
+    node: str,
+    task_id: str,
+    log: Path,
+    task_env: dict[str, str],
+    interactive: bool = False,
+) -> tuple[dict, dict[str, bool]]:
+    """跑一个套件并把证据回传农场。返回 (回执条目, 本轮凭据状态)。
+
+    抽出来是因为**人在环阶段要走同一套**：拍证据快照 → 跑 → 认本轮新目录 →
+    写凭据 → 回传。复制一份的话，两边的「认错上一轮目录」这类坑迟早只修一边。
+    """
+    print(f"  跑 {name}（分片 {shard_id}/{shard_count}）", flush=True)
+    before = evidence_snapshot()   # 先拍快照，避免没产出证据时错认上一轮的目录
+    rc, creds = run_suite(name, shard_id, shard_count, log, task_env=task_env, interactive=interactive)
+    run_dir = newest_run_dir(exclude=before)
+    entry: dict = {
+        "suite": name,
+        "shard_id": shard_id,
+        "shard_count": shard_count,
+        "exit_code": rc,
+        "run_dir": run_dir.name if run_dir else None,
+    }
+    if interactive:
+        # 标出来：汇总时能区分「无人值守跑的」和「真人守着收码跑的」，
+        # 否则一条要人输验证码的用例和一条纯自动用例在报告里长得一样。
+        entry["interactive"] = True
+    if run_dir is None:
+        print(f"  {name} 本轮没产出证据目录（rc={rc}），不猜测、不回传", file=sys.stderr, flush=True)
+        return entry, creds
+    _write_node_env(run_dir, node, task_id, name, creds)
+    dest = root / "results" / node / run_dir.name
+    try:
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(run_dir, dest)
+        print(f"  证据已回传 {dest}", flush=True)
+    except OSError as exc:
+        print(f"  证据回传失败：{exc}", file=sys.stderr, flush=True)
+    return entry, creds
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="多机跑批节点侧 agent")
     parser.add_argument("--once", action="store_true", help="取一次任务就跑完退出")
@@ -355,6 +468,11 @@ def main() -> int:
     parser.add_argument("--local", metavar="SUITE", default="", help="不走共享盘，本机直接跑指定套件")
     parser.add_argument("--shard-id", type=int, default=1)
     parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument(
+        "--no-manual",
+        action="store_true",
+        help="跑完自动套件后不再问「要不要参与人在环」。计划任务/无人值守场景加它。",
+    )
     args = parser.parse_args()
 
     # 节点机无人值守：agent 空转等任务时可能一等等几小时，机器若按默认电源方案
@@ -373,7 +491,16 @@ def main() -> int:
 
     if args.local:
         log = REPO_ROOT / "reports" / "farm" / f"local_{args.local}.log"
-        rc, _creds = run_suite(args.local, args.shard_id, args.shard_count, log)
+        # 人在环套件用 --local 跑时**必须交互**：它的全部意义就是让人在终端输验证码，
+        # 输出被重定向进日志的话提示语到不了终端，人只能干等。
+        # 判据用 farm_safe 而不是硬写 login-manual：以后再加人在环套件不用改这里。
+        rc, _creds = run_suite(
+            args.local,
+            args.shard_id,
+            args.shard_count,
+            log,
+            interactive=not get_suite(args.local).farm_safe,
+        )
         print(f"套件 {args.local} 退出码 {rc}，日志 {log}")
         return rc
 
@@ -427,24 +554,31 @@ def main() -> int:
             name = str(entry.get("name") or "")
             sid = int(entry.get("shard_id") or 1)
             scount = int(entry.get("shard_count") or 1)
-            print(f"  跑 {name}（分片 {sid}/{scount}）", flush=True)
-            before = evidence_snapshot()   # 先拍快照，避免没产出证据时错认上一轮的目录
-            rc, creds = run_suite(name, sid, scount, log, task_env=task_env)
-            run_dir = newest_run_dir(exclude=before)
-            results.append({"suite": name, "shard_id": sid, "shard_count": scount, "exit_code": rc,
-                            "run_dir": run_dir.name if run_dir else None})
-            if run_dir is None:
-                print(f"  {name} 本轮没产出证据目录（rc={rc}），不猜测、不回传", file=sys.stderr, flush=True)
-            else:
-                _write_node_env(run_dir, node, task_id, name, creds)
-                dest = root / "results" / node / run_dir.name
-                try:
-                    if dest.exists():
-                        shutil.rmtree(dest, ignore_errors=True)
-                    shutil.copytree(run_dir, dest)
-                    print(f"  证据已回传 {dest}", flush=True)
-                except OSError as exc:
-                    print(f"  证据回传失败：{exc}", file=sys.stderr, flush=True)
+            item, creds = execute_suite(
+                name, sid, scount, root=root, node=node, task_id=task_id, log=log, task_env=task_env
+            )
+            results.append(item)
+
+        # 人在环阶段：**等自动套件全跑完再问**，不夹在中间 ——
+        # 夹在中间的话，一条要人输码的用例会把整批自动套件卡在后面，
+        # 而控制机那边只看到「执行中」，与节点死机同形。
+        if not args.no_manual:
+            if ask_manual_participation():
+                print("  开始人在环，按提示输入验证码。", flush=True)
+                item, manual_creds = execute_suite(
+                    MANUAL_SUITE, 1, 1, root=root, node=node, task_id=task_id, log=log,
+                    task_env=task_env, interactive=True,
+                )
+                results.append(item)
+                if manual_creds:
+                    creds = manual_creds
+            elif _manual_capable():
+                # 人明确跳过了：把补跑命令打出来，别让他再去翻手册。
+                print(
+                    "  跳过人在环。要补跑：.\\.venv\\Scripts\\python.exe -X utf8 "
+                    f"tools\\farm_agent.py --local {MANUAL_SUITE}",
+                    flush=True,
+                )
 
         # 凭据状态写进回执：报告里能区分「这台没配凭据 → 一片 skip」和「用例真跳过」。
         # 不写的话，汇总表上只有一堆黄色，看不出根因是环境没铺好。

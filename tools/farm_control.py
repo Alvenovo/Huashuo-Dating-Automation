@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from hall_auto.env_pack import NODE_ENV_EVIDENCE_NAME  # noqa: E402
-from hall_auto.suites import SUITES, get_suite  # noqa: E402
+from hall_auto.suites import FULL_RUN_KEYWORDS, SUITES, get_suite, resolve_suite_names  # noqa: E402
 
 
 def farm_root() -> Path:
@@ -63,9 +63,14 @@ def farm_root() -> Path:
 def cmd_dispatch(args) -> int:
     root = farm_root()
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
-    suite_names = [s.strip() for s in args.suites.split(",") if s.strip()]
+    suite_names = resolve_suite_names(args.suites)
     if not nodes or not suite_names:
         raise SystemExit("--nodes 与 --suites 都不能为空")
+
+    # 全量档展开必须打出来：否则「我投了 all」和「实际投了哪几个」之间没有凭据 ——
+    # 以后往全量档里加套件，事后没人能还原这次到底投了什么。
+    if args.suites.strip().lower() in FULL_RUN_KEYWORDS:
+        print(f"--suites {args.suites.strip()} → 全量档 {len(suite_names)} 个：{', '.join(suite_names)}")
 
     # 人在环套件（manual）必须挡在农场外：它在节点上会卡在 input() 等验证码/新密码，
     # agent 一直不返回、整台机器再也取不到下一个任务，而控制机这边只看到"执行中"。
@@ -442,7 +447,14 @@ def main() -> int:
 
     p_dispatch = sub.add_parser("dispatch", help="生成并投放任务")
     p_dispatch.add_argument("--nodes", required=True, help="逗号分隔的节点标识")
-    p_dispatch.add_argument("--suites", required=True, help=f"逗号分隔的套件名，可用：{', '.join(sorted(SUITES))}")
+    p_dispatch.add_argument(
+        "--suites",
+        required=True,
+        help=(
+            "逗号分隔的套件名；写 all（或 full）= 全量档，一次投完所有无人值守能跑的套件。"
+            f"单个套件可用：{', '.join(sorted(SUITES))}"
+        ),
+    )
     p_dispatch.add_argument("--task-id", default="")
     p_dispatch.add_argument(
         "--allow-manual",

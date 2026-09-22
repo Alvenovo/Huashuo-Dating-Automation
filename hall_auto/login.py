@@ -18,6 +18,69 @@ CODE_RESEND_TIMEOUT_SEC = 65  # 短信网关冷却常为 60s，还原程紧接�
 MICROSOFT_WINDOW_TIMEOUT_SEC = 15  # 点微软入口后内嵌登录窗出现
 MICROSOFT_PAGE_TIMEOUT_SEC = 20  # WebView 里邮箱框出现（实测 ~1.7s，留余量）
 MICROSOFT_SSO_TIMEOUT_SEC = 25  # 点磁贴/提交后回到大厅已登录态
+MICROSOFT_OTP_SEND_TIMEOUT_SEC = 15  # 「我们向 <邮箱> 发送登录代码。」页上【发送验证码】按钮出现
+MICROSOFT_OTP_PAGE_TIMEOUT_SEC = 30  # 点【发送验证码】后代码输入框出现（微软发信有网络往返）
+
+# 「邮箱验证码页」的文本特征。**这一页必须排在 account_picker 之前判** ——
+# 它的正文是「我们向 3330859445@qq.com 发送登录代码。」，**含邮箱**，
+# 会被 `email in name` 那条误判成「账号选择器」：脚本去点一块纯文本（点不动），
+# 然后死等已登录态 → 报「提交后未进入已登录态」，看着像登录失败，其实是认错了页面。
+# 2026-09-22 真机截图实锤，见 reports 里那轮的 test_microsoft_login_sso/final.png。
+_MICROSOFT_OTP_MARKERS = (
+    "发送登录代码",
+    "发送验证码",
+    "输入代码",
+    "登录代码",
+    "send code",
+    "enter code",
+    "email code",
+)
+
+# 代码输入框 / 提交按钮的 automation id。取微软 login.microsoftonline.com 的
+# 标准 OTC（one-time code）id；**留退路**是因为微软会改版，而这一页结构极简
+# （只有一个输入框），退化规则比写死 id 更耐改。
+_MS_OTP_INPUT_AIDS = ("idTxtBx_SAOTCC_OTC", "idTxtBx_SAOTCC_OTC2")
+_MS_OTP_SUBMIT_AIDS = ("idSubmit_SAOTCC_Continue", "idSIButton9")
+_MS_OTP_SUBMIT_NAMES = ("验证", "继续", "下一步", "提交", "Verify", "Continue", "Next")
+
+
+def _is_microsoft_otp_page(name: str) -> bool:
+    """这一条文本是不是「邮箱验证码」页的特征。大小写不敏感（微软文案中英混排）。"""
+    low = name.lower()
+    return any(marker in name or marker in low for marker in _MICROSOFT_OTP_MARKERS)
+
+
+def _ms_dump_path() -> "Path":
+    from pathlib import Path
+
+    return Path(__file__).resolve().parent.parent / "reports" / "ms_ui_dump"
+
+
+def dump_microsoft_tree(ms_win, reason: str) -> str:
+    """把微软登录窗的控件树落盘，返回文件路径。
+
+    **为什么必须留着**：微软会改版，写死的 aid 一旦失配，现场只有一句
+    「点不到 XX」—— 有这棵树才能把 id 补回去，不用再让一线重跑一次抓。
+    """
+    from datetime import datetime
+
+    lines = [f"# {reason}", f"# {datetime.now().isoformat(timespec='seconds')}"]
+    for node in _ms_nodes(ms_win):
+        try:
+            info = node.element_info
+            lines.append(
+                f"{info.control_type or '?':14} aid={info.automation_id or '':32} "
+                f"name={popup_text(info.name or '')[:120]}"
+            )
+        except Exception:
+            continue
+    target = _ms_dump_path() / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return str(target)
+    except OSError:
+        return ""
 
 
 def _windows(pid: int) -> list:
@@ -384,10 +447,16 @@ def microsoft_state(pid: int, ms_win, email: str) -> str:
     """点「下一步」后的一次快照分支。
 
     返回 account_picker(本机有缓存 MS 会话，免密点磁贴) / password(要密码 i0118) /
-    mfa(要二次验证) / logged_in(已回大厅) / waiting(还在跳转)。
+    mfa(要二次验证) / email_otp(要邮箱验证码) / logged_in(已回大厅) / waiting(还在跳转)。
+
+    **判定顺序不能改**：email_otp 必须排在 account_picker 之前。这一页的正文含邮箱，
+    先判 account_picker 会把「发送登录代码」页认成账号选择器，脚本去点纯文本、
+    然后死等已登录态 —— 报出来的是「提交后未进入已登录态」，与「账号选择器点不动」
+    同形，方向全错（2026-09-22 真机踩过）。
     """
     if logged_in(pid):
         return "logged_in"
+    names: list[str] = []
     for node in _ms_nodes(ms_win):
         try:
             name = popup_text(node.element_info.name or "")
@@ -398,9 +467,99 @@ def microsoft_state(pid: int, ms_win, email: str) -> str:
             return "password"
         if "验证你的身份" in name or "verify your identity" in name.lower():
             return "mfa"
-        if email and email in name:
-            return "account_picker"
+        names.append(name)
+    # 先判验证码页，再判账号选择器 —— 顺序即正确性，别合并成一个 any()。
+    # 守卫：tests/unit/test_login_policy.py（注入法验过能红）。
+    if any(_is_microsoft_otp_page(n) for n in names):
+        return "email_otp"
+    if email and any(email in n for n in names):
+        return "account_picker"
     return "waiting"
+
+
+def _ms_by_name(ms_win, keyword: str, exact: bool = False):
+    for node in _ms_nodes(ms_win):
+        try:
+            name = popup_text(node.element_info.name or "")
+        except Exception:
+            continue
+        if (name == keyword) if exact else (keyword in name):
+            return node
+    return None
+
+
+def microsoft_send_code(ms_win) -> None:
+    """在「我们向 <邮箱> 发送登录代码。」页点【发送验证码】，触发微软把码发到邮箱。
+
+    点完按钮会从控件树里消失/变成倒计时态，所以**不以按钮状态判成功** ——
+    与 `request_sms_code` 同一个口径：以「邮箱真收到码」为准，下一步等代码框。
+    """
+    deadline = time.time() + MICROSOFT_OTP_SEND_TIMEOUT_SEC
+    while time.time() < deadline:
+        for node in _ms_nodes(ms_win):
+            try:
+                name = popup_text(node.element_info.name or "")
+            except Exception:
+                continue
+            if "发送验证码" in name or "send code" in name.lower():
+                if not _press_button(node):
+                    node.click_input()
+                return
+        time.sleep(0.5)
+    raise LaunchError(f"微软登录：等不到【发送验证码】按钮（{MICROSOFT_OTP_SEND_TIMEOUT_SEC}s）")
+
+
+def microsoft_code_input(ms_win):
+    """当前代码输入框；找不到返回 None。
+
+    先按标准 aid 找，再退化到「窗里唯一的 Edit」—— 这一页结构极简，
+    退化规则比写死 id 更耐微软改版。
+    """
+    for aid in _MS_OTP_INPUT_AIDS:
+        node = _ms_by_aid(ms_win, aid)
+        if node is not None:
+            return node
+    edits = []
+    for node in _ms_nodes(ms_win):
+        try:
+            if (node.element_info.control_type or "") == "Edit":
+                edits.append(node)
+        except Exception:
+            continue
+    return edits[0] if len(edits) == 1 else None
+
+
+def wait_microsoft_code_input(ms_win):
+    deadline = time.time() + MICROSOFT_OTP_PAGE_TIMEOUT_SEC
+    while time.time() < deadline:
+        node = microsoft_code_input(ms_win)
+        if node is not None:
+            return node
+        time.sleep(0.5)
+    dumped = dump_microsoft_tree(ms_win, "等不到验证码输入框（aid 可能被微软改版）")
+    raise LaunchError(
+        "微软登录：点【发送验证码】后等不到代码输入框"
+        + (f"，控件树已落盘：{dumped}" if dumped else "")
+    )
+
+
+def submit_microsoft_code(ms_win, code: str) -> None:
+    """填邮箱收到的验证码并提交。"""
+    box = wait_microsoft_code_input(ms_win)
+    box.set_edit_text(code)
+    for aid in _MS_OTP_SUBMIT_AIDS:
+        node = _ms_by_aid(ms_win, aid)
+        if node is not None and _press_button(node):
+            return
+    for keyword in _MS_OTP_SUBMIT_NAMES:
+        node = _ms_by_name(ms_win, keyword)
+        if node is not None and _press_button(node):
+            return
+    dumped = dump_microsoft_tree(ms_win, "找不到代码提交按钮")
+    raise LaunchError(
+        "微软登录：填了验证码但点不到提交按钮"
+        + (f"，控件树已落盘：{dumped}" if dumped else "")
+    )
 
 
 def wait_microsoft_state(pid: int, ms_win, email: str, timeout_sec: int = 15) -> str:

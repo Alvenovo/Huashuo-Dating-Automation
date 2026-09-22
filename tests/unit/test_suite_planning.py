@@ -153,3 +153,64 @@ def test_plan_shards_dict_shape():
     payload = plan.to_dict()
     assert payload["total_nodes"] == 1
     assert payload["assignments"][0]["suite"] == "login-manual"
+
+
+# ---------- 全量档（dispatch --suites all）----------
+
+# 全量档**刻意排除**的套件。改这个名单前先读 hall_auto/suites.py 里 FULL_RUN_SUITES
+# 上面那段理由：manual 会让节点卡在 input()；install / apps-lifecycle 要管理员 +
+# HALL_ALLOW_INSTALL=1，而 farm_agent 是非提权的 → 投了必挂。
+FULL_RUN_EXCLUDED = {"install", "apps-lifecycle", "login-manual"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("keyword", ["all", "ALL", "full", "Full"])
+def test_full_run_keywords_expand_to_the_full_run_set(keyword):
+    """`--suites all` 是「一条命令投完」的入口，大小写都得认。"""
+    assert suites.resolve_suite_names(keyword) == list(suites.FULL_RUN_SUITES)
+
+
+@pytest.mark.unit
+def test_full_run_never_contains_manual_or_elevation_required_suites():
+    """**关键保护**：全量档混进这三类中的任何一个，都会让「一条命令跑完」变成
+    「一条命令卡死」—— 前者卡在等输入，后者因为非提权直接挂。
+
+    这条红了**别改断言**，去改 `FULL_RUN_SUITES`。
+    """
+    for name in FULL_RUN_EXCLUDED:
+        assert name not in suites.FULL_RUN_SUITES, name
+    for name in suites.FULL_RUN_SUITES:
+        assert get_suite(name).farm_safe, name
+
+
+@pytest.mark.unit
+def test_every_runnable_suite_is_either_in_full_run_or_documented_excluded():
+    """反向锁：以后新增了能无人值守跑的套件，忘了加进全量档，
+    现场就又是「跑着跑着停了」—— 那正是全量档要消灭的症状。
+    """
+    for name, suite in SUITES.items():
+        if not suite.farm_safe:
+            continue
+        assert name in suites.FULL_RUN_SUITES or name in FULL_RUN_EXCLUDED, (
+            f"套件 {name} 既不在全量档、也不在排除名单里 —— 二选一，别悬着"
+        )
+
+
+@pytest.mark.unit
+def test_resolve_suite_names_keeps_order_and_dedupes():
+    """保序 + 去重。去重不能省：`launch,launch` 会让节点把同一套件跑两遍，
+    回执里两条同名记录看起来像「跑了两轮」，排查时会被带偏。
+    """
+    assert suites.resolve_suite_names("settings,launch,settings") == ["settings", "launch"]
+
+
+@pytest.mark.unit
+def test_resolve_suite_names_ignores_blank_tokens():
+    assert suites.resolve_suite_names(" launch , , apps-detect ") == ["launch", "apps-detect"]
+
+
+@pytest.mark.unit
+def test_resolve_suite_names_can_mix_keyword_and_names():
+    """`all,install` 这种混写：关键字展开后仍保序，且不重复。"""
+    names = suites.resolve_suite_names("all,unit")
+    assert names == list(suites.FULL_RUN_SUITES)
