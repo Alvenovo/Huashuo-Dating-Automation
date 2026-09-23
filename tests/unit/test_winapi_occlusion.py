@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import sys
 from pathlib import Path
 
@@ -255,3 +256,69 @@ def test_window_state_facts_names_the_occluders(desk, monkeypatch):
     desk[1][300] = 777
     monkeypatch.setattr(winapi, "_hwnd_text", lambda h: "微信")
     assert "微信" in winapi.window_state_facts(HALL_PID)
+
+
+# ---------------- DWM cloaked：唯一能解释「API 说可见、屏幕没画」的机制 ----------------
+#
+# 2026-09-23 真机最后一击：诊断报「visible=True iconic=False 采样命中 5/5 遮挡=无」，
+# 而失败截图里**大厅一个像素都没画出来**。前四种状态全排除 —— 只剩下
+# **另一个虚拟桌面 / 应用被挂起**：这类窗口 `IsWindowVisible` 返回 True、
+# `WindowFromPoint` 照样命中，但**屏幕上不画**，于是 WebView2 不渲染。
+
+
+class _FakeDwm:
+    """只实现 DwmGetWindowAttribute，按 out 指针把 cloaked 值写回去。"""
+
+    def __init__(self, cloaked: int = 0):
+        self.cloaked = cloaked
+        self.calls: list[tuple[int, int]] = []
+
+    def DwmGetWindowAttribute(self, hwnd, attr, out, _size):   # noqa: N802
+        self.calls.append((int(hwnd), int(attr)))
+        # `out` 是 ctypes.byref(DWORD) 产生的 CArgObject，`_obj` 是那个 DWORD
+        ctypes.cast(ctypes.pointer(out._obj), ctypes.POINTER(ctypes.c_uint))[0] = self.cloaked
+        return 0
+
+
+def test_hwnd_cloaked_reads_the_dwm_attribute(desk, monkeypatch):
+    """守卫这个判定本身：要真的去问 DWM，而不是恒返回 0（恒 0 等于没有这个诊断）。"""
+    fake = _FakeDwm(cloaked=2)
+    monkeypatch.setattr(winapi, "_dwmapi", fake)
+
+    assert winapi._hwnd_cloaked(100) == 2
+    assert fake.calls == [(100, winapi.DWMWA_CLOAKED)], "要按 hwnd + DWMWA_CLOAKED 去问"
+
+
+def test_cloaked_hall_is_reported(desk, monkeypatch):
+    """**核心**：cloaked 必须单独报出来，而且要说清「前面那些检查都会说正常」。
+
+    不单列这一条的话，人看到「visible=True 遮挡=无」会以为窗口没问题，转去查产品 ——
+    而产品侧一点问题都没有。
+    """
+    _use(monkeypatch, _FakeUser32())
+    monkeypatch.setattr(winapi, "_hwnd_cloaked", lambda h: 1)
+
+    hint = winapi.occlusion_hint(HALL_PID)
+    assert "cloaked" in hint.lower(), f"要指名道姓说 cloaked：{hint!r}"
+    assert "虚拟桌面" in hint, "要给出可执行动作（切回当前虚拟桌面）"
+
+
+def test_window_state_facts_reports_cloaked(desk, monkeypatch):
+    """依据里也要有 cloaked 这个数字 —— 否则只能看到"一切正常"。"""
+    _use(monkeypatch, _FakeUser32())
+    monkeypatch.setattr(winapi, "_hwnd_cloaked", lambda h: 1)
+    assert "cloaked=1" in winapi.window_state_facts(HALL_PID)
+
+
+def test_ensure_window_shown_does_not_pretend_to_fix_cloaked(desk, monkeypatch):
+    """**关键**：cloaked 修不了（`ShowWindow` 管不着），所以**不许装作修好了**。
+
+    装作修好（返回空串）会把真因盖掉 —— 上层就以为窗口没问题了。
+    """
+    fake = _FakeUser32()
+    _use(monkeypatch, fake)
+    monkeypatch.setattr(winapi, "_hwnd_cloaked", lambda h: 1)
+
+    note = winapi.ensure_window_shown(100)
+    assert "cloaked" in note.lower(), f"要说清是这个状态：{note!r}"
+    assert fake.shown == [], "cloaked 不该靠 ShowWindow 去「修」"

@@ -26,6 +26,10 @@ _user32.WindowFromPoint.argtypes = [wintypes.POINT]
 _user32.WindowFromPoint.restype = wintypes.HWND
 _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 _user32.GetAncestor.restype = wintypes.HWND
+_dwmapi = ctypes.windll.dwmapi
+_dwmapi.DwmGetWindowAttribute.argtypes = [
+    wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+]
 _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 # SendMessageTimeoutW 必须显式声明返回值：ctypes 默认按 c_int 截断，64 位下会丢掉高位
 _user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
@@ -136,6 +140,34 @@ def _close_window(hwnd: int) -> None:
 GA_ROOT = 2
 SW_SHOW = 5
 SW_RESTORE = 9
+DWMWA_CLOAKED = 14
+
+
+def _hwnd_cloaked(hwnd: int) -> int:
+    """0 = 没被 DWM 藏起来；非 0 = **被 cloaked**（DWM 属性，别用返回值当布尔用）。
+
+    ## 为什么要查这个（2026-09-23 真机，最后一种机制）
+
+    **在另一个虚拟桌面上的窗口、以及被挂起的 UWP 窗口，都会被 DWM cloaked。**
+    这类窗口：
+      - `IsWindowVisible` 返回 **True**
+      - `WindowFromPoint` **照样命中**它（z 序上确实在上面）
+      - 但**屏幕上根本不画** —— 于是 WebView2 不渲染，依赖页面的断言永远等不到
+
+    真机现场：诊断报「visible=True iconic=False **采样命中 5/5 遮挡=无**」，
+    而失败截图里**大厅一个像素都没画出来**（只有终端和豆包）。
+    **所有"可见性"检查都说正常，只有这个属性说不对。**
+
+    没有它就只能停在"API 说可见、屏幕说没有"的矛盾里 —— 而那个矛盾没法定性。
+    """
+    value = wintypes.DWORD(0)
+    try:
+        hr = _dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_CLOAKED, ctypes.byref(value), ctypes.sizeof(value)
+        )
+    except OSError:
+        return 0
+    return int(value.value) if hr == 0 else 0
 
 
 def _main_window_hwnd(pid: int, *, visible_only: bool = True) -> int:
@@ -179,6 +211,13 @@ def ensure_window_shown(hwnd: int) -> str:
     """
     if not hwnd:
         return ""
+    if _hwnd_cloaked(hwnd):
+        # 被 DWM cloaked（另一个虚拟桌面 / 应用被挂起）—— **`ShowWindow` 修不了这个**。
+        # 所以只报事实，**不装作修好了**（装作修好会把真因盖掉）。
+        return (
+            "大厅窗口被 DWM **cloaked**（在另一个虚拟桌面 / 应用被挂起）—— "
+            "这种状态 `ShowWindow` 修不了"
+        )
     if _user32.IsIconic(hwnd):
         _user32.ShowWindow(hwnd, SW_RESTORE)
         return "大厅窗口原来是最小化，已还原"
@@ -261,6 +300,7 @@ def window_state_facts(pid: int) -> str:
     return (
         f"窗口状态：pid={pid} hwnd=0x{hwnd:X} rect={_hwnd_rect(hwnd)} "
         f"visible={_hwnd_visible(hwnd)} iconic={bool(_user32.IsIconic(hwnd))} "
+        f"cloaked={_hwnd_cloaked(hwnd)} "
         f"采样命中大厅自己 {own}/{total} 遮挡={names or '无'}"
     )
 
@@ -302,6 +342,13 @@ def occlusion_hint(pid: int) -> str:
             "依赖页面的断言会一直等不到（而 UIA 照样找得到控件，"
             "所以启动阶段不会报错，只会在断言处超时）。"
             "请把窗口显示出来后再跑。"
+        )
+    if _hwnd_cloaked(hwnd):
+        return (
+            "大厅窗口被 **DWM cloaked**（在另一个虚拟桌面 / 应用被挂起）—— "
+            "这种状态 `IsWindowVisible` 和 `WindowFromPoint` **都会说它可见**、"
+            "采样也全都命中它自己，但**屏幕上不会画出来**，WebView2 也就不渲染。"
+            "处理：把大厅切回**当前虚拟桌面**（或先关掉多桌面）再重跑。"
         )
     if _user32.IsIconic(hwnd):
         return (
