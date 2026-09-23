@@ -46,6 +46,11 @@ def _task(task_id: str = "T1", suites=None) -> dict:
     }
 
 
+def _full_run_task(task_id: str = "T1") -> dict:
+    """全量档任务 —— 默认只有它跑完才该问人在环（见 `farm_agent.task_covers_full_run`）。"""
+    return _task(task_id, suites=[{"name": n} for n in farm_agent.FULL_RUN_SUITES])
+
+
 def test_take_task_reaps_stale_running_placeholder(root):
     """**关键保护**：上一轮崩掉留下的 `.running` 会永久挡住新任务。
 
@@ -507,7 +512,7 @@ def test_manual_suite_matches_the_one_dispatch_refuses_to_send():
 
 
 def _boom_if_called(*_args, **_kwargs):
-    raise AssertionError("--no-manual 下不该问人在环")
+    raise AssertionError("这个场景不该问人在环")
 
 
 def test_manual_phase_is_skipped_with_no_manual_flag(root, monkeypatch):
@@ -532,8 +537,10 @@ def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
 
     标 interactive 是回执的一部分：汇总时要能区分「无人值守跑的」和
     「真人守着收码跑的」，否则要人输验证码的用例和纯自动用例在报告里长得一样。
+
+    任务造的是**全量档** —— 默认只有全量档跑完才问人在环（`task_covers_full_run`）。
     """
-    _write_task(root, "R01", _task())
+    _write_task(root, "R01", _full_run_task())
     monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
     monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
     monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
@@ -555,6 +562,61 @@ def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
     receipt = json.loads((root / "done" / "R01_T1.json").read_text(encoding="utf-8"))
     manual = [r for r in receipt["results"] if r["suite"] == farm_agent.MANUAL_SUITE]
     assert manual and manual[0].get("interactive") is True
+
+
+def test_manual_prompt_is_skipped_for_a_smoke_task(root, monkeypatch):
+    """冒烟任务跑完**不许问**人在环 —— 2026-09-23 真机挂起的回归守卫。
+
+    冒烟的全部意义是「几十秒验链路通」。弹一个要人回答的问句，人不答就永久
+    `input()` 阻塞，而控制机侧看到的是「执行中」不动 —— **与节点死机同形**，
+    现场只能干等（真机：4 passed / 36.9s 就跑完，之后两分多钟毫无动静）。
+    """
+    _write_task(root, "R01", _task(suites=[{"name": "launch"}]))
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+    monkeypatch.setattr(farm_agent, "run_suite", lambda *a, **k: (0, {}))
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+    # 人就在终端前（门禁放行）—— 此时唯一能拦住提问的只有「任务不是全量档」本身
+    monkeypatch.setattr(farm_agent, "_manual_capable", lambda: True)
+    monkeypatch.setattr(farm_agent, "ask_manual_participation", _boom_if_called)
+
+    assert farm_agent.main() == 0
+    assert (root / "done" / "R01_T1.json").is_file(), "冒烟任务也必须照常写回执、清 .running"
+
+
+def test_ask_manual_flag_forces_the_prompt_on_a_smoke_task(root, monkeypatch):
+    """`--ask-manual` 能把「只对全量档问」那道门打开 —— 手工调试要在冒烟后跑人在环。"""
+    _write_task(root, "R01", _task(suites=[{"name": "launch"}]))
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once", "--ask-manual"])
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+
+    calls: list[tuple] = []
+
+    def _fake_run_suite(name, sid, scount, log, *, task_env=None, interactive=False):
+        calls.append((name, interactive))
+        return 0, {}
+
+    monkeypatch.setattr(farm_agent, "run_suite", _fake_run_suite)
+    monkeypatch.setattr(farm_agent, "ask_manual_participation", lambda: True)
+
+    assert farm_agent.main() == 0
+    assert (farm_agent.MANUAL_SUITE, True) in calls
+
+
+def test_task_covers_full_run_needs_the_whole_set():
+    """判据是「**覆盖**全量档」，不是「任务里有几个套件」。少一个都不算。"""
+    full = [{"name": n} for n in farm_agent.FULL_RUN_SUITES]
+    assert farm_agent.task_covers_full_run({"suites": full})
+    assert farm_agent.task_covers_full_run({"suites": full + [{"name": "extra"}]})
+    assert not farm_agent.task_covers_full_run({"suites": [{"name": "launch"}]})
+    assert not farm_agent.task_covers_full_run({"suites": full[:-1]}), "少一个都不算全量档"
+    assert not farm_agent.task_covers_full_run({"suites": []})
+    assert not farm_agent.task_covers_full_run({}), "任务缺 suites 键不能炸"
 
 
 # ---------- 人在环提示语的**内容** ----------

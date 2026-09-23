@@ -100,7 +100,7 @@ from hall_auto.env_pack import (  # noqa: E402
     credential_status,
 )
 from hall_auto.evidence import EVIDENCE_ROOT  # noqa: E402
-from hall_auto.suites import build_command, get_suite  # noqa: E402
+from hall_auto.suites import FULL_RUN_SUITES, build_command, get_suite  # noqa: E402
 
 POLL_SECONDS = 30
 
@@ -355,6 +355,24 @@ def _manual_capable() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def task_covers_full_run(task: dict) -> bool:
+    """这个任务的套件是不是**全量档** —— 只有全量档跑完才值得问人在环。
+
+    ⚠️ **2026-09-23 加**：原来不问任务内容，**任何**任务跑完都问一次。投一个 36 秒的
+    `launch` 冒烟任务，agent 也会弹「是否现在参与人在环」并 `input()` 阻塞 ——
+    **控制机那边只看到「执行中」不动，与节点死机完全同形**。
+    真机踩到：冒烟 11:47:31 跑完（4 passed, 36.9s），之后两分多钟没动静，
+    用户只能看着进度行一遍遍重打。
+
+    讽刺的是，这正是本模块人在环那段注释里要避免的挂起（「夹在中间的话……
+    与节点死机同形」），被自己造了出来 —— 只不过这次夹在后面的不是自动套件，是人。
+
+    想在任何任务后都问（手工调试）→ 加 `--ask-manual`。
+    """
+    names = {str(entry.get("name") or "") for entry in (task.get("suites") or [])}
+    return set(FULL_RUN_SUITES) <= names
+
+
 def ask_manual_participation() -> bool:
     """问一句要不要现在参与人在环。**不是「人能看见又能回答」的环境就不问，直接 False。**
 
@@ -497,6 +515,11 @@ def main() -> int:
         action="store_true",
         help="跑完自动套件后不再问「要不要参与人在环」。计划任务/无人值守场景加它。",
     )
+    parser.add_argument(
+        "--ask-manual",
+        action="store_true",
+        help="任何任务跑完都问「要不要参与人在环」（默认只对全量档任务问）。手工调试用。",
+    )
     args = parser.parse_args()
 
     # 节点机无人值守：agent 空转等任务时可能一等等几小时，机器若按默认电源方案
@@ -590,7 +613,12 @@ def main() -> int:
         # 人在环阶段：**等自动套件全跑完再问**，不夹在中间 ——
         # 夹在中间的话，一条要人输码的用例会把整批自动套件卡在后面，
         # 而控制机那边只看到「执行中」，与节点死机同形。
-        if not args.no_manual:
+        #
+        # 2026-09-23 再加一道：**默认只对全量档任务问**。冒烟 / 单套件任务问一次要人
+        # 盯着终端答，不答就永久 `input()` 阻塞 —— 那就又把「与死机同形」造回来了。
+        # 判据见 `task_covers_full_run`；想在任何任务后都问就加 `--ask-manual`。
+        want_manual = args.ask_manual or task_covers_full_run(task)
+        if not args.no_manual and want_manual:
             if ask_manual_participation():
                 print("  开始人在环，按提示输入验证码。", flush=True)
                 item, manual_creds = execute_suite(
