@@ -145,6 +145,7 @@ FIXTURE_REL = "fixtures/7z2602-x64.exe"
 # 与 hall_auto/env_pack.NODE_ENV_FILENAME 是同一条约定，这里 import 过来免得抄错。
 from hall_auto.env_pack import NODE_ENV_FILENAME  # noqa: E402
 from hall_auto.elevation import ELEVATION_SCRIPT, ELEVATION_TASK_NAME  # noqa: E402
+from hall_auto.suites import PYTEST_TMP_REL  # noqa: E402
 
 # P2 内部安全工具在共享盘上的相对目录（相对共享根）与本机落地位置。
 # 与 `step_write_local_config` 写的 `security.tools_dir` 必须指向同一个地方，否则白拷。
@@ -216,6 +217,27 @@ REEXEC_ENV = "HALL_BOOTSTRAP_IN_VENV"
 # 第 12 步自检失败时最多逐条列几条。列全了会把屏幕刷满（一次能红 20 条），
 # 列太少又等于没说 —— 12 条够看清是哪一类，剩下的指到完整日志。
 SELFTEST_MAX_LISTED = 12
+
+# 自检用的 pytest 参数：**必须把临时目录和缓存隔离出去**。
+#
+# 为什么这条不能省（2026-09-23 真机踩出来的，代价是 238 条 ERROR）：
+# 本步骤是**管理员**跑的（bootstrap 整个要管理员），而 pytest 默认把临时根放在
+# `%LOCALAPPDATA%\Temp\pytest-of-<user>`、**按用户名复用**。提权进程创建的对象，
+# Windows 把 owner 记成 `BUILTIN\Administrators`，ACL 也只给 Administrators 全控。
+# 之后**普通权限**跑 `tests/unit` 时，令牌里的 Administrators 是 **deny-only**
+# （UAC 过滤令牌的标准行为）→ 建子目录被拒 → `tmp_path` fixture 在 setup 阶段
+# `PermissionError: [WinError 5]`，凡是用了 `tmp_path` 的用例全崩。
+#
+# 真机后果：新机 bootstrap 自检一跑，之后农场里的 `unit` 套件就有 238/599 条 ERROR，
+# 而报告上看着像"代码烂了"——**每台新机都会这样**，所以必须从源头隔离，而不是事后清目录。
+#
+# `--basetemp` 带 `pid`：每次运行一个新目录，pytest 就不会去 `rm_rf` 别人身份建的目录。
+# `-p no:cacheprovider`：`.pytest_cache/` 有同样的问题（管理员建过之后普通权限写不进，
+# 每轮打一堆 `PytestCacheWarning`）；我们一条都不用 `--lf/--ff/cache` fixture。
+SELFTEST_ISOLATION = [
+    f"--basetemp={PYTEST_TMP_REL}/bootstrap_selftest_p{os.getpid()}",
+    "-p", "no:cacheprovider",
+]
 
 
 def _venv_python() -> Path:
@@ -1620,7 +1642,8 @@ def step_selftest(skip: bool) -> Step:
         return st
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     proc = _run_text(
-        [str(py), "-X", "utf8", "-m", "pytest", "tests/unit", "-q", "--skip-env-check"],
+        [str(py), "-X", "utf8", "-m", "pytest", "tests/unit", "-q", "--skip-env-check",
+         *SELFTEST_ISOLATION],
         cwd=str(REPO_ROOT), env=env, check=False,
     )
 
@@ -1721,9 +1744,15 @@ def _failed_case_ids(raw: str) -> list[str]:
 
 
 def _rerun_failed_cases(py: Path, failed_ids: list[str], env: dict) -> tuple[str, int]:
-    """只重跑失败的那几条用例，返回 (原始输出, rc)。"""
+    """只重跑失败的那几条用例，返回 (原始输出, rc)。
+
+    隔离参数（`SELFTEST_ISOLATION`）这里也要带 —— 漏了的话重跑那一次又会去用
+    共享的 `pytest-of-<user>`，于是"换进程重跑"本身也 PermissionError，
+    看起来像"真失败"，把环境级 flake 误判成代码回归。
+    """
     proc = _run_text(
-        [str(py), "-X", "utf8", "-m", "pytest", *failed_ids, "-q", "--skip-env-check"],
+        [str(py), "-X", "utf8", "-m", "pytest", *failed_ids, "-q", "--skip-env-check",
+         *SELFTEST_ISOLATION],
         cwd=str(REPO_ROOT), env=env, check=False,
     )
     return (proc.stdout or "") + (proc.stderr or ""), proc.returncode or 0

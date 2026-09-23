@@ -141,8 +141,13 @@ def read_json(path: Path) -> dict:
 def validate_pytest_args(raw: object) -> tuple[list[str], str]:
     """校验请求里的 pytest 参数。返回 (参数列表, 拒绝原因)；原因非空即拒。
 
-    允许的形态就三种：`tests/` 下的路径、白名单短参数、`--shard-*`。
+    允许的形态就四种：`tests/` 下的路径、白名单短参数、`--shard-*`、
+    以及**仓库内 `reports/` 下的 `--basetemp=`**。
     其余一律拒绝 —— 提权段跑的是管理员 pytest，参数来源必须是**可预期**的。
+
+    `--basetemp` 单独放行是因为它必须能带值，而值只许指向仓库自己的临时目录
+    （见 `hall_auto/suites.py::pytest_basetemp`）；放行绝对路径或 `..` 等于让它把
+    临时目录写到任意位置。
     """
     if not isinstance(raw, list) or not raw:
         return [], "pytest 参数为空"
@@ -152,6 +157,12 @@ def validate_pytest_args(raw: object) -> tuple[list[str], str]:
         if token in _ALLOWED_FLAGS:
             out.append(token)
             continue
+        if token.startswith("--basetemp="):
+            value = token.split("=", 1)[1].replace("\\", "/")
+            if value.startswith("reports/") and ".." not in value:
+                out.append(token)
+                continue
+            return [], f"--basetemp 只许指向仓库内 reports/ 下：{value!r}"
         if token.startswith(_ALLOWED_PREFIXES):
             out.append(token)
             continue

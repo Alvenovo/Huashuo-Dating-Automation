@@ -112,6 +112,8 @@ from hall_auto.suites import (  # noqa: E402
     build_command,
     execution_order,
     get_suite,
+    prune_pytest_tmp,
+    pytest_basetemp,
 )
 
 POLL_SECONDS = 30
@@ -290,6 +292,7 @@ def run_suite(
     *,
     task_env: dict[str, str] | None = None,
     interactive: bool = False,
+    task_id: str = "local",
 ) -> tuple[int, dict[str, bool]]:
     """跑一个套件。返回 (退出码, 本轮凭据状态)。
 
@@ -299,12 +302,23 @@ def run_suite(
     `interactive=True` 用于人在环套件：**stdout 不能重定向**。这些用例靠 `input()`
     的提示语告诉人「现在去收哪个码」，重定向进日志文件的话提示语到不了终端，
     人会干等 —— 而日志里看着一切正常，最难查的一类故障。
+
+    `task_id` 只用来给本次 pytest 起一个**专属的临时根目录**（`pytest_basetemp`）：
+    不隔离的话，管理员跑过的那一轮会把共享的 `pytest-of-<user>` 变成
+    Administrators 所有，之后普通权限的 `tmp_path` 全崩 —— 2026-09-23 真机
+    238 条 ERROR 就是这个（bootstrap 自检用管理员跑出来的）。
     """
     py = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
     if not py.is_file():
         py = Path(sys.executable)
     suite = get_suite(suite_name)
-    argv = [str(py), "-X", "utf8", "-m", "pytest", *build_command(suite, shard=shard_id, of=shard_count)]
+    argv = [
+        str(py), "-X", "utf8", "-m", "pytest",
+        *build_command(
+            suite, shard=shard_id, of=shard_count,
+            basetemp=pytest_basetemp(task_id, suite_name, shard_id),
+        ),
+    ]
     # 环境变量：任务文件（非敏感）+ 节点本地凭据文件 合成，节点已有值优先。
     # 不这么做的话，密码登录 / SSO 套件在节点机上必然静默 skip。
     env, notes = build_suite_env(task_env=task_env, node_env_path=NODE_ENV_PATH)
@@ -603,7 +617,8 @@ def execute_suite(
         )
     else:
         rc, creds = run_suite(
-            name, shard_id, shard_count, log, task_env=task_env, interactive=interactive
+            name, shard_id, shard_count, log, task_env=task_env, interactive=interactive,
+            task_id=task_id,
         )
     run_dir = newest_run_dir(exclude=before)
     entry: dict = {
@@ -731,6 +746,12 @@ def main() -> int:
         task_id = str(task.get("task_id") or datetime.now().strftime("%Y%m%d_%H%M%S"))
         task_env = task.get("env") if isinstance(task.get("env"), dict) else {}
         print(f"取到任务 {task_id}", flush=True)
+        # 顺手清掉过期的 pytest 临时目录（每个套件一个，见 `pytest_basetemp`）。
+        # 尽力而为：管理员跑过的那批归 Administrators，普通权限删不掉 —— 删不掉就留着，
+        # 不影响正确性（正因为**不复用**才敢这么随意）。
+        pruned = prune_pytest_tmp()
+        if pruned:
+            print(f"  （顺手清掉 {pruned} 个过期的 pytest 临时目录）", flush=True)
         log = root / "logs" / f"{node}_{task_id}.log"
         results: list[dict] = []
         creds: dict[str, bool] = {}

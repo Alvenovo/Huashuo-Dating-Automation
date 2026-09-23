@@ -71,6 +71,33 @@ def test_validate_rejects_empty():
         assert reject
 
 
+def test_validate_accepts_the_isolated_basetemp():
+    """`--basetemp=reports/...` 要放行 —— 提权段的 pytest 也得有专属临时目录。
+
+    不放行的话，提权段会去用共享的 `pytest-of-<user>`；管理员跑过一次之后，
+    普通权限的 `tmp_path` 就全崩（2026-09-23 真机 238 条 ERROR）。
+    """
+    argv = [
+        "tests/launch/test_p1_apps.py", "-m", "apps and destructive", "-v",
+        "-p", "no:cacheprovider",
+        "--basetemp=reports/_pytest_tmp/task_1_apps-lifecycle_s1_p123",
+    ]
+    args, reject = elevation.validate_pytest_args(argv)
+    assert reject == ""
+    assert "--basetemp=reports/_pytest_tmp/task_1_apps-lifecycle_s1_p123" in args
+
+
+def test_validate_rejects_basetemp_outside_the_repo():
+    """**关键保护**：放行 `--basetemp` 是因为它要带值，但值只许指向仓库自己的临时目录。
+
+    放开绝对路径 / `..`，等于让提权段把临时目录写到机器上任意位置。
+    """
+    for bad in ("--basetemp=C:/Windows/Temp", "--basetemp=/tmp/x",
+                "--basetemp=reports/../../evil", "--basetemp=reports\\..\\evil"):
+        _args, reject = elevation.validate_pytest_args(["tests/install", "-v", bad])
+        assert reject, f"该拒绝：{bad}"
+
+
 # ---------------- 请求 / 结果文件 ----------------
 
 def test_write_request_is_atomic_and_leaves_no_tmp(tmp_path):

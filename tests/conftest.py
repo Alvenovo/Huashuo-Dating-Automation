@@ -185,9 +185,30 @@ def allow_install(request) -> bool:
     return _allow_install(request.config)
 
 
+ASSERTION_HEAD = 300
+ASSERTION_TAIL = 480
+
+
 def _assertion_text(report) -> str:
+    """失败/错误文本。**头和尾都要留** —— 只留头等于把最关键的一行丢掉。
+
+    2026-09-23 真机踩出来的：原来是 `text[:800]`。pytest 的 `longrepr` 是**完整调用链**，
+    顺序是「用例自己的源码 → `_ _ _` 逐层往下 → **真正的异常类型与消息在最后**」。
+    截前 800 字符的结果是：**留下了我们本来就有的用例源码，丢掉了唯一有用的异常行**。
+
+    真机后果：`apps-lifecycle` 的 `test_fixture_install_then_uninstall` 失败，
+    报告里那段文字停在 `> matched = install_fixture(` 就没了 ——
+    异常是什么、为什么，一个字都看不到，只能去节点翻 `reports/_elev/elevated_run.log`。
+    **报错必须能指向下一步**，截断截掉根因等于没有报错。
+
+    所以超长时保留「头 + 尾」：头给上下文（哪条用例、什么参数），尾给根因（异常类型 + 消息）。
+    守卫：tests/unit/test_evidence_policy.py::test_assertion_text_keeps_the_exception_at_the_tail。
+    """
     text = str(report.longrepr or "")
-    return text[:800]
+    if len(text) <= ASSERTION_HEAD + ASSERTION_TAIL:
+        return text
+    omitted = len(text) - ASSERTION_HEAD - ASSERTION_TAIL
+    return f"{text[:ASSERTION_HEAD]}\n…（中间省略 {omitted} 字符）…\n{text[-ASSERTION_TAIL:]}"
 
 
 # 门禁 marker → 受阻类别，只作前缀标签；具体原因与解锁条件用 skip 现场写的原文（作者写得比这里更精确）。

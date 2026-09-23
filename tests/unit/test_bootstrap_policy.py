@@ -1063,6 +1063,45 @@ def test_selftest_runs_whole_unit_suite(bm):
     assert argv[argv.index("-m") + 1] == "pytest"
 
 
+def test_selftest_isolates_the_pytest_temp_dir(bm):
+    """**关键保护**：自检必须把 pytest 的临时目录 / 缓存隔离出去。
+
+    本步骤是**管理员**跑的（bootstrap 整体要管理员），而 pytest 默认把临时根放在
+    `%LOCALAPPDATA%\\Temp\\pytest-of-<user>`、**按用户名复用**。提权进程创建的对象，
+    Windows 把 owner 记成 `BUILTIN\\Administrators` —— 之后**普通权限**跑 `tests/unit`
+    时（UAC 过滤令牌里 Administrators 是 deny-only）写不进去，`tmp_path` fixture
+    在 setup 阶段 `PermissionError`。
+
+    真机后果（2026-09-23）：新机第一次跑农场，`unit` 套件 **238 / 599 条 ERROR**，
+    报告上看着像"代码烂了"。**每台新机都会这样**，所以必须从源头隔离，不能靠事后清目录。
+
+    这条红了**别改断言**，去改 `SELFTEST_ISOLATION`。
+    """
+    with mock.patch.object(bm.subprocess, "run", return_value=_fake_run()) as run:
+        bm.step_selftest(False)
+
+    argv = run.call_args_list[0][0][0]
+    assert any(a.startswith("--basetemp=reports/_pytest_tmp/") for a in argv), (
+        f"自检没隔离临时目录，会把共享的 pytest-of-<user> 污染成管理员所有：{argv}"
+    )
+    assert "no:cacheprovider" in argv, f"自检没关掉 pytest 缓存（同样的 ACL 问题）：{argv}"
+
+
+def test_selftest_rerun_also_isolates(bm):
+    """重跑那一次也要带隔离参数。
+
+    漏了的话「换进程重跑失败用例」本身也会 PermissionError ——
+    看起来像"真失败"，把环境级 flake 误判成代码回归（本步的存在意义就没了）。
+    """
+    proc = mock.Mock(stdout="", stderr="", returncode=0)
+    with mock.patch.object(bm.subprocess, "run", return_value=proc) as run:
+        bm._rerun_failed_cases(bm._venv_python(), ["tests/unit/test_x.py::test_y"], {})
+
+    argv = run.call_args_list[0][0][0]
+    assert any(a.startswith("--basetemp=") for a in argv), f"重跑没隔离临时目录：{argv}"
+    assert "no:cacheprovider" in argv, f"重跑没关掉缓存：{argv}"
+
+
 # ---------------- 手册与代码的一致性（防漂移）----------------
 #
 # 这轮踩的坑就是"文档说 A、代码做 B"，而且两轮复核都只核对了名字对不对、

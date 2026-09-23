@@ -556,7 +556,8 @@ def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
 
     calls: list[tuple] = []
 
-    def _fake_run_suite(name, sid, scount, log, *, task_env=None, interactive=False):
+    def _fake_run_suite(name, sid, scount, log, *, task_env=None, interactive=False,
+                        task_id="local"):
         calls.append((name, interactive))
         return 0, {}
 
@@ -782,7 +783,8 @@ def test_ask_manual_flag_forces_the_prompt_on_a_smoke_task(root, monkeypatch):
 
     calls: list[tuple] = []
 
-    def _fake_run_suite(name, sid, scount, log, *, task_env=None, interactive=False):
+    def _fake_run_suite(name, sid, scount, log, *, task_env=None, interactive=False,
+                        task_id="local"):
         calls.append((name, interactive))
         return 0, {}
 

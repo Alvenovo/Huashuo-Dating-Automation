@@ -18,7 +18,22 @@
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# **不 import hall_auto.config**：它顶层 `import yaml`，而本模块会被
+# `tools/bootstrap_machine.py` 间接导入 —— 那台机器上 PyYAML 还没装。
+# 同一条约束见 hall_auto/elevation.py 与 tests/unit/test_bootstrap_policy.py。
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# pytest 的临时根目录落点。**不能让它用系统默认的 `%LOCALAPPDATA%\Temp\pytest-of-<user>`** ——
+# 见 `pytest_basetemp` 的 docstring。
+PYTEST_TMP_REL = "reports/_pytest_tmp"
+PYTEST_TMP_ROOT = REPO_ROOT / PYTEST_TMP_REL
 
 # 用例类 marker（与 pytest.ini 的 markers 一致）
 MARKER_UNIT = "unit"
@@ -275,12 +290,16 @@ def _elevation_rank(name: str) -> int:
         return 0
 
 
-def build_command(suite: Suite, *, shard: int = 1, of: int = 1, extra: list[str] | None = None) -> list[str]:
+def build_command(suite: Suite, *, shard: int = 1, of: int = 1, extra: list[str] | None = None,
+                  basetemp: str | None = None) -> list[str]:
     """拼出该套件的 pytest 参数（不含解释器路径）。
 
     分片用 marker 表达式 + `-k` 不好做精确切分，改用 pytest 的节点 id 取模 ——
     但 pytest 没有原生的"按用例序号取模"参数，所以分片走 `--shard-id/--shard-count`
     这两个自定义选项（在 tests/conftest.py 里实现）。
+
+    `basetemp` 是 `pytest_basetemp()` 的产物（**相对路径**，两个调用方的 cwd 都是仓库根）。
+    传了就加 `--basetemp=`，pytest 的 `tmp_path` 就落在那儿，不碰系统临时目录。
     """
     argv = [*suite.paths, "-m", suite.marker, "-v"]
     if suite.interactive:
@@ -303,9 +322,83 @@ def build_command(suite: Suite, *, shard: int = 1, of: int = 1, extra: list[str]
         argv.append("-s")
     if of > 1:
         argv += [f"--shard-id={shard}", f"--shard-count={of}"]
+    # 关掉 pytest 缓存插件：它会往**仓库根**写 `.pytest_cache/`，而管理员跑过一次之后
+    # 那个目录归 `BUILTIN\Administrators`，之后普通权限的每一轮都会打一堆
+    # `PytestCacheWarning: could not create cache path ... [WinError 5] 拒绝访问`
+    # （2026-09-23 真机日志里就有）。我们**一条都不用** `--lf/--ff/cache` fixture，
+    # 关掉零代价。守卫：tests/unit/test_suite_planning.py。
+    argv += ["-p", "no:cacheprovider"]
+    if basetemp:
+        argv.append(f"--basetemp={basetemp}")
     if extra:
         argv += extra
     return argv
+
+
+def pytest_basetemp(task_id: str, suite: str, shard_id: int = 1) -> str:
+    """给这次 pytest 进程一个**专属**的临时根目录（相对仓库根），返回相对路径字符串。
+
+    ## 为什么必须这么干（2026-09-23 真机踩出来的）
+
+    pytest 默认把临时根放在 `%LOCALAPPDATA%\\Temp\\pytest-of-<user>`，**按用户名复用**。
+    而 bootstrap 第 12 步的自检是**用管理员**跑的，于是那个目录由提权进程创建 ——
+    Windows 把**提权进程创建的对象的 owner 记成 `BUILTIN\\Administrators`**，
+    ACL 也只给 Administrators 全控。
+
+    之后普通权限跑 `tests/unit` 时，进程令牌里的 Administrators 是 **deny-only**
+    （UAC 过滤令牌的标准行为）→ 在 `pytest-of-<user>` 里建子目录被拒 → `tmp_path`
+    fixture 在 setup 阶段直接 `PermissionError: [WinError 5]`。
+    真机后果：**238 / 599 条用例 ERROR**（凡是用了 `tmp_path` 的全崩），
+    而报告上看着像"代码烂了"，实际是环境被自己的 bootstrap 污染了。
+
+    **不是"清一次就好"** —— 每台新机跑 bootstrap 都会重新污染一遍。所以做法是
+    **根本不用那个共享目录**：每次运行一个专属 basetemp，谁建的谁用，永不复用。
+
+    名字里带 `pid` + 时间戳：pytest 对 `--basetemp` 会先 `rm_rf` 再 `mkdir`，
+    而复用的路径若归另一个身份所有（管理员跑过的那批），`rm_rf` 本身就失败并**抛异常**。
+    每次换新名字就绕开了这一步。
+
+    **父目录要自己建**：pytest 的 `--basetemp` 只做 `mkdir()`（不带 `parents=True`），
+    父目录不存在会直接 `FileNotFoundError`，表现是「凡是用了 `tmp_path` 的用例全 ERROR」——
+    和这次要修的症状**长得一模一样**，很容易查错方向（2026-09-23 实测踩到）。
+    """
+    try:
+        PYTEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # 建不出来时**不在这里炸** —— 让 pytest 自己在套件日志里报，那才是能定位的地方。
+        pass
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    raw = f"{task_id}_{suite}_s{shard_id}_p{os.getpid()}_{stamp}"
+    safe = re.sub(r"[^0-9A-Za-z_.\-]", "_", raw)[:90]
+    # 连续的点也洗掉：`task/../evil` 只洗分隔符会留下字面的 `..`（不是路径上跳，
+    # 但看着像，且守卫没法用一句 `".." not in rel` 表达）。`re.sub` 一次搞定。
+    safe = re.sub(r"\.{2,}", "_", safe)
+    return f"{PYTEST_TMP_REL}/{safe}"
+
+
+def prune_pytest_tmp(keep_days: int = 2) -> int:
+    """清掉过期的 basetemp 目录。返回删掉的个数。
+
+    **尽力而为，绝不抛异常**：目录可能归另一个身份所有（管理员跑过的那批），
+    普通权限删不掉。删不掉就留着，反正不影响正确性 —— 只是占点磁盘。
+    """
+    if keep_days <= 0 or not PYTEST_TMP_ROOT.is_dir():
+        return 0
+    cutoff = time.time() - keep_days * 86400
+    removed = 0
+    try:
+        entries = list(PYTEST_TMP_ROOT.iterdir())
+    except OSError:
+        return 0
+    for path in entries:
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 @dataclass

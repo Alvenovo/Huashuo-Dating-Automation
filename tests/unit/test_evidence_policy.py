@@ -315,3 +315,52 @@ def test_runbook_states_the_same_default_as_conftest():
         f"运行手册里没写「`--evidence={default}`（默认）」—— "
         "默认值改了但手册没跟上，一线会以为要显式加 failure-only，或者反过来以为默认是全留"
     )
+
+
+# ---------------- 失败文本必须留下**根因**（不能只截头）----------------
+#
+# 2026-09-23 真机踩出来的：原来是 `text[:800]`。pytest 的 `longrepr` 是完整调用链，
+# 顺序是「用例源码 → `_ _ _` 逐层往下 → **真正的异常类型与消息在最后**」。
+# 截前 800 字符 = 留下了我们本来就有的用例源码、丢掉了唯一有用的异常行。
+#
+# 后果很具体：`apps-lifecycle` 的 `test_fixture_install_then_uninstall` 失败，
+# 报告里那段文字停在 `> matched = install_fixture(` 就没了 ——
+# 异常是什么、为什么，一个字都看不到，只能去节点翻 `reports\_elev\elevated_run.log`。
+
+
+class _LongRepr:
+    """只带 `longrepr` 的假 report（`_assertion_text` 只用这一个字段）。"""
+
+    def __init__(self, text: str):
+        self.longrepr = text
+
+
+def test_assertion_text_keeps_the_exception_at_the_tail():
+    """**核心回归锁**：超长时尾巴必须留 —— 根因就在尾巴上。"""
+    conftest_mod = _load_conftest()
+    traceback_text = (
+        "用例自己的源码（几十行，本来就有）\n" * 60
+        + "E   RuntimeError: 钉住安装包不存在：C:/.../fixtures/xxx.exe"
+    )
+    assert len(traceback_text) > conftest_mod.ASSERTION_HEAD + conftest_mod.ASSERTION_TAIL, (
+        "这条用例要造一段**真的超长**的文本，否则走不到截断分支，等于没测"
+    )
+    out = conftest_mod._assertion_text(_LongRepr(traceback_text))
+
+    assert "RuntimeError: 钉住安装包不存在" in out, (
+        "截断把根因丢了 —— 报告里只剩用例源码，等于没有报错"
+    )
+    assert "省略" in out, "要显式标出中间被省略了多少，别让人以为原文就这么短"
+    assert len(out) < len(traceback_text), "超长时要真的截，不能原样返回（报告会爆）"
+
+
+def test_assertion_text_keeps_short_text_intact():
+    """短文本原样返回 —— 别为了统一格式给正常失败加省略号。"""
+    conftest_mod = _load_conftest()
+    short = "assert False"
+    assert conftest_mod._assertion_text(_LongRepr(short)) == short
+
+
+def test_assertion_text_handles_empty_longrepr():
+    conftest_mod = _load_conftest()
+    assert conftest_mod._assertion_text(_LongRepr("")) == ""

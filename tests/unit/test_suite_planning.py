@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import os
+import time
+
 import pytest
 
 from hall_auto import suites
@@ -325,3 +328,98 @@ def test_interactive_suites_are_never_farm_safe():
 def test_login_manual_keeps_its_interactive_flag():
     """`login-manual` 的 interactive 位别被顺手删掉 —— 删了 `-s` 就没了，整套静默失效。"""
     assert get_suite("login-manual").interactive is True
+
+
+# ---------- pytest 的临时目录 / 缓存隔离（2026-09-23：238 条 ERROR 的根因）----------
+#
+# bootstrap 第 12 步的自检是**管理员**跑的，而 pytest 默认把临时根放在
+# `%LOCALAPPDATA%\Temp\pytest-of-<user>`、按用户名复用。提权进程建出来的目录
+# owner 是 `BUILTIN\Administrators`，之后**普通权限**（UAC 过滤令牌里 Administrators
+# 是 deny-only）写不进去 → `tmp_path` fixture 在 setup 阶段 `PermissionError`，
+# 凡是用了 `tmp_path` 的用例全崩。真机后果：新机第一次跑农场，`unit` 套件
+# **238 / 599 条 ERROR**，报告上看着像"代码烂了"。
+#
+# 修法不是"事后清目录"（每台新机 bootstrap 都会重新污染），而是**根本不用那个共享目录**。
+
+
+@pytest.mark.unit
+def test_build_command_disables_pytest_cache():
+    """关掉 pytest 缓存插件 —— 它会往仓库根写 `.pytest_cache/`，有同样的 ACL 污染问题。"""
+    argv = suites.build_command(get_suite("launch"))
+    assert "-p" in argv and "no:cacheprovider" in argv, f"没关掉 cacheprovider：{argv}"
+
+
+@pytest.mark.unit
+def test_build_command_uses_the_given_basetemp():
+    argv = suites.build_command(get_suite("launch"), basetemp="reports/_pytest_tmp/X")
+    assert "--basetemp=reports/_pytest_tmp/X" in argv
+
+
+@pytest.mark.unit
+def test_build_command_omits_basetemp_when_not_given():
+    """不给就不加 —— 免得调用方以为"默认已经隔离了"。"""
+    assert not any(a.startswith("--basetemp=") for a in suites.build_command(get_suite("launch")))
+
+
+@pytest.mark.unit
+def test_pytest_basetemp_is_relative_and_under_the_repo():
+    """必须是**相对仓库根**的 `reports/` 路径。
+
+    相对：两个调用方（`farm_agent.run_suite` / `elevated_runner`）的 cwd 都是仓库根，
+    而提权侧的参数白名单**只放行 `reports/` 下的相对路径**（绝对路径等于让它写到任意位置）。
+    """
+    rel = suites.pytest_basetemp("task_1", "launch", 1)
+    assert rel.startswith("reports/_pytest_tmp/"), rel
+    assert ".." not in rel and ":" not in rel, f"不许出现盘符或上跳：{rel}"
+
+
+@pytest.mark.unit
+def test_pytest_basetemp_is_unique_per_process():
+    """带 pid：pytest 对 `--basetemp` 会先 `rm_rf` 再 `mkdir`。
+
+    路径复用、而归另一个身份所有时，**`rm_rf` 本身就失败** —— 每次换新名字才绕得开。
+    """
+    a = suites.pytest_basetemp("task_1", "launch", 1)
+    b = suites.pytest_basetemp("task_1", "launch", 2)
+    c = suites.pytest_basetemp("task_2", "launch", 1)
+    assert len({a, b, c}) == 3
+
+
+@pytest.mark.unit
+def test_pytest_basetemp_sanitizes_the_name():
+    """任务名 / 套件名会进路径，必须洗掉分隔符，别让它跑出目录。"""
+    rel = suites.pytest_basetemp("task/../evil", "launch", 1)
+    assert ".." not in rel and "/" not in rel.split("reports/_pytest_tmp/", 1)[1]
+
+
+@pytest.mark.unit
+def test_prune_pytest_tmp_removes_only_old_ones(tmp_path, monkeypatch):
+    """过期的删掉、当次的留着。"""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    old, fresh = root / "old", root / "fresh"
+    old.mkdir()
+    fresh.mkdir()
+    stale = time.time() - 10 * 86400
+    os.utime(old, (stale, stale))
+
+    monkeypatch.setattr(suites, "PYTEST_TMP_ROOT", root)
+    assert suites.prune_pytest_tmp(keep_days=1) == 1
+    assert not old.exists(), "过期目录该删"
+    assert fresh.exists(), "当次目录不能删"
+
+
+@pytest.mark.unit
+def test_prune_pytest_tmp_never_raises(tmp_path, monkeypatch):
+    """清理是**尽力而为**：目录可能归另一个身份所有（管理员跑过的那批），删不掉就留着。
+
+    删不掉不影响正确性 —— 正因为 basetemp **不复用**，留着也只是占点磁盘。
+    所以这里只要求"不抛异常"。
+    """
+    monkeypatch.setattr(suites, "PYTEST_TMP_ROOT", tmp_path / "nope")
+    assert suites.prune_pytest_tmp() == 0          # 目录不存在
+
+    blocker = tmp_path / "afile"
+    blocker.write_text("x", encoding="utf-8")       # 拿普通文件当目录根
+    monkeypatch.setattr(suites, "PYTEST_TMP_ROOT", blocker)
+    assert suites.prune_pytest_tmp() == 0           # 不能抛
