@@ -15,16 +15,25 @@
 
 ## 用法
 
-    # 投 launch + apps-detect 给一台节点，等它跑完，自动出报告
+    # 冒烟：一个套件、几十秒，只验「节点真的会自己取任务跑起来」
     .\\.venv\\Scripts\\python.exe -X utf8 tools\\run_farm.py ^
-        --nodes DESKTOP-DOHED68 --suites launch,apps-detect
+        --nodes DESKTOP-DOHED68 --suites launch
 
-    # 多台 + 全量档 + 自定义超时
+    # 冒烟过了 → 一条命令跑全部（含真装真卸，节点侧零人工）
     .\\.venv\\Scripts\\python.exe -X utf8 tools\\run_farm.py ^
-        --nodes R01,R02,R03 --suites all --timeout 7200
+        --nodes DESKTOP-DOHED68 --suites all
+
+    # 多台
+    .\\.venv\\Scripts\\python.exe -X utf8 tools\\run_farm.py ^
+        --nodes R01,R02,R03 --suites all --timeout 14400
 
     # 只投不等（等价于原来的 dispatch）
     .\\.venv\\Scripts\\python.exe -X utf8 tools\\run_farm.py --nodes R01 --suites launch --no-wait
+
+`--suites all` = 全量档 9 个，**含 `install`（卸载重装大厅本体）和 `apps-lifecycle`
+（夹具真装真卸）** —— 这两个要管理员，但走的是 bootstrap 建好的提权计划任务
+`HallAutoP1`，节点侧零人工（见 `hall_auto/elevation.py`）。唯一不跑的是
+`login-manual`（要真人收验证码），它在节点终端上单独问、单独跑。
 
 **它不替代节点侧的 `farm_agent.py --loop`。** 节点上那个窗口没开，本脚本会在
 90 秒后明确告诉你「任务没被取走」，然后继续等（或超时退出）—— 这是刻意的：
@@ -32,7 +41,7 @@
 
 ## 退出码
 
-`0` 全部节点交了回执 ／ `1` 超时（有节点没交）／ `2` 投任务就失败了 ／ `130` 人按了 Ctrl+C
+`0` 全部节点交了回执 ／ `1` 超时（有节点没交）／ `2` 投前自检没过或投任务失败 ／ `130` 人按了 Ctrl+C
 """
 
 from __future__ import annotations
@@ -48,12 +57,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from hall_auto.suites import get_suite, resolve_suite_names  # noqa: E402
+
 # 投出去多久还没被取走就告警。3 个轮询周期（agent 的 POLL_SECONDS = 30），
 # 足够覆盖"节点刚好在轮询间隔里"的正常情况，又不至于让人干等。
 STUCK_WARN_SECONDS = 90
 
 DEFAULT_INTERVAL = 30
-DEFAULT_TIMEOUT = 3600
+# 默认超时按**全量档**给：9 个套件里 `apps-lifecycle` 要下 165MB 级安装包、
+# `install` 要卸载+重装大厅，单套件十几分钟是常态。按老口径（1 小时）给的话，
+# 全量档跑到一半就被判超时，看着像"卡住"。
+DEFAULT_TIMEOUT = 4 * 3600
 
 
 def _load_farm_control():
@@ -172,6 +186,69 @@ def _timeout_report(root: Path, nodes: list[str], states: dict[str, str],
     print("\n人工看进度：farm_control.py status", flush=True)
 
 
+# ---------------------------------------------------------------- 投前自检
+
+def preflight(root: Path, nodes: list[str]) -> tuple[list[str], list[str]]:
+    """投任务前的自检。返回 (必须停下的问题, 提醒)。
+
+    **为什么要在投之前查**：任务投出去没人取时，原来的表现是控制机干等一小时才超时，
+    期间只有一行「待执行 1 个」。而下面这几类问题在**投之前**就能看出来，
+    发现时间从一小时变成一秒：
+
+      - 农场目录连不上 / 建不出来（包源机关了、代理没关、共享名写错）
+      - 目标节点上还压着**上一轮没被取走**的任务 —— 本次投递会把它覆盖掉
+      - 有残留的 `.running` 占位 —— 它会挡住新任务（agent 重跑时会自动清，但要说一声）
+
+    注意 `Path.is_dir()` 在 UNC 上会把 `OSError` 吞成 `False`（本项目实测过），
+    所以判可达性用「真去 mkdir 一次」，不是 `is_dir()`。
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    for sub in ("tasks", "done", "results", "logs"):
+        try:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            errors.append(f"农场目录不可用：{root / sub}（{exc}）")
+            return errors, warnings
+
+    for node in nodes:
+        running = root / "tasks" / f"{node}.json.running"
+        if running.is_file():
+            warnings.append(
+                f"{node}：有残留的 `.running` 占位 —— 上一轮没正常收尾。"
+                "节点重跑 agent 时会自动清，没清掉它取不到新任务。"
+            )
+        pending = root / "tasks" / f"{node}.json"
+        if pending.is_file():
+            warnings.append(
+                f"{node}：还压着一条**没被取走**的任务（{pending.name}），本次投递会把它覆盖。"
+            )
+    return errors, warnings
+
+
+def destructive_notice(suite_names: list[str]) -> str:
+    """提权/破坏性套件的醒目告警。**空串 = 本次没有**。
+
+    全量档现在包含真装真卸（`install` 会卸载并重装大厅本体），
+    这事必须在按下回车之前说清楚 —— 它是跑批里唯一会改动被测产品的动作。
+    """
+    elevated = [n for n in suite_names if get_suite(n).needs_elevation]
+    if not elevated:
+        return ""
+    lines = [
+        "⚠ 本次含真装真卸套件（走提权通道 HallAutoP1，节点侧零人工）：",
+    ]
+    for name in elevated:
+        what = {
+            "install": "卸载并重装**华硕大厅本体** —— 跑完登录态/主题档位全部重置",
+            "apps-lifecycle": "真装真卸夹具应用（走厂商 CDN，165MB 级安装包）",
+        }.get(name, get_suite(name).needs)
+        lines.append(f"    · {name}：{what}")
+    lines.append("  ⚠ **只能在测试机上跑。** 办公机上投这一批会把大厅卸掉重装。")
+    lines.append("  它们排在只读套件之后执行（install 最后），不会打断前面的结果。")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- 主流程
 
 def build_parser() -> argparse.ArgumentParser:
@@ -181,7 +258,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--nodes", required=True, help="逗号分隔的节点标识（必须和节点心跳里的名字一致）")
     parser.add_argument("--suites", required=True,
-                        help="逗号分隔的套件名；写 all = 全量档。单个套件可用：unit/launch/apps-detect/…")
+                        help="逗号分隔的套件名；写 all = 全量档（9 个，含真装真卸）。"
+                             "单个套件可用：unit/launch/apps-detect/…")
     parser.add_argument("--task-id", default="", help="不填则用当前时间生成")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
                         help=f"轮询间隔秒数（默认 {DEFAULT_INTERVAL}）")
@@ -214,7 +292,23 @@ def main(argv: list[str] | None = None) -> int:
     print(f"套件：{args.suites}", flush=True)
     print(flush=True)
 
-    print("[1/3] 投任务", flush=True)
+    root = fc.farm_root()
+
+    print("[1/4] 投前自检", flush=True)
+    errors, warnings = preflight(root, nodes)
+    for line in warnings:
+        print(f"  ⚠ {line}", flush=True)
+    if errors:
+        for line in errors:
+            print(f"  ✗ {line}", file=sys.stderr, flush=True)
+        print("\n自检没过，不投任务。", file=sys.stderr, flush=True)
+        return 2
+    print(f"  ✓ 农场目录可用：{root}", flush=True)
+    notice = destructive_notice(resolve_suite_names(args.suites))
+    if notice:
+        print("\n" + notice + "\n", flush=True)
+
+    print("[2/4] 投任务", flush=True)
     dispatch_args = argparse.Namespace(
         nodes=args.nodes,
         suites=args.suites,
@@ -235,9 +329,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[--no-wait] 投完即退。看进度：farm_control.py status", flush=True)
         return 0
 
-    root = fc.farm_root()
     started = time.monotonic()
-    print(f"\n[2/3] 等结果（每 {args.interval} 秒查一次，Ctrl+C 可中断）", flush=True)
+    print(f"\n[3/4] 等结果（每 {args.interval} 秒查一次，Ctrl+C 可中断）", flush=True)
 
     stuck_warned = False
     prev_states: dict[str, str] | None = None
@@ -272,13 +365,38 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[--no-aggregate] 跳过汇总。", flush=True)
         return 0
 
-    print("\n[3/3] 出报告", flush=True)
+    print("\n[4/4] 出报告", flush=True)
     try:
         fc.cmd_aggregate(argparse.Namespace())
     except SystemExit as exc:
         print(f"汇总失败：{exc}", file=sys.stderr, flush=True)
         return 1
+
+    # 全自动部分到此结束。人在环**不在这个脚本里**：它要真人收验证码，
+    # 只能在节点那台机器的终端上问（agent 跑完自动段后会问一句）。
+    # 这里只负责告诉人「去哪儿、怎么并进报告」，不替人做决定。
+    if task_covers_full_run_names(resolve_suite_names(args.suites)):
+        print(
+            "\n自动段全部跑完。人在环（微软邮箱码 / 短信码 / 忘记密码往返）"
+            "在**节点那台机器的终端**上：\n"
+            "  跑完自动段后 agent 会问一句「是否现在参与人在环？」—— 回「能」就开始收码。\n"
+            "  错过/跳过了要补跑：在节点上敲 "
+            ".\\.venv\\Scripts\\python.exe -X utf8 tools\\farm_agent.py --local login-manual\n"
+            "  跑完在控制机重跑一次 aggregate，把人在环结果并进上面那份报告。",
+            flush=True,
+        )
     return 0
+
+
+def task_covers_full_run_names(suite_names: list[str]) -> bool:
+    """这批套件是不是覆盖了全量档的自动段 —— 是的话才提人在环。
+
+    判据与节点侧 `farm_agent.task_covers_full_run` 同源（都对着 `FULL_RUN_SUITES`），
+    写死套件名的话，以后往全量档里加套件，两边就会各说各的。
+    """
+    from hall_auto.suites import FULL_RUN_SUITES
+
+    return set(FULL_RUN_SUITES) <= set(suite_names)
 
 
 if __name__ == "__main__":

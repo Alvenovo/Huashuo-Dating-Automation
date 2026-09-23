@@ -216,3 +216,113 @@ def test_empty_nodes_rejected(fake_fc):
 def test_bad_interval_rejected(fake_fc):
     with pytest.raises(SystemExit):
         run_farm.main(["--nodes", "R01", "--suites", "launch", "--interval", "0"])
+
+
+# ------------------------------------------------------------ 投前自检
+#
+# 2026-09-23 加：任务投出去没人取时，原来的表现是**干等一小时才超时**，
+# 期间只有一行「待执行 1 个」。而下面这几类问题在投之前就能看出来 ——
+# 发现时间从一小时变成一秒。
+
+
+def test_preflight_ok_on_a_healthy_farm(root):
+    errors, warnings = run_farm.preflight(root, ["R01"])
+    assert errors == [] and warnings == []
+
+
+def test_preflight_creates_the_farm_dirs(tmp_path):
+    """节点第一次跑不必手工建目录（幂等）。"""
+    errors, _warnings = run_farm.preflight(tmp_path / "fresh", ["R01"])
+    assert errors == []
+    assert (tmp_path / "fresh" / "tasks").is_dir()
+
+
+def test_preflight_reports_an_unusable_farm_root(tmp_path):
+    """**关键**：农场目录建不出来时要**拦住投递**，不是投出去再等超时。
+
+    包源机关了 / 代理没关 / 共享名写错，都表现成这一条。
+    `Path.is_dir()` 在 UNC 上会把 OSError 吞成 False（本项目实测过），
+    所以判可达性是「真去 mkdir 一次」。
+    """
+    blocker = tmp_path / "afile"
+    blocker.write_text("x", encoding="utf-8")   # 拿普通文件当父目录，mkdir 必抛 OSError
+    errors, _warnings = run_farm.preflight(blocker / "farm", ["R01"])
+    assert errors, "农场不可用却没报错"
+    assert "农场目录不可用" in errors[0]
+
+
+def test_preflight_warns_about_a_leftover_running_placeholder(root):
+    """残留 `.running` 会挡住新任务 —— 投之前先说一声。"""
+    (root / "tasks" / "R01.json.running").write_text("{}", encoding="utf-8")
+    errors, warnings = run_farm.preflight(root, ["R01"])
+    assert errors == []
+    assert any(".running" in w for w in warnings)
+
+
+def test_preflight_warns_when_a_previous_task_was_never_taken(root):
+    """上一轮的任务还压着 → 本次投递会把它覆盖掉。这事不能悄悄发生。"""
+    (root / "tasks" / "R01.json").write_text("{}", encoding="utf-8")
+    _errors, warnings = run_farm.preflight(root, ["R01"])
+    assert any("没被取走" in w for w in warnings)
+
+
+def test_preflight_fails_before_dispatch(fake_fc, tmp_path, monkeypatch):
+    """自检没过时**不投任务**，退出码 2。"""
+    blocker = tmp_path / "afile"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(fake_fc, "farm_root", lambda: blocker / "farm")
+    rc = run_farm.main(["--nodes", "R01", "--suites", "launch", "--no-wait"])
+    assert rc == 2
+
+
+# ---------------------------------------------------- 真装真卸的醒目告警
+
+def test_destructive_notice_names_what_gets_installed(root):
+    """全量档现在含真装真卸，**按下回车之前必须说清楚**。
+
+    `install` 会卸载并重装大厅本体 —— 这是跑批里唯一会改动被测产品的动作，
+    一句话不说就投出去，人会在机器被重装到一半时才发现。
+    """
+    notice = run_farm.destructive_notice(["unit", "install", "apps-lifecycle"])
+    assert "install" in notice and "apps-lifecycle" in notice
+    assert "华硕大厅本体" in notice
+    assert "只能在测试机上跑" in notice
+
+
+def test_destructive_notice_is_silent_for_readonly_batches(root):
+    """只读批次不该看到这个告警 —— 否则真出问题时人也当噪音忽略。"""
+    assert run_farm.destructive_notice(["unit", "launch", "login"]) == ""
+
+
+def test_destructive_notice_covers_the_whole_full_run():
+    """全量档必须触发告警。往全量档里加了提权套件而这里没跟上，就是漏报。"""
+    from hall_auto.suites import FULL_RUN_SUITES
+
+    assert run_farm.destructive_notice(list(FULL_RUN_SUITES)), (
+        "全量档含真装真卸，却没打出告警"
+    )
+
+
+def test_manual_hint_only_for_a_full_run_batch():
+    """人在环的提示只对**覆盖全量档**的批次打。
+
+    判据与节点侧同源（都对着 `FULL_RUN_SUITES`）—— 写死套件名的话，
+    以后往全量档里加套件，两边会各说各的。
+    """
+    from hall_auto.suites import FULL_RUN_SUITES
+
+    assert run_farm.task_covers_full_run_names(list(FULL_RUN_SUITES))
+    assert not run_farm.task_covers_full_run_names(["launch"])
+    assert not run_farm.task_covers_full_run_names(list(FULL_RUN_SUITES)[:-1])
+
+
+def test_full_run_reports_the_manual_phase_location(fake_fc, root, capsys):
+    """全量档跑完，控制机要告诉人「人在环在哪儿跑、跑完怎么并进报告」。"""
+    (root / "tasks" / "R01.json").unlink(missing_ok=True)
+    (root / "done" / "R01_T1.json").write_text("{}", encoding="utf-8")
+    rc = run_farm.main(["--nodes", "R01", "--suites", "all", "--task-id", "T1",
+                        "--interval", "1", "--timeout", "5"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "login-manual" in out, "没告诉人人在环怎么跑"
+    assert "aggregate" in out, "没告诉人跑完怎么并进报告"

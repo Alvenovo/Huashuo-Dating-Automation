@@ -11,6 +11,9 @@
 - **密码 / 测试号 / 微软邮箱只走环境变量**（`HALL_TEST_USER` / `HALL_TEST_PASSWORD` / `HALL_TEST_NEW_PASSWORD` / `HALL_MS_USER`），不落盘、不进 git、不写进任何文件。`config.local.yaml` 已在 `.gitignore`。
 - **绝不点这些按钮**：同步页「全部安装」`InstallAllBtn` 及任何条目安装、更新页 `UpdateAllBtn`、任何非夹具条目——列表里全是 QQ/微信/WPS 这类日常软件，点下去就真装一机器。
 - **办公机不要 `--allow-install`**；破坏性用例（`destructive` 标记）必须门禁 + 提权才跑。
+  ⚠️ **2026-09-23 起全量档 `--suites all` 含 `install`（卸载重装大厅本体）和 `apps-lifecycle`
+  （夹具真装真卸）** —— 它们走提权通道（计划任务 `HallAutoP1`，`hall_auto/elevation.py`）执行，
+  节点侧零人工。**在办公机上要跑回归就投具体套件**（`launch,login,settings,…`），**别投 `all`**。
 - 本机 `python` 不在 PATH，一律 `.venv\Scripts\python.exe`，带 `PYTHONUTF8=1`。
 - 内部安全工具（CheckAppV/SignAppsV/signcheck_v2）和受检安装包**不进公开仓库**，只放 `Desktop/Test/华硕大厅/fixtures/`，committed 的 `config.yaml` 对应块留空。
 - **机器绝对路径不进代码**：`*.py` / `*.ps1` 里不许出现**具体用户 profile** 的绝对路径（`C:/Users/<名字>/...`）。

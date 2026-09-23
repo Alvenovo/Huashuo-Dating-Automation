@@ -22,7 +22,7 @@
 | 8 **安全工具** | `fixtures/security_tools/` 关键文件在否 | 一个字节都不拷 |
 | 9 农场目录 | `tasks/ done/ results/ logs/` 齐否 | 齐则跳过 |
 | 10 准备安装包 | 本地 → 缓存 → 共享盘 → 下载 | 命中即止 |
-| 11 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间） |
+| 11 提权计划任务 | 查任务是否已存在且指向本仓库脚本 | 跳过（覆盖会重置触发时间）；**指向旧动作时例外重建** |
 | 12 自检 | 跑 tests/unit | 可 `--skip-selftest` |
 | 13 **屏幕常亮** | 跑 `set_keep_awake.ps1 -Check` 回读电源超时值 | 跳过（不重复写备份） |
 
@@ -144,6 +144,7 @@ FIXTURE_REL = "fixtures/7z2602-x64.exe"
 # 节点本地凭据文件的名字（仓库根下，已在 .gitignore）。
 # 与 hall_auto/env_pack.NODE_ENV_FILENAME 是同一条约定，这里 import 过来免得抄错。
 from hall_auto.env_pack import NODE_ENV_FILENAME  # noqa: E402
+from hall_auto.elevation import ELEVATION_SCRIPT, ELEVATION_TASK_NAME  # noqa: E402
 
 # P2 内部安全工具在共享盘上的相对目录（相对共享根）与本机落地位置。
 # 与 `step_write_local_config` 写的 `security.tools_dir` 必须指向同一个地方，否则白拷。
@@ -1518,6 +1519,17 @@ def step_schtask(skip: bool) -> Step:
 
     重建的代价不是"多花几秒"，是**触发时间被重置**——如果正好在跑批，
     重建会把任务状态抹掉。所以默认只检测，不覆盖。
+
+    ## 2026-09-23：动作脚本从 `run_p1_apps.ps1` 换成 `tools/run_elevated_suite.ps1`
+
+    原来这个任务只会跑 P1-A 夹具装卸一件事，所以提权段只能手工做（清单步骤十八）。
+    现在它指向**通用提权执行器**：参数走 `reports/_elev/request.json`，
+    农场 agent 触发它就能跑任意需要管理员的套件（`install` / `apps-lifecycle`），
+    跑批不用再开管理员窗口。
+
+    **旧任务必须重建**，否则新代码触发了它，它还是去跑老的 `run_p1_apps.ps1`——
+    表现是「提权段一直没结果」，而节点侧看起来只是慢。所以检测到旧动作时
+    这里**主动覆盖**，并把原因写进日志（默认那条"不重建"的规则让位给正确性）。
     """
     st = Step("提权计划任务")
     if skip:
@@ -1526,19 +1538,27 @@ def step_schtask(skip: bool) -> Step:
     if not is_admin():
         st.fail("非管理员无法建计划任务；以管理员重跑本脚本，或手工建（见 项目知识库/运行手册.md）")
         return st
-    task = "HallAutoP1"
-    script = REPO_ROOT / "run_p1_apps.ps1"
+    task = ELEVATION_TASK_NAME
+    script = ELEVATION_SCRIPT
 
     # ---- 检测：任务已存在且动作指向本仓库的脚本 ----
     xml = _task_action(task)
     if xml:
+        decoded = xml.replace("&amp;", "&")
         # 只认「这个任务的 Command/Arguments 里出现了本仓库的脚本路径」
-        if script.name in xml and str(REPO_ROOT) in xml.replace("&amp;", "&"):
+        if script.name in decoded and str(REPO_ROOT) in decoded:
             st.log(f"任务 {task} 已存在且指向本仓库脚本，跳过（覆盖会重置触发时间）")
             st.log(f"触发：MSYS_NO_PATHCONV=1 schtasks /Run /TN {task}")
             st.log(f"要强制重建：先 schtasks /Delete /TN {task} /F 再重跑本脚本")
             return st
-        st.log(f"任务 {task} 已存在但指向别的脚本，将覆盖重建")
+        if "run_p1_apps.ps1" in decoded and str(REPO_ROOT) in decoded:
+            st.log(
+                f"任务 {task} 指向的是**旧动作** run_p1_apps.ps1 —— 重建为通用提权执行器 "
+                f"{script.name}。不重建的话，跑批触发了它也只是把夹具装卸重跑一遍，"
+                "新加的大厅装卸（install）永远跑不到。"
+            )
+        else:
+            st.log(f"任务 {task} 已存在但指向别的脚本，将覆盖重建")
     else:
         # 查询没结果：要么本机确实还没有这个任务（新机正常），要么查询本身没跑成。
         # 明说一句 —— 下面走的是 `/Create /F`，**会重置已存在任务的触发时间**，

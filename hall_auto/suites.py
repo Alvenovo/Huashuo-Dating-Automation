@@ -50,6 +50,17 @@ class Suite:
     interactive 需要真人守着的交互式终端。会给 pytest 加 `-s`（**不加必挂**，
                 理由见 `build_command`），调用方也不该重定向它的 stdout。
                 必然 `farm_safe=False` —— 两者互斥，有守卫锁着。
+    needs_elevation
+                必须**管理员**权限。农场 agent 是非提权的（整体提权会改掉
+                launch/login 的权限上下文），所以这类套件由 agent 走
+                `hall_auto/elevation.py` 的提权通道：写请求文件 → 触发计划任务
+                `HallAutoP1`（bootstrap 第 11 步建好）→ 提权侧跑 → 回结果。
+                **仍然 farm_safe**：它进农场，只是换了个身份执行。
+    reset_fixture
+                跑之前先执行 `tools/reset_fixture.py` 把夹具压回起点。
+                上一次装剩的会让装卸用例**直接 skip**（不报错），报告上一片黄
+                而人以为"跑过了"。原来写死在 `run_p1_apps.ps1` 里，
+                现在跟着套件定义走，提权通道照做。
     """
 
     name: str
@@ -60,6 +71,8 @@ class Suite:
     needs: str = ""
     farm_safe: bool = True
     interactive: bool = False
+    needs_elevation: bool = False
+    reset_fixture: bool = False
 
     def concurrency(self) -> int:
         """本套件允许的最大并发机器数。"""
@@ -86,7 +99,8 @@ SUITES: dict[str, Suite] = {
         parallel="limited",
         # 会真装/卸大厅 + 打更新服务；20 台同时装同一个版本对服务端是 20 倍压力
         max_concurrent=5,
-        needs="管理员权限 + HALL_ALLOW_INSTALL=1 + installer_dir 下有安装包",
+        needs="管理员权限（提权通道 HallAutoP1）+ HALL_ALLOW_INSTALL=1 + installer_dir 下有安装包",
+        needs_elevation=True,
     ),
     "launch": Suite(
         name="launch",
@@ -109,7 +123,10 @@ SUITES: dict[str, Suite] = {
         parallel="limited",
         # 真装真卸，走厂商 CDN 下载 165MB 级安装包；并发太高会被限流且拖慢每台
         max_concurrent=5,
-        needs="管理员权限（HallAutoP1 计划任务或管理员终端）+ HALL_ALLOW_INSTALL=1",
+        needs="管理员权限（提权通道 HallAutoP1）+ HALL_ALLOW_INSTALL=1",
+        needs_elevation=True,
+        # 上一次装剩的夹具会让装卸用例直接 skip（不报错）—— 必须先从注册表静默卸掉。
+        reset_fixture=True,
     ),
     "login": Suite(
         name="login",
@@ -172,16 +189,23 @@ def get_suite(name: str) -> Suite:
     return SUITES[name]
 
 
-# 「全量档」：一次投完**无人值守能跑的全部**套件。
+# 「全量档」：一次投完**所有**套件（除人在环）。
 #
 # 为什么要有它：`dispatch --suites` 要人肉打套件名，漏一个就表现为
 # 「跑着跑着停了」—— 节点跑完手上的活就回轮询，看起来像卡死，实际是没人投。
 # 全量档把「这次要跑什么」从人的记忆里拿出来，一条命令投完。
 #
-# 刻意**不含**这三个，理由不是省事：
-#   install / apps-lifecycle  要管理员 + HALL_ALLOW_INSTALL=1，而 farm_agent 是非提权的
-#                             （把 agent 整体提权会改掉 launch/login 的权限上下文）→ 投了必挂
-#   login-manual              人在环，farm_safe=False，永不进无人值守农场
+# 唯一不含的是 `login-manual`：人在环，`farm_safe=False`，永不进无人值守农场。
+#
+# ⚠️ **顺序有意义，不是随便排的**：`install` 会**卸载并重装大厅本体**，
+# 跑完之后登录态、主题档位全部重置 —— 所以它必须排在最后。
+# 顺序靠 `resolve_suite_names` 保序来维持，改这里的位置等于改执行顺序。
+# 守卫：tests/unit/test_suite_planning.py::test_elevated_suites_run_last。
+#
+# 历史：2026-09-23 之前这里只有 7 个，`install` / `apps-lifecycle` 被排除在外，
+# 理由是「farm_agent 非提权 → 投了必挂」。那个结论过时了 —— 提权通道
+# `HallAutoP1` 早就建好（bootstrap 第 11 步），只是没人接上。现在它们走
+# `hall_auto/elevation.py` 的 broker，跑批不用再切管理员窗口。
 FULL_RUN_SUITES: tuple[str, ...] = (
     "unit",
     "launch",
@@ -190,6 +214,8 @@ FULL_RUN_SUITES: tuple[str, ...] = (
     "settings",
     "security",
     "wb",
+    "apps-lifecycle",
+    "install",
 )
 
 # --suites 的展开关键字。写成元组是故意的：两个词都认，但只在这一处定义，
@@ -217,6 +243,36 @@ def resolve_suite_names(raw: str) -> list[str]:
 def farm_suites() -> list[Suite]:
     """可进无人值守农场的套件（排除人在环）。"""
     return [s for s in SUITES.values() if s.farm_safe]
+
+
+def elevated_suites() -> list[Suite]:
+    """需要管理员、必须走提权通道执行的套件。"""
+    return [s for s in SUITES.values() if s.needs_elevation]
+
+
+def execution_order(names: list[str]) -> list[str]:
+    """套件的执行顺序：**非提权段先跑，提权段后跑**，组内保持原顺序（稳定排序）。
+
+    **为什么要强制，而不是「投任务的人按顺序写」**：`install` 会卸载并重装大厅本体，
+    跑完之后登录态和主题档位全被重置。任务里同时有 `install` 和 `launch`/`login` 时，
+    谁先谁后直接决定结果对不对。
+
+    全量档自己已经排好了（见 `FULL_RUN_SUITES` 上面的说明），但
+    `--suites login,install` 这种手写组合必须也被纠正 —— 靠人记得是不可靠的。
+    """
+    return sorted(names, key=_elevation_rank)
+
+
+def _elevation_rank(name: str) -> int:
+    """排序键：提权套件排后面。未知套件名按非提权处理。
+
+    **未知名字不能在这里炸**：抛 KeyError 会让整批套件一个都不跑（排序发生在
+    第一个套件之前），而真错应该在执行到它时报出来，那时前面已经跑完的还有结果。
+    """
+    try:
+        return 1 if get_suite(name).needs_elevation else 0
+    except KeyError:
+        return 0
 
 
 def build_command(suite: Suite, *, shard: int = 1, of: int = 1, extra: list[str] | None = None) -> list[str]:

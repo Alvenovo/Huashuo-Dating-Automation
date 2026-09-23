@@ -157,10 +157,11 @@ def test_plan_shards_dict_shape():
 
 # ---------- 全量档（dispatch --suites all）----------
 
-# 全量档**刻意排除**的套件。改这个名单前先读 hall_auto/suites.py 里 FULL_RUN_SUITES
-# 上面那段理由：manual 会让节点卡在 input()；install / apps-lifecycle 要管理员 +
-# HALL_ALLOW_INSTALL=1，而 farm_agent 是非提权的 → 投了必挂。
-FULL_RUN_EXCLUDED = {"install", "apps-lifecycle", "login-manual"}
+# 全量档**刻意排除**的套件。2026-09-23 起只剩人在环这一个 ——
+# `install` / `apps-lifecycle` 曾经也在这儿，理由是「farm_agent 非提权 → 投了必挂」，
+# 现在它们走提权通道（`hall_auto/elevation.py`，计划任务 `HallAutoP1`）执行，
+# 仍然 farm_safe。改这个名单前先读 `hall_auto/suites.py` 里 FULL_RUN_SUITES 上面的理由。
+FULL_RUN_EXCLUDED = {"login-manual"}
 
 
 @pytest.mark.unit
@@ -171,16 +172,78 @@ def test_full_run_keywords_expand_to_the_full_run_set(keyword):
 
 
 @pytest.mark.unit
-def test_full_run_never_contains_manual_or_elevation_required_suites():
-    """**关键保护**：全量档混进这三类中的任何一个，都会让「一条命令跑完」变成
-    「一条命令卡死」—— 前者卡在等输入，后者因为非提权直接挂。
+def test_full_run_never_contains_the_manual_suite():
+    """**关键保护**：全量档混进人在环套件，会让「一条命令跑完」变成「一条命令卡死」——
+    节点无人应答却问了「要不要参与人在环」，永久 `input()` 阻塞。
 
     这条红了**别改断言**，去改 `FULL_RUN_SUITES`。
     """
-    for name in FULL_RUN_EXCLUDED:
-        assert name not in suites.FULL_RUN_SUITES, name
+    assert "login-manual" not in suites.FULL_RUN_SUITES
     for name in suites.FULL_RUN_SUITES:
         assert get_suite(name).farm_safe, name
+        assert not get_suite(name).interactive, f"{name} 是人在环，不该进全量档"
+
+
+@pytest.mark.unit
+def test_full_run_includes_the_elevation_suites():
+    """**反向锁**：`install` / `apps-lifecycle` 必须在全量档里。
+
+    它们不在的话，跑批又要退回「先跑全量档、再开管理员窗口补跑」那三段式 ——
+    正是 2026-09-23 这次改造要消灭的东西。它们能进是因为走提权通道执行，
+    不是靠把 agent 整体提权（那会改掉 launch/login 的权限上下文）。
+    """
+    for name in ("install", "apps-lifecycle"):
+        assert get_suite(name).needs_elevation, f"{name} 没标 needs_elevation"
+        assert name in suites.FULL_RUN_SUITES, f"{name} 不在全量档里"
+
+
+@pytest.mark.unit
+def test_elevation_suites_run_last():
+    """**顺序即正确性**：`install` 会卸载并重装大厅本体，跑完登录态/主题档位全重置。
+
+    它排在只读套件前面的话，`launch` / `login` / `settings` 全部跑在刚重装的机器上，
+    结果对不对没人说得清。所以全量档里提权段必须在最后，且 `install` 是最后一个。
+    """
+    names = list(suites.FULL_RUN_SUITES)
+    ranks = [1 if get_suite(n).needs_elevation else 0 for n in names]
+    assert ranks == sorted(ranks), f"提权套件没排在最后：{names}"
+    assert names[-1] == "install", f"最后一个必须是 install（它会重装大厅）：{names[-1]!r}"
+
+
+@pytest.mark.unit
+def test_execution_order_puts_elevated_suites_last():
+    """手写组合（`--suites login,install`）也要被纠正成「先只读、后提权」。
+
+    靠"投任务的人记得按顺序写套件名"是不可靠的：写反了不会报错，
+    只会让 login 跑在一台刚被重装过大厅的机器上。
+    """
+    assert suites.execution_order(["install", "login", "launch"]) == ["login", "launch", "install"]
+    assert suites.execution_order(["apps-lifecycle", "unit"]) == ["unit", "apps-lifecycle"]
+    # 组内保序（稳定排序）：不能顺手把只读套件的相对顺序也打乱
+    assert suites.execution_order(["wb", "unit", "launch"]) == ["wb", "unit", "launch"]
+
+
+@pytest.mark.unit
+def test_execution_order_tolerates_unknown_suite_names():
+    """未知套件名不能在这里抛异常。
+
+    排序发生在**第一个套件之前**，抛了就是整批一条都不跑；
+    真错应该在执行到它时报出来，那时前面跑完的还有结果。
+    """
+    assert suites.execution_order(["no-such-suite", "install"]) == ["no-such-suite", "install"]
+
+
+@pytest.mark.unit
+def test_apps_lifecycle_resets_fixtures_before_running():
+    """夹具复位必须跟着套件定义走。
+
+    上一次装剩的夹具会让装卸用例**直接 skip**（不报错），报告上一片黄而人以为"跑过了"。
+    原来这条顺序写死在 `run_p1_apps.ps1` 里，换成提权通道后就没人做了 ——
+    所以它必须是套件自己的属性，提权执行器照着做。
+    """
+    assert get_suite("apps-lifecycle").reset_fixture is True
+    # 大厅自身装卸不该顺带复位夹具：它验的是安装包，夹具在不在与它无关
+    assert get_suite("install").reset_fixture is False
 
 
 @pytest.mark.unit

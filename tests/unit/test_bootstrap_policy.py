@@ -203,7 +203,10 @@ def test_schtask_skips_when_existing_points_to_this_repo(bm):
     不重建的理由：覆盖会重置触发时间。跑批途中重建会把任务状态抹掉。
     """
     ps = "power" + "shell"
-    xml = f"<Command>{ps}</Command><Arguments>-File {bm.REPO_ROOT}/run_p1_apps.ps1</Arguments>"
+    xml = (
+        f"<Command>{ps}</Command>"
+        f"<Arguments>-File {bm.REPO_ROOT}/tools/run_elevated_suite.ps1</Arguments>"
+    )
     with mock.patch.object(bm, "_task_action", return_value=xml), \
          mock.patch.object(bm, "is_admin", return_value=True), \
          mock.patch.object(bm.subprocess, "run", return_value=_fake_run()) as run:
@@ -212,6 +215,29 @@ def test_schtask_skips_when_existing_points_to_this_repo(bm):
     assert st.ok
     assert any("跳过" in line for line in st.detail)
     assert not any("Create" in str(c) for c in run.call_args_list), "不应执行 Create"
+
+
+def test_schtask_migrates_from_the_old_p1_apps_action(bm):
+    """**关键保护**：指向旧动作 `run_p1_apps.ps1` 的任务必须重建。
+
+    这是 2026-09-23 改造留下的唯一「例外重建」场景：老的 HallAutoP1 只会跑夹具装卸，
+    新代码触发它时它还是去跑老脚本 —— 表现是「提权段一直没结果」，而节点侧看着只是慢。
+    不重建的话，新加进全量档的大厅装卸（`install`）永远跑不到，且不会报错。
+    """
+    xml = (
+        f"<Command>powershell</Command>"
+        f"<Arguments>-File {bm.REPO_ROOT}/run_p1_apps.ps1</Arguments>"
+    )
+    with mock.patch.object(bm, "_task_action", return_value=xml), \
+         mock.patch.object(bm, "is_admin", return_value=True), \
+         mock.patch.object(bm.subprocess, "run", return_value=_fake_run()) as run:
+        st = bm.step_schtask(False)
+
+    assert st.ok
+    assert any("旧动作" in line for line in st.detail), "要写明为什么破例重建"
+    created = [str(c) for c in run.call_args_list if "Create" in str(c)]
+    assert created, "指向旧动作时必须重建"
+    assert "run_elevated_suite.ps1" in created[0], "重建后要指向新的提权执行器"
 
 
 def test_schtask_recreates_when_missing(bm):

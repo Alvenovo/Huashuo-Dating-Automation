@@ -539,6 +539,10 @@ def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
     「真人守着收码跑的」，否则要人输验证码的用例和纯自动用例在报告里长得一样。
 
     任务造的是**全量档** —— 默认只有全量档跑完才问人在环（`task_covers_full_run`）。
+
+    ⚠️ 2026-09-23 改：人在环的结果走**独立回执** `<node>_<task_id>_manual.json`，
+    不再并进自动段那份。两份混在一起时，「自动段跑完了没有」和
+    「人在环跑完了没有」在文件层面分不开。
     """
     _write_task(root, "R01", _full_run_task())
     monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
@@ -546,6 +550,9 @@ def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
     monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
     monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+    # 全量档现在含 install / apps-lifecycle（走提权通道）。这里把本进程当成已提权，
+    # 让它们也走被替换掉的 run_suite —— 否则会真去触发 schtasks。
+    monkeypatch.setattr(farm_agent, "is_elevated", lambda: True)
 
     calls: list[tuple] = []
 
@@ -559,9 +566,187 @@ def test_manual_phase_runs_when_user_says_yes(root, monkeypatch):
     assert farm_agent.main() == 0
     assert ("launch", False) in calls, "任务里的自动套件要先跑"
     assert (farm_agent.MANUAL_SUITE, True) in calls, "回「能」后人在环套件要以交互模式跑"
-    receipt = json.loads((root / "done" / "R01_T1.json").read_text(encoding="utf-8"))
-    manual = [r for r in receipt["results"] if r["suite"] == farm_agent.MANUAL_SUITE]
+
+    auto = json.loads((root / "done" / "R01_T1.json").read_text(encoding="utf-8"))
+    assert farm_agent.MANUAL_SUITE not in {r["suite"] for r in auto["results"]}, (
+        "人在环结果不该混进自动段回执 —— 两份分不开就看不出自动段到底跑完没有"
+    )
+    manual_receipt = json.loads((root / "done" / "R01_T1_manual.json").read_text(encoding="utf-8"))
+    assert manual_receipt["phase"] == "manual"
+    manual = [r for r in manual_receipt["results"] if r["suite"] == farm_agent.MANUAL_SUITE]
     assert manual and manual[0].get("interactive") is True
+
+
+def test_receipt_is_written_before_the_manual_prompt(root, monkeypatch):
+    """**2026-09-23 改的核心**：自动段先落回执、收 `.running`，**再**问人在环。
+
+    原来问句在写回执之前 —— 人还没答的那几分钟里，控制机只看到「执行中」不动，
+    与节点死机同形（真机踩过：`launch` 36.9s 跑完，之后两分多钟毫无动静）。
+    改完之后，人还在犹豫的时候，控制机就已经能出报告、任务已经结清。
+
+    这条锁的是**时机**：把写回执挪回问句后面，断言立刻红。
+    """
+    _write_task(root, "R01", _full_run_task())
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+    monkeypatch.setattr(farm_agent, "run_suite", lambda *a, **k: (0, {}))
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+    monkeypatch.setattr(farm_agent, "is_elevated", lambda: True)
+
+    seen: dict[str, bool] = {}
+
+    def _fake_ask() -> bool:
+        seen["receipt"] = (root / "done" / "R01_T1.json").is_file()
+        seen["running"] = (root / "tasks" / "R01.json.running").is_file()
+        return False   # 人没参与，避免真去跑人在环套件
+
+    monkeypatch.setattr(farm_agent, "ask_manual_participation", _fake_ask)
+    assert farm_agent.main() == 0
+
+    assert seen["receipt"] is True, "问人在环之前就该写好回执（否则控制机一直看到「执行中」）"
+    assert seen["running"] is False, "问人在环之前就该收掉 .running 占位"
+
+
+# ---------- 提权通道（install / apps-lifecycle） ----------
+#
+# 这两类套件必须管理员权限，而农场 agent 是非提权的（整体提权会改掉
+# launch/login 的权限上下文）。所以 agent 写请求文件 → 触发计划任务 HallAutoP1
+# → 提权侧跑 → 回结果。协议在 hall_auto/elevation.py。
+
+
+def test_elevated_suites_go_through_the_broker(root, monkeypatch):
+    """非提权进程遇到 needs_elevation 套件 -> 走提权通道，**不直接起 pytest**。"""
+    _write_task(root, "R01", _task(suites=[{"name": "install"}]))
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+    monkeypatch.setattr(farm_agent, "is_elevated", lambda: False)
+
+    direct: list[str] = []
+    brokered: list[str] = []
+    monkeypatch.setattr(
+        farm_agent, "run_suite",
+        lambda name, *a, **k: (direct.append(name), (0, {}))[1],
+    )
+    monkeypatch.setattr(
+        farm_agent, "run_suite_elevated",
+        lambda name, *a, **k: (brokered.append(name), (0, {}))[1],
+    )
+
+    assert farm_agent.main() == 0
+    assert brokered == ["install"], "install 必须走提权通道"
+    assert direct == [], "install 不该在非提权进程里直接跑（会挂在权限检查上）"
+
+
+def test_already_elevated_process_runs_them_directly(root, monkeypatch):
+    """人手工在管理员窗口里跑 agent 时，提权套件直接跑，不多绕一层 broker。
+
+    绕了也不致命，但会多出「请求文件 / 结果文件」这两个排查面 ——
+    能直接跑就直接跑。
+    """
+    _write_task(root, "R01", _task(suites=[{"name": "apps-lifecycle"}]))
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+    monkeypatch.setattr(farm_agent, "is_elevated", lambda: True)
+
+    direct: list[str] = []
+    monkeypatch.setattr(
+        farm_agent, "run_suite",
+        lambda name, *a, **k: (direct.append(name), (0, {}))[1],
+    )
+    monkeypatch.setattr(
+        farm_agent, "run_suite_elevated",
+        _boom_if_called,
+    )
+
+    assert farm_agent.main() == 0
+    assert direct == ["apps-lifecycle"]
+
+
+def test_elevated_suites_run_after_the_readonly_ones(root, monkeypatch):
+    """**顺序即正确性**：任务里写反了（install 在前）也要被纠正。
+
+    `install` 会卸载并重装大厅本体 —— 它跑在前面的话，后面每个套件都在一台
+    刚被重装过的机器上跑，结果对不对没人说得清。
+    """
+    _write_task(root, "R01", _task(suites=[{"name": "install"}, {"name": "launch"}]))
+    monkeypatch.setattr(farm_agent, "farm_root", lambda: root)
+    monkeypatch.setattr(farm_agent, "node_id", lambda: "R01")
+    monkeypatch.setattr(sys, "argv", ["farm_agent.py", "--once"])
+    monkeypatch.setattr(farm_agent, "evidence_snapshot", lambda: set())
+    monkeypatch.setattr(farm_agent, "newest_run_dir", lambda exclude=None: None)
+    monkeypatch.setattr(farm_agent, "is_elevated", lambda: True)
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        farm_agent, "run_suite",
+        lambda name, *a, **k: (order.append(name), (0, {}))[1],
+    )
+
+    assert farm_agent.main() == 0
+    assert order == ["launch", "install"], f"执行顺序不对：{order}"
+
+
+def test_elevated_broker_polls_until_the_result_lands(root, monkeypatch, tmp_path):
+    """提权段要**一直等**到结果落盘，中间空手不当作完成。
+
+    `read_result_for` 的契约是「request_id 对不上就返回空字典」——
+    这里第一次返回空（提权侧还在跑），第二次才给结果。若 broker 把「空」当成
+    「没结果就返回」，提权段会立刻以「成功」结束而其实什么都没跑（假绿）。
+    """
+    log = tmp_path / "node.log"
+    written: dict = {}
+    calls = {"n": 0}
+
+    monkeypatch.setattr(
+        farm_agent, "write_request",
+        lambda **kw: (written.update(kw), "REQ-1")[1],
+    )
+    monkeypatch.setattr(farm_agent, "trigger_task", lambda: (True, "已触发"))
+
+    def _fake_read_result(request_id: str) -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {}   # 提权侧还没跑完
+        return {"request_id": request_id, "exit_code": 0}
+
+    monkeypatch.setattr(farm_agent, "read_result_for", _fake_read_result)
+    monkeypatch.setattr(farm_agent.time, "sleep", lambda _s: None)
+
+    rc, _creds = farm_agent.run_suite_elevated(
+        "install", 1, 1, log, task_id="T1", task_env={}
+    )
+    assert rc == 0
+    assert calls["n"] >= 2, "结果没落盘时要继续轮询，不能空手当成完成"
+    assert written["suite"] == "install"
+    assert written["pytest_args"], "要把 build_command 的产物写进请求，提权侧照着跑"
+    assert written["reset_fixture"] is False, "install 不复位夹具"
+
+
+def test_elevated_broker_reports_a_failed_trigger(root, monkeypatch, tmp_path, capsys):
+    """触发不了计划任务时**不许假装跑过**：返回非 0，并给出排查方向。
+
+    任务不存在（新机没跑 bootstrap、或被人删了）是最常见的一种 ——
+    静默返回 0 会让整批看起来"跑完了"，而真装真卸一条都没执行。
+    """
+    monkeypatch.setattr(farm_agent, "write_request", lambda **kw: "REQ-1")
+    monkeypatch.setattr(farm_agent, "trigger_task", lambda: (False, "任务不存在"))
+    monkeypatch.setattr(
+        farm_agent, "read_result_for", _boom_if_called
+    )
+
+    rc, _creds = farm_agent.run_suite_elevated(
+        "install", 1, 1, tmp_path / "n.log", task_id="T1", task_env={}
+    )
+    assert rc == 2
+    assert "提权通道启动失败" in capsys.readouterr().err
 
 
 def test_manual_prompt_is_skipped_for_a_smoke_task(root, monkeypatch):

@@ -93,6 +93,13 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from hall_auto.awake import keep_awake_for_process  # noqa: E402
 from hall_auto.dpi import is_interactive_session, machine_profile, node_id  # noqa: E402
+from hall_auto.elevation import (  # noqa: E402
+    ELEVATION_TASK_NAME,
+    is_elevated,
+    read_result_for,
+    trigger_task,
+    write_request,
+)
 from hall_auto.env_pack import (  # noqa: E402
     NODE_ENV_EVIDENCE_NAME,
     NODE_ENV_FILENAME,
@@ -100,9 +107,22 @@ from hall_auto.env_pack import (  # noqa: E402
     credential_status,
 )
 from hall_auto.evidence import EVIDENCE_ROOT  # noqa: E402
-from hall_auto.suites import FULL_RUN_SUITES, build_command, get_suite  # noqa: E402
+from hall_auto.suites import (  # noqa: E402
+    FULL_RUN_SUITES,
+    build_command,
+    execution_order,
+    get_suite,
+)
 
 POLL_SECONDS = 30
+
+# 提权段最多等多久。真装真卸要下 165MB 安装包，大厅自身装卸还要卸载+重装，
+# 单套件十几分钟是常态；4 小时兜住两台慢机的极端情况。
+ELEVATION_TIMEOUT_SECONDS = 4 * 3600
+ELEVATION_POLL_SECONDS = 5
+# 等待期间的心跳间隔。**不能静默等** —— 提权段几分钟没有输出，
+# 现场分不清「在装」和「任务触发了但没跑起来」，这正是本项目反复踩的那类假象。
+ELEVATION_HEARTBEAT_SECONDS = 30
 
 # 节点本地凭据文件：仓库根下，已在 .gitignore，不进 git、不上共享盘。
 NODE_ENV_PATH = REPO_ROOT / NODE_ENV_FILENAME
@@ -314,6 +334,93 @@ def run_suite(
     return proc.returncode, creds
 
 
+def run_suite_elevated(
+    suite_name: str,
+    shard_id: int,
+    shard_count: int,
+    log_path: Path,
+    *,
+    task_id: str,
+    task_env: dict[str, str] | None = None,
+) -> tuple[int, dict[str, bool]]:
+    """把「需要管理员」的套件交给提权通道跑。返回 (退出码, 凭据状态)。
+
+    **返回值口径与 `run_suite` 完全一致**，调用方不必知道这一轮是不是提权的 ——
+    这是把它做成 broker 而不是"另一条分支流程"的理由：分支一多，
+    「证据回传 / 凭据状态 / 回执」这几条共用链路迟早只修一边。
+
+    流程（协议常量在 `hall_auto/elevation.py`）：
+      写请求文件 → `schtasks /Run /TN HallAutoP1` → 每 5 秒看结果文件 → 按 request_id 认领
+
+    ⚠️ **按 `request_id` 认领，不按「结果文件在不在」**：上一轮的结果文件还躺在原地，
+    只认文件存在会把旧结果当本轮（本项目反复踩的「错认上一轮」）。
+    """
+    suite = get_suite(suite_name)
+    env, notes = build_suite_env(task_env=task_env, node_env_path=NODE_ENV_PATH)
+    creds = credential_status(env)
+    argv = build_command(suite, shard=shard_id, of=shard_count)
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"\n===== {datetime.now().isoformat(timespec='seconds')} 提权段 {suite_name} =====\n"
+            f"[env] 走提权通道：计划任务 {ELEVATION_TASK_NAME}（本进程 admin={is_elevated()}）\n"
+            f"[env] pytest 参数：{' '.join(argv)}\n"
+            f"[env] 复位夹具：{'是' if suite.reset_fixture else '否'}\n"
+            + "".join(f"[env] {note}\n" for note in notes)
+            + "[env] 本段输出不落这个日志，在 reports\\_elev\\elevated_run.log\n"
+        )
+
+    request_id = write_request(
+        task_id=task_id,
+        suite=suite_name,
+        shard_id=shard_id,
+        shard_count=shard_count,
+        pytest_args=argv,
+        reset_fixture=suite.reset_fixture,
+        # 只带非敏感项：凭据在节点本地 farm_node.env，提权进程继承不到 agent 的合成环境，
+        # 但这两类套件本来也不需要账号。
+        env={k: v for k, v in (task_env or {}).items()},
+    )
+
+    ok, note = trigger_task()
+    if not ok:
+        print(
+            f"  ⚠ 提权通道启动失败：{note}\n"
+            f"    排查：① 计划任务 {ELEVATION_TASK_NAME} 在不在（schtasks /Query /TN {ELEVATION_TASK_NAME}）；"
+            "② 不在就用管理员重跑 tools\\bootstrap_machine.ps1（幂等）。",
+            file=sys.stderr, flush=True,
+        )
+        return 2, creds
+
+    print(f"  已交给提权通道（{ELEVATION_TASK_NAME}），等待结果…", flush=True)
+    started = time.monotonic()
+    last_beat = started
+    while True:
+        result = read_result_for(request_id)
+        if result:
+            rc = int(result.get("exit_code", 1))
+            print(
+                f"  提权段 {suite_name} 退出码 {rc}"
+                f"（{time.monotonic() - started:.0f}s，日志 reports\\_elev\\elevated_run.log）",
+                flush=True,
+            )
+            return rc, creds
+        elapsed = time.monotonic() - started
+        if elapsed >= ELEVATION_TIMEOUT_SECONDS:
+            print(
+                f"  ⚠ 提权段 {suite_name} 等了 {elapsed / 60:.0f} 分钟还没回结果。\n"
+                "    真装真卸可能要十几分钟，但如果任务栏里没有安装向导在动，"
+                "就是提权侧没跑起来：看 reports\\_elev\\elevated_run.log 和 result.json。",
+                file=sys.stderr, flush=True,
+            )
+            return 1, creds
+        if time.monotonic() - last_beat >= ELEVATION_HEARTBEAT_SECONDS:
+            last_beat = time.monotonic()
+            print(f"  …提权段 {suite_name} 进行中（已 {elapsed:.0f}s）", flush=True)
+        time.sleep(ELEVATION_POLL_SECONDS)
+
+
 # 人在环套件：只能跑在「有真人守着的交互式终端」里，且**永不进农场任务文件**。
 # 与 suites.py 的 farm_safe=False 是同一条约束的两侧，改一边要改另一边。
 MANUAL_SUITE = "login-manual"
@@ -456,6 +563,18 @@ def _write_node_env(run_dir: Path, node: str, task_id: str, suite: str, creds: d
         print(f"  凭据状态写入证据失败（汇总报告凭据列会不准）：{exc}", file=sys.stderr)
 
 
+def _ordered_entries(entries: list) -> list:
+    """把任务里的套件条目排成执行顺序：非提权段先跑、提权段后跑，组内保持原顺序。
+
+    抽成函数是为了让「顺序」这件事只有一处实现 —— 排序散在循环里的话，
+    以后加一条「复位夹具要最先跑」之类的规则就得改两遍。
+    真正的排序规则在 `hall_auto/suites.py::execution_order`，这里有守卫单测。
+    """
+    by_name = {str(e.get("name") or ""): e for e in entries if isinstance(e, dict)}
+    ordered_names = execution_order([n for n in by_name if n])
+    return [by_name[n] for n in ordered_names]
+
+
 def execute_suite(
     name: str,
     shard_id: int,
@@ -475,7 +594,17 @@ def execute_suite(
     """
     print(f"  跑 {name}（分片 {shard_id}/{shard_count}）", flush=True)
     before = evidence_snapshot()   # 先拍快照，避免没产出证据时错认上一轮的目录
-    rc, creds = run_suite(name, shard_id, shard_count, log, task_env=task_env, interactive=interactive)
+    suite = get_suite(name)
+    if suite.needs_elevation and not is_elevated():
+        # 本进程非提权（农场 agent 的常态）→ 走提权通道。
+        # 已经在提权环境里跑（人手工在管理员窗口里跑 agent）时直接跑，少绕一圈。
+        rc, creds = run_suite_elevated(
+            name, shard_id, shard_count, log, task_id=task_id, task_env=task_env
+        )
+    else:
+        rc, creds = run_suite(
+            name, shard_id, shard_count, log, task_env=task_env, interactive=interactive
+        )
     run_dir = newest_run_dir(exclude=before)
     entry: dict = {
         "suite": name,
@@ -484,6 +613,10 @@ def execute_suite(
         "exit_code": rc,
         "run_dir": run_dir.name if run_dir else None,
     }
+    if suite.needs_elevation:
+        # 标出来：汇总时能区分「普通权限跑的」和「走提权通道跑的」，
+        # 否则真装真卸的用例和只读用例在报告里长得一样，看不出机器被改过。
+        entry["elevated"] = True
     if interactive:
         # 标出来：汇总时能区分「无人值守跑的」和「真人守着收码跑的」，
         # 否则一条要人输验证码的用例和一条纯自动用例在报告里长得一样。
@@ -601,7 +734,18 @@ def main() -> int:
         log = root / "logs" / f"{node}_{task_id}.log"
         results: list[dict] = []
         creds: dict[str, bool] = {}
-        for entry in task.get("suites") or []:
+
+        # 执行顺序强制为「非提权段先跑、提权段后跑」：`install` 会把大厅卸了重装，
+        # 跑完之后登录态/主题档位全重置，排在只读套件前面就是错的。
+        # 全量档自己排好了，但 `--suites login,install` 这种手写组合也得纠正。
+        entries = _ordered_entries(task.get("suites") or [])
+        elevated_count = sum(1 for e in entries if get_suite(str(e.get("name") or "")).needs_elevation)
+        if elevated_count:
+            print(
+                f"  本次含 {elevated_count} 个提权套件（真装真卸），排在只读套件之后执行。",
+                flush=True,
+            )
+        for entry in entries:
             name = str(entry.get("name") or "")
             sid = int(entry.get("shard_id") or 1)
             scount = int(entry.get("shard_count") or 1)
@@ -610,32 +754,14 @@ def main() -> int:
             )
             results.append(item)
 
-        # 人在环阶段：**等自动套件全跑完再问**，不夹在中间 ——
-        # 夹在中间的话，一条要人输码的用例会把整批自动套件卡在后面，
-        # 而控制机那边只看到「执行中」，与节点死机同形。
+        # ---------------- 自动段到此结束：**先结清回执，再问人在环** ----------------
         #
-        # 2026-09-23 再加一道：**默认只对全量档任务问**。冒烟 / 单套件任务问一次要人
-        # 盯着终端答，不答就永久 `input()` 阻塞 —— 那就又把「与死机同形」造回来了。
-        # 判据见 `task_covers_full_run`；想在任何任务后都问就加 `--ask-manual`。
-        want_manual = args.ask_manual or task_covers_full_run(task)
-        if not args.no_manual and want_manual:
-            if ask_manual_participation():
-                print("  开始人在环，按提示输入验证码。", flush=True)
-                item, manual_creds = execute_suite(
-                    MANUAL_SUITE, 1, 1, root=root, node=node, task_id=task_id, log=log,
-                    task_env=task_env, interactive=True,
-                )
-                results.append(item)
-                if manual_creds:
-                    creds = manual_creds
-            elif _manual_capable():
-                # 人明确跳过了：把补跑命令打出来，别让他再去翻手册。
-                print(
-                    "  跳过人在环。要补跑：.\\.venv\\Scripts\\python.exe -X utf8 "
-                    f"tools\\farm_agent.py --local {MANUAL_SUITE}",
-                    flush=True,
-                )
-
+        # 2026-09-23 改：原来人在环问句在写回执**之前**，于是人还没答的那几分钟里，
+        # 控制机只看到「执行中」不动 —— 与节点死机同形（真机踩过一次）。
+        # 现在自动段一跑完就落回执、收掉 .running，控制机当场出报告、任务结清；
+        # 人在环的产出走**独立回执**（`<node>_<task_id>_manual.json`），
+        # 不和自动段混在一份里，谁跑没跑一眼分得开。
+        #
         # 凭据状态写进回执：报告里能区分「这台没配凭据 → 一片 skip」和「用例真跳过」。
         # 不写的话，汇总表上只有一堆黄色，看不出根因是环境没铺好。
         # creds 直接取自最后一个套件的 run_suite 结果（同参数合成必然同结果，不重算）。
@@ -652,6 +778,53 @@ def main() -> int:
         done_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         (root / "tasks" / f"{node}.json.running").unlink(missing_ok=True)
         print(f"任务完成，结果 {done_file}", flush=True)
+
+        # 人在环阶段：**等自动套件全跑完再问**，不夹在中间 ——
+        # 夹在中间的话，一条要人输码的用例会把整批自动套件卡在后面。
+        #
+        # 门禁两道，都过才问：① 人能看见 + 能回答（stdin/stdout 都是终端）；
+        # ② 任务覆盖全量档。冒烟 / 单套件任务问一次要人盯着终端答，
+        # 不答就永久 `input()` 阻塞 —— 那就又把「与死机同形」造回来了。
+        # 判据见 `task_covers_full_run`；想在任何任务后都问就加 `--ask-manual`。
+        want_manual = args.ask_manual or task_covers_full_run(task)
+        if not args.no_manual and want_manual:
+            if ask_manual_participation():
+                print("  开始人在环，按提示输入验证码。", flush=True)
+                item, manual_creds = execute_suite(
+                    MANUAL_SUITE, 1, 1, root=root, node=node, task_id=task_id, log=log,
+                    task_env=task_env, interactive=True,
+                )
+                manual_file = root / "done" / f"{node}_{task_id}_manual.json"
+                manual_file.write_text(
+                    json.dumps(
+                        {
+                            "task_id": task_id,
+                            "node": node,
+                            "phase": "manual",
+                            "profile": machine_profile(),
+                            "interactive": is_interactive_session(),
+                            "credentials": manual_creds or creds,
+                            "finished_at": datetime.now().isoformat(timespec="seconds"),
+                            "results": [item],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"人在环完成，结果 {manual_file}", flush=True)
+                print(
+                    "  把这份结果并进汇总报告：控制机敲 "
+                    ".\\\\.venv\\\\Scripts\\\\python.exe -X utf8 tools\\\\farm_control.py aggregate",
+                    flush=True,
+                )
+            elif _manual_capable():
+                # 人明确跳过了：把补跑命令打出来，别让他再去翻手册。
+                print(
+                    "  跳过人在环。要补跑：.\\.venv\\Scripts\\python.exe -X utf8 "
+                    f"tools\\farm_agent.py --local {MANUAL_SUITE}",
+                    flush=True,
+                )
 
         if args.once:
             return 0
