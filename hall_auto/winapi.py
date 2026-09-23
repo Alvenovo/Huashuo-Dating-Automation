@@ -30,6 +30,14 @@ _dwmapi = ctypes.windll.dwmapi
 _dwmapi.DwmGetWindowAttribute.argtypes = [
     wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
 ]
+_user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetWindowLongW.restype = ctypes.c_long
+_user32.GetLayeredWindowAttributes.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.POINTER(wintypes.DWORD),
+]
 _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 # SendMessageTimeoutW 必须显式声明返回值：ctypes 默认按 c_int 截断，64 位下会丢掉高位
 _user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
@@ -141,6 +149,30 @@ GA_ROOT = 2
 SW_SHOW = 5
 SW_RESTORE = 9
 DWMWA_CLOAKED = 14
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+
+
+def _hwnd_exstyle(hwnd: int) -> int:
+    """扩展样式位。`WS_EX_LAYERED` / `WS_EX_TRANSPARENT` 都在这里看。"""
+    return int(_user32.GetWindowLongW(hwnd, GWL_EXSTYLE)) & 0xFFFFFFFF
+
+
+def _layered_alpha(hwnd: int) -> int | None:
+    """分层窗口的整体 alpha（0-255）；不是分层窗口 / 没用 `SetLayeredWindowAttributes` 时返回 None。
+
+    **alpha=0 就是"窗口在、能命中、但完全没画"** —— 这正是 2026-09-23 真机最后剩下的那一种：
+    `visible=True iconic=False cloaked=0 采样命中 5/5 遮挡=无`（所有检查都说正常），
+    而截图里大厅一个像素都没画出来。**Win32 层的"可见性"检查全都看不出这种状态。**
+    """
+    key = wintypes.DWORD(0)
+    alpha = ctypes.c_ubyte(0)
+    flags = wintypes.DWORD(0)
+    ok = _user32.GetLayeredWindowAttributes(
+        hwnd, ctypes.byref(key), ctypes.byref(alpha), ctypes.byref(flags)
+    )
+    return int(alpha.value) if ok else None
 
 
 def _hwnd_cloaked(hwnd: int) -> int:
@@ -218,6 +250,10 @@ def ensure_window_shown(hwnd: int) -> str:
             "大厅窗口被 DWM **cloaked**（在另一个虚拟桌面 / 应用被挂起）—— "
             "这种状态 `ShowWindow` 修不了"
         )
+    if _hwnd_exstyle(hwnd) & WS_EX_LAYERED and _layered_alpha(hwnd) == 0:
+        # 完全透明的分层窗口 —— 同上，`ShowWindow` 修不了（要改 alpha 才行），
+        # **不许装作修好了**。
+        return "大厅窗口是**完全透明的分层窗口**（alpha=0）—— `ShowWindow` 修不了"
     if _user32.IsIconic(hwnd):
         _user32.ShowWindow(hwnd, SW_RESTORE)
         return "大厅窗口原来是最小化，已还原"
@@ -300,7 +336,8 @@ def window_state_facts(pid: int) -> str:
     return (
         f"窗口状态：pid={pid} hwnd=0x{hwnd:X} rect={_hwnd_rect(hwnd)} "
         f"visible={_hwnd_visible(hwnd)} iconic={bool(_user32.IsIconic(hwnd))} "
-        f"cloaked={_hwnd_cloaked(hwnd)} "
+        f"cloaked={_hwnd_cloaked(hwnd)} exstyle=0x{_hwnd_exstyle(hwnd):08X} "
+        f"alpha={_layered_alpha(hwnd)} "
         f"采样命中大厅自己 {own}/{total} 遮挡={names or '无'}"
     )
 
@@ -349,6 +386,14 @@ def occlusion_hint(pid: int) -> str:
             "这种状态 `IsWindowVisible` 和 `WindowFromPoint` **都会说它可见**、"
             "采样也全都命中它自己，但**屏幕上不会画出来**，WebView2 也就不渲染。"
             "处理：把大厅切回**当前虚拟桌面**（或先关掉多桌面）再重跑。"
+        )
+    if _hwnd_exstyle(hwnd) & WS_EX_LAYERED and _layered_alpha(hwnd) == 0:
+        return (
+            "大厅窗口是**完全透明的分层窗口**（`WS_EX_LAYERED` + **alpha=0**）—— "
+            "窗口在、`WindowFromPoint` 能命中、所有可见性检查都说正常，"
+            "但**屏幕上什么都不画**，WebView2 也就不渲染。"
+            "这属于**产品侧状态**（一般是启动淡入动画没走完，或自己把 alpha 设成 0 后没恢复），"
+            "不是脚本能修的。**拿这一行报开发。**"
         )
     if _user32.IsIconic(hwnd):
         return (

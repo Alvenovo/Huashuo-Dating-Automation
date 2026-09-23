@@ -38,9 +38,12 @@ HALL_PID = 42
 class _FakeUser32:
     """只实现 occlusion_hint / ensure_window_shown 用到的那几个调用。"""
 
-    def __init__(self, *, at: dict | None = None, iconic: bool = False):
+    def __init__(self, *, at: dict | None = None, iconic: bool = False,
+                 exstyle: int = 0, alpha: int | None = None):
         self.at = dict(at or {})      # (x, y) -> hwnd；缺的点返回 0（= 那儿没窗口）
         self.iconic = iconic
+        self.exstyle = exstyle
+        self.alpha = alpha            # None = 不是分层窗口 / 没设过属性
         self.points: list[tuple[int, int]] = []
         self.shown: list[tuple[int, int]] = []      # ShowWindow 的调用记录
 
@@ -57,6 +60,16 @@ class _FakeUser32:
     def ShowWindow(self, hwnd, cmd):             # noqa: N802
         self.shown.append((hwnd, cmd))
         return True
+
+    def GetWindowLongW(self, _hwnd, _index):     # noqa: N802
+        return self.exstyle
+
+    def GetLayeredWindowAttributes(self, _hwnd, _key, out_alpha, _flags):   # noqa: N802
+        if self.alpha is None:
+            return 0
+        # `out_alpha` 是 ctypes.byref(c_ubyte) 产生的 CArgObject，`_obj` 是那个 c_ubyte
+        ctypes.cast(ctypes.pointer(out_alpha._obj), ctypes.POINTER(ctypes.c_ubyte))[0] = self.alpha
+        return 1
 
 
 @pytest.fixture
@@ -322,3 +335,46 @@ def test_ensure_window_shown_does_not_pretend_to_fix_cloaked(desk, monkeypatch):
     note = winapi.ensure_window_shown(100)
     assert "cloaked" in note.lower(), f"要说清是这个状态：{note!r}"
     assert fake.shown == [], "cloaked 不该靠 ShowWindow 去「修」"
+
+
+# ---------------- alpha=0 的完全透明分层窗口：真机最后剩下的那一种 ----------------
+#
+# 2026-09-23 真机：`visible=True iconic=False cloaked=0 采样命中 5/5 遮挡=无`
+# —— **所有可见性检查都说正常**，而失败截图里大厅一个像素都没画出来。
+# 只剩这一种：`WS_EX_LAYERED` + alpha=0（窗口在、能命中、但什么都不画）。
+
+
+def test_transparent_layered_hall_is_reported(desk, monkeypatch):
+    """**核心**：alpha=0 必须单独报出来，并指明是产品侧、该报开发。"""
+    _use(monkeypatch, _FakeUser32(exstyle=winapi.WS_EX_LAYERED, alpha=0))
+
+    hint = winapi.occlusion_hint(HALL_PID)
+    assert "透明" in hint and "alpha=0" in hint, f"要指名道姓：{hint!r}"
+    assert "报开发" in hint, "要指明这不是脚本能修的，避免继续在环境上打转"
+
+
+def test_layered_with_nonzero_alpha_is_not_reported(desk, monkeypatch):
+    """分层但 alpha>0 = **正常显示**（大量应用用分层做圆角/阴影），不许误报。
+
+    误报比漏报更糟：会把人从真因上带开。
+    """
+    _use(monkeypatch, _FakeUser32(exstyle=winapi.WS_EX_LAYERED, alpha=255))
+    assert winapi.occlusion_hint(HALL_PID) == ""
+
+
+def test_window_state_facts_reports_exstyle_and_alpha(desk, monkeypatch):
+    """依据里也要有 exstyle / alpha —— 否则下一次还是只能看到"一切正常"。"""
+    _use(monkeypatch, _FakeUser32(exstyle=winapi.WS_EX_LAYERED, alpha=0))
+    facts = winapi.window_state_facts(HALL_PID)
+    assert "alpha=0" in facts, facts
+    assert "exstyle=0x" in facts, facts
+
+
+def test_ensure_window_shown_does_not_pretend_to_fix_alpha_zero(desk, monkeypatch):
+    """alpha=0 也修不了（要改 alpha，`ShowWindow` 管不着）—— 同样不许装作修好。"""
+    fake = _FakeUser32(exstyle=winapi.WS_EX_LAYERED, alpha=0)
+    _use(monkeypatch, fake)
+
+    note = winapi.ensure_window_shown(100)
+    assert "透明" in note, f"要说清是这个状态：{note!r}"
+    assert fake.shown == [], "alpha=0 不该靠 ShowWindow 去「修」"
