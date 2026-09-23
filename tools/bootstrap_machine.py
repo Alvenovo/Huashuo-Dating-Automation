@@ -653,6 +653,71 @@ def _share_connect(dirs: list[Path], log: Callable[[str], None]) -> list[str]:
     return unreachable
 
 
+def _share_dirs_from_config_text(text: str) -> list[str]:
+    """从配置文本里抠出 `package_share:` → `dirs:` 下的列表项（**零依赖**）。
+
+    **这不是通用 YAML 解析器**，只认这一小块结构（够用就行，多认一分就多一分漂移）：
+      * 顶层键 `package_share:`（缩进 0）；
+      * 它下面 `dirs:`；
+      * `dirs:` 下面缩进更深的 `- ` 项，直到缩进回到 `dirs` 同级或出现新的顶层键。
+
+    行内 `#` 之后当注释；值去首尾引号；空串丢掉。
+
+    剥注释不是洁癖：`config.yaml` 里的真实写法就是
+    `- "//LAPTOP-VS5F7HF4/hall-packages"   # 机器名访问（推荐）` —— 不剥的话
+    整段注释会粘成路径的一部分，节点去连一个不存在的地址，报的还是「找不到网络路径」
+    （看着像共享盘没建）。它下面那段**注释掉的** IP 备用地址同理，必须整行丢掉，
+    否则会去连一个随 DHCP 变过的过期 IP —— 正是 `config.yaml` 自己那段注释警告的坑。
+    """
+    out: list[str] = []
+    in_block = False
+    in_dirs = False
+    dirs_indent = 0
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if not in_block:
+            if indent == 0 and stripped.startswith("package_share:"):
+                in_block = True
+            continue
+        if indent == 0:
+            break  # 出了 package_share 块
+        if not in_dirs:
+            if stripped.startswith("dirs:"):
+                in_dirs = True
+                dirs_indent = indent
+            continue
+        if indent > dirs_indent and stripped.startswith("-"):
+            val = stripped[1:].strip().strip("'\"")
+            if val:
+                out.append(val)
+            continue
+        if indent <= dirs_indent:
+            break  # dirs 列表结束
+    return out
+
+
+def _share_dirs_from_config_files() -> list[str]:
+    """`package_share.dirs` 的零依赖读法：`config.local.yaml` 优先，其次 `config.yaml`。
+
+    与 `load_config()` 的覆盖语义一致（本机配置盖仓库模板）；本机那份给不出东西时
+    再退回模板 —— 新机器上 `config.local.yaml` 压根不存在，走的就是模板。
+    """
+    for name in ("config.local.yaml", "config.yaml"):
+        path = REPO_ROOT / name
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        found = _share_dirs_from_config_text(text)
+        if found:
+            return found
+    return []
+
+
 def _wheelhouse_share_dirs() -> list[Path]:
     """可能放着 `wheelhouse/` 的共享盘目录 —— **不依赖 PyYAML**。
 
@@ -660,8 +725,22 @@ def _wheelhouse_share_dirs() -> list[Path]:
     import 都做不到（它顶层 `import yaml`）。所以：
       ① `HALL_PACKAGE_SHARE` —— `hall_auto.fetch.share_dirs()` 本来就认这个环境
          变量，且**不读配置**，所以这一段零依赖；
-      ② 能 import 配置时，再补上 `package_share.dirs`。
+      ② 能 import 配置时，用 `package_share.dirs`；
+      ③ **import 不了时，退回零依赖的 `_share_dirs_from_config_files()`**。
     ① 放前面是因为它本来就是"人临时指定"的覆盖项，优先级更高。
+
+    ## ③ 为什么非有不可（2026-09-23 实测）
+
+    原来只有 ①②。第 2 步在**全新机器**上必然走不进 ② —— 系统 Python 没 PyYAML，
+    `except Exception: pass` 一吞，共享盘列表就是空的。后果不是"少一条候选"，而是：
+
+        第 2 步打印「没有离线 wheelhouse（没配共享盘，本机也没有 wheelhouse 目录）」
+        → 转在线 pip → 无外网的机器直接 `No matching distribution found` → bootstrap 当场停
+
+    而共享盘 `hall-packages\\wheelhouse\\` 明明躺着、也可达 —— **报错说"没配共享盘"，
+    真因是"配了但这一层读不到"**，一线会往完全错的方向查（本项目的老毛病）。
+    对照实测：同一份代码，只多设一个 `HALL_PACKAGE_SHARE` 就从红变绿，
+    所以这条回退必须让"共享盘已经备好 wheelhouse"这件事在**无外网新机**上自动成立。
     """
     dirs: list[Path] = []
     env = (os.environ.get("HALL_PACKAGE_SHARE") or "").strip()
@@ -671,11 +750,13 @@ def _wheelhouse_share_dirs() -> list[Path]:
         from hall_auto.config import load_config  # noqa: PLC0415
         from hall_auto.fetch import share_dirs  # noqa: PLC0415
 
-        for d in share_dirs(load_config()):
-            if d not in dirs:
-                dirs.append(d)
+        got = list(share_dirs(load_config()))
     except Exception:
-        pass  # 还没装依赖 / 配置读不了 —— 上面那一段已经尽力了
+        # 还没装依赖 / 配置读不了 —— 退回零依赖读法，别把共享盘 wheelhouse 一起丢掉
+        got = [Path(d) for d in _share_dirs_from_config_files()]
+    for d in got:
+        if d not in dirs:
+            dirs.append(d)
     return dirs
 
 

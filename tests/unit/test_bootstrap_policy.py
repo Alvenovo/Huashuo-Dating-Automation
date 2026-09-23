@@ -1489,12 +1489,93 @@ def test_wheelhouse_share_dirs_puts_env_var_first(bm, monkeypatch):
     assert Path("//other/hall-packages") in dirs, dirs
 
 
-def test_wheelhouse_share_dirs_survives_config_import_failure(bm, monkeypatch):
+def test_wheelhouse_share_dirs_survives_config_import_failure(bm, monkeypatch, tmp_path):
     """配置 import 不了（没装 PyYAML）时，仍然要能靠环境变量拿到共享盘。"""
     monkeypatch.setenv("HALL_PACKAGE_SHARE", "//host/hall-packages")
+    # REPO_ROOT 指到空目录：本用例只验「环境变量这条路」，不让零依赖回退掺进来
+    # （回退单独有守卫：test_wheelhouse_share_dirs_falls_back_to_config_without_pyyaml）
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
     monkeypatch.setitem(sys.modules, "hall_auto.config", None)  # 之后的 import 会 ImportError
     dirs = bm._wheelhouse_share_dirs()
     assert dirs == [Path("//host/hall-packages")], dirs
+
+
+def test_wheelhouse_share_dirs_falls_back_to_config_without_pyyaml(bm, monkeypatch, tmp_path):
+    """**无外网新机的命门**：没装 PyYAML 时，`package_share.dirs` 也必须读得到。
+
+    2026-09-23 实测的硬阻断：原来这里只有「环境变量 + `hall_auto.config`」两条来源，
+    而第 2 步跑在依赖还没装的时刻，`import hall_auto.config` 必抛（顶层 `import yaml`），
+    异常被 `except Exception: pass` 吞掉 → 共享盘列表为空 → 共享盘上明明备好的
+    `wheelhouse\\` 找不到 → 转在线 pip → 无外网的机器 `No matching distribution found`，
+    bootstrap 当场停，报的却是「没配共享盘」（指向完全错误的方向）。
+    """
+    (tmp_path / "config.yaml").write_text(
+        "installer_dir: \"C:/Users/ASUS/Desktop/华硕大厅\"\n"
+        "package_share:\n"
+        "  dirs:\n"
+        "    - \"//LAPTOP-VS5F7HF4/hall-packages\"\n"
+        "display_name_contains: \"华硕大厅\"\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
+    monkeypatch.delenv("HALL_PACKAGE_SHARE", raising=False)
+    monkeypatch.setitem(sys.modules, "hall_auto.config", None)  # 模拟"系统 Python 没有 PyYAML"
+
+    dirs = bm._wheelhouse_share_dirs()
+    assert dirs == [Path("//LAPTOP-VS5F7HF4/hall-packages")], dirs
+
+
+def test_share_dirs_from_config_text_ignores_commented_examples(bm):
+    """注释必须剥干净：**行内尾注释不能粘进路径**，整行注释掉的备用地址也不能收。
+
+    `config.yaml` 的真实写法就是 `- "//LAPTOP-VS5F7HF4/hall-packages"   # 机器名访问（推荐）`。
+    不剥 `#` 的话整段注释会粘成路径的一部分 —— 节点去连一个不存在的地址，
+    报的还是「找不到网络路径」，看着像共享盘没建（本项目反复踩的那类误导）。
+    下面那段注释掉的 IP 备用地址同理：真收进来就会去连一个随 DHCP 变过的过期 IP。
+    """
+    text = (
+        "package_share:\n"
+        "  dirs:\n"
+        "    - \"//LAPTOP-VS5F7HF4/hall-packages\"   # 机器名访问（推荐）\n"
+        "  # 例（多共享盘做冗余，按顺序试）：\n"
+        "  # dirs:\n"
+        "  #   - \"//192.168.0.8/hall-packages\"     # 备用：本机当时 IP，会随 DHCP 变化\n"
+        "display_name_contains: \"华硕大厅\"\n"
+    )
+    assert bm._share_dirs_from_config_text(text) == ["//LAPTOP-VS5F7HF4/hall-packages"]
+
+
+def test_share_dirs_from_config_text_stops_at_other_top_level_lists(bm):
+    """出了 `package_share` 块就停 —— 别把别的顶层列表项（如 `dismiss_buttons`）当共享盘。"""
+    text = (
+        "package_share:\n"
+        "  dirs:\n"
+        "    - \"//host/hall-packages\"\n"
+        "launch:\n"
+        "  dismiss_buttons:\n"
+        "    - 关闭\n"
+        "    - 稍后\n"
+    )
+    assert bm._share_dirs_from_config_text(text) == ["//host/hall-packages"]
+
+
+def test_share_dirs_from_config_files_prefers_local_config(bm, monkeypatch, tmp_path):
+    """本机 `config.local.yaml` 覆盖仓库模板 —— 与 `load_config()` 的覆盖语义一致。"""
+    (tmp_path / "config.yaml").write_text(
+        "package_share:\n  dirs:\n    - \"//repo-host/hall-packages\"\n", encoding="utf-8"
+    )
+    (tmp_path / "config.local.yaml").write_text(
+        "package_share:\n  dirs:\n    - \"//local-host/hall-packages\"\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
+    assert bm._share_dirs_from_config_files() == ["//local-host/hall-packages"]
+
+
+def test_real_repo_config_yaml_yields_the_share(bm):
+    """真实仓库的 `config.yaml` 必须能被零依赖读法读出共享盘地址（新机就靠它）。"""
+    dirs = bm._share_dirs_from_config_files()
+    assert dirs, "config.yaml 里读不出 package_share.dirs —— 无外网新机第 2 步会挂"
+    assert all(d.startswith("//") or ":" in d for d in dirs), dirs
 
 
 def _write_wheelhouse(wh: Path, python_xy: str, req_sha: str) -> None:
