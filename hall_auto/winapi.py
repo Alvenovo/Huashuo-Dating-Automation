@@ -21,6 +21,7 @@ _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 _user32.IsWindowVisible.argtypes = [wintypes.HWND]
 _user32.IsWindowEnabled.argtypes = [wintypes.HWND]
 _user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.WindowFromPoint.argtypes = [wintypes.POINT]
 _user32.WindowFromPoint.restype = wintypes.HWND
 _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
@@ -133,23 +134,58 @@ def _close_window(hwnd: int) -> None:
 # 人得逐张看 PNG 截图才能定性。这里把「谁挡着」变成失败信息里的一行。
 
 GA_ROOT = 2
+SW_SHOW = 5
+SW_RESTORE = 9
 
 
-def _main_window_hwnd(pid: int) -> int:
-    """该进程**面积最大的可见顶层窗**（大厅主窗）。没有则 0。
+def _main_window_hwnd(pid: int, *, visible_only: bool = True) -> int:
+    """该进程**面积最大的顶层窗**（大厅主窗）。没有则 0。
 
     取最大面积而不是第一个：大厅会同时存在若干顶层窗（隐藏的、工具窗），
     主窗是最大的那个。
+
+    `visible_only=False` 用来在「找不到可见窗口」时**继续往下查**：
+    窗口可能是被隐藏了（缩到托盘），那种状态下 WebView2 不渲染，
+    报错要说清是哪一种，别只报一句"找不到"。
     """
     best, best_area = 0, 0
     for hwnd in _top_hwnds():
-        if _hwnd_pid(hwnd) != pid or not _hwnd_visible(hwnd):
+        if _hwnd_pid(hwnd) != pid:
+            continue
+        if visible_only and not _hwnd_visible(hwnd):
             continue
         left, top, right, bottom = _hwnd_rect(hwnd)
         area = max(0, right - left) * max(0, bottom - top)
         if area > best_area:
             best, best_area = hwnd, area
     return best
+
+
+def ensure_window_shown(hwnd: int) -> str:
+    """确保窗口**真的可见**；返回「修了什么」（本来就正常则返回空串）。
+
+    ## 为什么要它（2026-09-23 真机）
+
+    大厅主内容区是 **WebView2**，**窗口不可见时 Chromium 不渲染** ——
+    依赖页面的断言（列表刷出来 / 进已登录态）永远等不到。
+    而 **UIA 照样找得到隐藏 / 最小化的窗口**，所以 `wait_main_window` 会"成功"、
+    测试继续往下跑，最后报成「列表没刷出来」这种**看起来像产品缺陷**的错。
+
+    真机表现：`test_sync_list_logged_in` 等 44s 后报「列表没刷出来」，
+    失败截图里**大厅整个不在屏幕上**（只有桌面 + 终端）。
+
+    **只在真的不正常时才动手**（正常时返回空串、不碰窗口）——
+    不抢焦点、不改正常路径的行为。
+    """
+    if not hwnd:
+        return ""
+    if _user32.IsIconic(hwnd):
+        _user32.ShowWindow(hwnd, SW_RESTORE)
+        return "大厅窗口原来是最小化，已还原"
+    if not _hwnd_visible(hwnd):
+        _user32.ShowWindow(hwnd, SW_SHOW)
+        return "大厅窗口原来不可见（被隐藏 / 缩到托盘），已显示"
+    return ""
 
 
 def occluders_of(hwnd: int, samples: int = 5) -> list[str]:
@@ -190,14 +226,43 @@ def occluders_of(hwnd: int, samples: int = 5) -> list[str]:
 
 
 def occlusion_hint(pid: int) -> str:
-    """大厅被别的窗口挡住 / 最小化时，给一句**可执行**的提示；没事返回空串。
+    """大厅「看不见 / 被挡住」时给一句**可执行**的提示；一切正常返回空串。
 
-    **不抛异常、不改变任何行为** —— 只在已经失败时提供排查方向，调用方拼进报错里即可。
-    没被挡就返回空串，不会给报错加噪音。
+    覆盖四种状态（**后两种是 2026-09-23 真机补上的** —— 当时只判了遮挡，
+    而实际发生的是「窗口根本不在屏幕上」，于是提示返回空、把真因藏了）：
+
+    | 状态 | 提示 |
+    | --- | --- |
+    | 主窗可见且在最上 | 空串（不打扰） |
+    | 主窗被别的进程的窗口盖住 | 报出是哪个窗口 |
+    | 主窗**最小化** | 说清是最小化 |
+    | 主窗**不可见**（隐藏 / 缩到托盘） | 说清是不可见 |
+    | **找不到任何顶层窗** | 说可能是进程已退出 |
+
+    **不抛异常、不改变任何行为** —— 只在已经失败时提供排查方向。
     """
     hwnd = _main_window_hwnd(pid)
     if not hwnd:
-        return ""
+        # 没有**可见**的顶层窗。往下细分，别只报一句"找不到"——
+        # 2026-09-23 真机就栽在这儿：主窗被隐藏了，提示返回空，于是
+        # `test_sync_list_logged_in` 报「列表没刷出来」看着像产品缺陷。
+        hidden = _main_window_hwnd(pid, visible_only=False)
+        if not hidden:
+            return (
+                "找不到大厅的任何顶层窗口 —— 进程可能已经退出。"
+                "依赖页面的断言在那种状态下只会等超时。"
+            )
+        if _user32.IsIconic(hidden):
+            return (
+                "大厅窗口处于**最小化**状态 —— WebView2 不渲染，"
+                "依赖页面的断言会一直等不到。请把窗口还原后再跑。"
+            )
+        return (
+            "大厅窗口**不可见**（被隐藏 / 缩到托盘）—— WebView2 不渲染，"
+            "依赖页面的断言会一直等不到（而 UIA 照样找得到控件，"
+            "所以启动阶段不会报错，只会在断言处超时）。"
+            "请把窗口显示出来后再跑。"
+        )
     if _user32.IsIconic(hwnd):
         return (
             "大厅窗口处于**最小化**状态 —— WebView2 不渲染，"

@@ -12,7 +12,13 @@ from pywinauto.uia_element_info import UIAElementInfo
 
 from hall_auto.config import Config, LaunchSettings, REPO_ROOT
 from hall_auto.product import EXE_NAME, read_installed, stop_main_process
-from hall_auto.winapi import _hwnd_pid, _hwnd_text, _hwnd_visible, _top_hwnds
+from hall_auto.winapi import (
+    _hwnd_pid,
+    _hwnd_text,
+    _hwnd_visible,
+    _top_hwnds,
+    ensure_window_shown,
+)
 
 REPORTS_DIR = REPO_ROOT / "reports" / "launch"
 
@@ -372,15 +378,35 @@ def dismiss_pre_main_popups(app: Application, settings: LaunchSettings) -> bool:
 
 
 def wait_main_window(app: Application, cfg: Config):
+    """等主窗口出现；**出现之后还要确保它真的在屏幕上**。
+
+    ## 为什么"找到主窗口"不够（2026-09-23 真机）
+
+    **UIA 找得到隐藏 / 最小化的窗口** —— 所以这里返回成功，不等于窗口可见。
+    而大厅主内容区是 **WebView2**，**窗口不可见时 Chromium 不渲染**：
+    启动阶段一切正常（控件都读得到），后面依赖页面的断言却**永远等不到**，
+    最后报成「列表没刷出来」这种**看着像产品缺陷**的错。
+
+    真机表现：`test_sync_list_logged_in` 等 44s 后报「登录后同步页仍没刷出列表」，
+    失败截图里**大厅整个不在屏幕上**（只有桌面 + 终端）。
+
+    所以这里补一步 `ensure_window_shown`：窗口正常时它什么都不做（返回空串），
+    只有最小化 / 隐藏时才还原，并把"修了什么"打到日志里（**不静默**）。
+    """
     deadline = time.time() + cfg.timeouts.launch_sec
     last = None
     while time.time() < deadline:
         dismiss_pre_main_popups(app, cfg.launch)
         try:
-            return main_window(app, cfg.display_name_contains, 3)
+            main = main_window(app, cfg.display_name_contains, 3)
         except LaunchError as exc:
             last = exc
             time.sleep(1)
+            continue
+        fixed = ensure_window_shown(int(getattr(main, "handle", 0) or 0))
+        if fixed:
+            print(f"[env] {fixed} —— WebView2 要窗口可见才渲染，否则页面断言会空等")
+        return main
     raise LaunchError(f"未出现主窗口（标题含 {cfg.display_name_contains}）: {last}")
 
 

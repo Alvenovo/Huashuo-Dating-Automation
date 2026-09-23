@@ -35,12 +35,13 @@ HALL_PID = 42
 
 
 class _FakeUser32:
-    """只实现 occlusion_hint 用到的那三个调用。"""
+    """只实现 occlusion_hint / ensure_window_shown 用到的那几个调用。"""
 
     def __init__(self, *, at: dict | None = None, iconic: bool = False):
         self.at = dict(at or {})      # (x, y) -> hwnd；缺的点返回 0（= 那儿没窗口）
         self.iconic = iconic
         self.points: list[tuple[int, int]] = []
+        self.shown: list[tuple[int, int]] = []      # ShowWindow 的调用记录
 
     def WindowFromPoint(self, point):            # noqa: N802 - Win32 命名
         self.points.append((point.x, point.y))
@@ -51,6 +52,10 @@ class _FakeUser32:
 
     def IsIconic(self, _hwnd):                   # noqa: N802
         return self.iconic
+
+    def ShowWindow(self, hwnd, cmd):             # noqa: N802
+        self.shown.append((hwnd, cmd))
+        return True
 
 
 @pytest.fixture
@@ -90,9 +95,30 @@ def test_own_dialogs_are_not_occluders(desk, monkeypatch):
     assert winapi.occlusion_hint(HALL_PID) == ""
 
 
-def test_no_hall_window_at_all_returns_empty(monkeypatch):
+def test_no_top_level_window_at_all_is_reported(monkeypatch):
+    """**连顶层窗都没有** → 报「进程可能已退出」，不能返回空。
+
+    返回空会让报错看起来像产品缺陷（2026-09-23 真机就是这么被藏住真因的）。
+    """
     monkeypatch.setattr(winapi, "_top_hwnds", lambda: [])
-    assert winapi.occlusion_hint(HALL_PID) == ""
+    hint = winapi.occlusion_hint(HALL_PID)
+    assert "退出" in hint, f"该说清是「找不到窗口」：{hint!r}"
+
+
+def test_hidden_hall_window_is_reported(desk, monkeypatch):
+    """**主窗被隐藏**（缩到托盘 / 被 hide）也要报 —— 这是真机实际发生的那种。
+
+    当时只判了「被别的窗口挡住」，于是提示返回空、`test_sync_list_logged_in`
+    报「登录后同步页仍没刷出列表」看着像产品缺陷，其实**窗口根本不在屏幕上**
+    （失败截图里只有桌面 + 终端）。**UIA 照样找得到隐藏的窗口**，
+    所以启动阶段不会报错，只会在依赖页面的断言处空等。
+    """
+    monkeypatch.setattr(winapi, "_hwnd_visible", lambda h: False)
+    _use(monkeypatch, _FakeUser32())
+
+    hint = winapi.occlusion_hint(HALL_PID)
+    assert "不可见" in hint, f"没说清是「不可见」：{hint!r}"
+    assert "WebView2" in hint, "要说明机制，否则一线会去查产品"
 
 
 def test_main_window_is_the_largest_visible_one(desk, monkeypatch):
@@ -144,3 +170,45 @@ def test_hint_lists_at_most_four_occluders(desk, monkeypatch):
         assert f"窗口{300 + idx}" in hint, f"前 4 个都要列出来：{hint!r}"
     assert "窗口304" not in hint, f"第 5 个不该出现（会把报错刷屏）：{hint!r}"
     assert "窗口300" in hint, "第一个（中心点）那个必须报出来"
+
+
+# ---------------- ensure_window_shown：把"窗口不在屏幕上"直接修掉 ----------------
+#
+# 这是 `test_sync_list_logged_in` 那条真机失败的**正面修法**：
+# UIA 找得到隐藏 / 最小化的窗口，所以 `wait_main_window` 会"成功"、测试继续跑，
+# 而 WebView2 不渲染 → 依赖页面的断言空等 → 报成「列表没刷出来」。
+# 所以启动阶段就要**确保窗口真的可见**，而不是等断言失败后去猜。
+
+
+def test_ensure_window_shown_does_nothing_when_fine(desk, monkeypatch):
+    """正常窗口**一个动作都不做** —— 不抢焦点、不改正常路径行为。"""
+    fake = _FakeUser32()
+    _use(monkeypatch, fake)
+    assert winapi.ensure_window_shown(100) == ""
+    assert fake.shown == [], "正常窗口不该被动过"
+
+
+def test_ensure_window_shown_restores_a_minimized_window(desk, monkeypatch):
+    fake = _FakeUser32(iconic=True)
+    _use(monkeypatch, fake)
+    note = winapi.ensure_window_shown(100)
+    assert "最小化" in note, f"要说清修了什么（不静默）：{note!r}"
+    assert fake.shown == [(100, winapi.SW_RESTORE)], fake.shown
+
+
+def test_ensure_window_shown_shows_a_hidden_window(desk, monkeypatch):
+    """隐藏（缩到托盘）用 SW_SHOW，不是 SW_RESTORE —— 两者语义不同，别混用。"""
+    monkeypatch.setattr(winapi, "_hwnd_visible", lambda h: False)
+    fake = _FakeUser32()
+    _use(monkeypatch, fake)
+    note = winapi.ensure_window_shown(100)
+    assert "不可见" in note, f"要说清修了什么（不静默）：{note!r}"
+    assert fake.shown == [(100, winapi.SW_SHOW)], fake.shown
+
+
+def test_ensure_window_shown_tolerates_no_hwnd(desk, monkeypatch):
+    """拿不到 hwnd 时不能抛 —— 它跑在启动路径上，抛了整批一条都不跑。"""
+    fake = _FakeUser32()
+    _use(monkeypatch, fake)
+    assert winapi.ensure_window_shown(0) == ""
+    assert fake.shown == []
