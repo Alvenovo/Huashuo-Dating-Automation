@@ -325,7 +325,19 @@ def request_forgot_sms(pid: int, user: str) -> None:
     if not _press_button(send):
         raise LaunchError("忘记密码：点不动「发送验证码」")
     if not wait_until(lambda: _by_aid(pid, "Button", "CodeSendBtn") is None, timeout_sec=8, interval=0.5):
-        raise LaunchError("忘记密码：点发送后 CodeSendBtn 没消失，可能没触发")
+        # 2026-09-23 真机踩出：这条报错原来只说「可能没触发」，把**最常见的真因**漏掉了。
+        # 短信验证码是**服务端限流**的：短时间内给同一个号发太多次，服务端拒绝发送，
+        # 界面上通常只闪一下提示（截图里抓不到），按钮留在原位不动 ——
+        # 表现与"点击没落上"完全一样。一线看到「可能没触发」会去查控件、查 UIA，
+        # 方向全错。所以这里把限流写在第一条，并给出可执行动作。
+        raise LaunchError(
+            "忘记密码：点发送后 CodeSendBtn 没消失，可能没触发。"
+            "**先按「短信发送超限」排查**：短时间内给同一个号发太多次时，服务端会拒绝发送，"
+            "按钮留在原位不动、提示只闪一下（截图抓不到）。"
+            "处理：① 换一个没被限流的测试号；② 等冷却（通常十几分钟到次日）再跑；"
+            "③ 本条用例要**连发 2 个码**（重置 + 还原），是最容易撞上超限的一条。"
+            "若确实刚发过码且号也没超限，再按控件没落点去查。"
+        )
 
 
 def submit_forgot_reset(pid: int, code: str, new_password: str) -> dict:

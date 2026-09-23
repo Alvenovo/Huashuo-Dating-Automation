@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from hall_auto import apps
@@ -224,3 +226,77 @@ def test_pick_wizard_button_drawn_ok_off_skips_cta():
     # 卸载页照样能点中隐藏的文字「卸载」，drawn_ok 不影响这一档
     picked = apps.pick_wizard_button(NETEASE_UNINSTALL, drawn_ok=False)
     assert picked is not None and picked.hwnd == 7408192
+
+
+# ---------- 夹具应用：商店条目名带后缀时必须照样能装 ----------
+#
+# 2026-09-23 真机踩出：`install_fixture` 里原来是**精确相等**
+# （`if app_name not in hits: raise ...`），而商店里那个条目叫「网易云音乐官方版」。
+# `search_hits` 明明已经命中，却因为名字不相等直接抛错 —— `apps-lifecycle`
+# 整套 **1.15 秒**就失败，报告上看着像"装卸功能坏了"，实际只是名字对不上。
+# 注册表那边（`installed_match`）一直在用 `match_display_name`，只有这条路径漏了。
+
+
+def _stub_install_fixture(monkeypatch, hits, *, detail_action="安装"):
+    """把 install_fixture 的机器相关部分全部替换掉，只留「挑商店名」这段真逻辑。"""
+    cfg = load_config()
+    seen: dict = {}
+    monkeypatch.setattr(apps, "is_admin", lambda: True)
+    monkeypatch.setattr(apps, "installer_dialogs", lambda *a, **k: [])
+    monkeypatch.setattr(apps, "is_app_installed", lambda *a, **k: False)
+    monkeypatch.setattr(apps, "search_hits", lambda probe, main: list(hits))
+
+    def _fake_open(probe, main, title):
+        seen["title"] = title
+        return types.SimpleNamespace(title=title, primary_action=detail_action)
+
+    monkeypatch.setattr(apps, "open_detail_until_ready", _fake_open)
+    # 详情页主按钮找不到 -> 在这里收住，不真去点、不进安装循环
+    monkeypatch.setattr(apps, "_by_name", lambda *a, **k: None)
+    return cfg, seen
+
+
+@pytest.mark.unit
+def test_install_fixture_accepts_a_store_name_with_a_suffix(monkeypatch):
+    """**关键保护**：配置写「网易云音乐」而商店叫「网易云音乐官方版」时要能装。
+
+    这条红了**别改断言**，去把 `install_fixture` 里的挑名逻辑改回 `match_display_name`。
+    """
+    cfg, seen = _stub_install_fixture(monkeypatch, ["网易云音乐官方版"])
+
+    with pytest.raises(apps.LaunchError) as exc:
+        apps.install_fixture(cfg, main=object(), app_name="网易云音乐")
+
+    assert "搜不到" not in str(exc.value), (
+        f"命中 ['网易云音乐官方版'] 却被判成搜不到 —— 又退回精确相等了：{exc.value}"
+    )
+    assert seen["title"] == "网易云音乐官方版", (
+        "详情页要用**商店里的名字**打开，不是配置里那个名字（点不到条目）"
+    )
+
+
+@pytest.mark.unit
+def test_install_fixture_prefers_an_exact_hit(monkeypatch):
+    """精确命中优先 —— 商店同时有「网易云音乐」和「网易云音乐官方版」时，别挑错。"""
+    cfg, seen = _stub_install_fixture(monkeypatch, ["网易云音乐官方版", "网易云音乐"])
+    with pytest.raises(apps.LaunchError):
+        apps.install_fixture(cfg, main=object(), app_name="网易云音乐")
+    assert seen["title"] == "网易云音乐"
+
+
+@pytest.mark.unit
+def test_install_fixture_still_reports_a_real_miss(monkeypatch):
+    """反向锁：商店里确实没有 → 照旧报「搜不到」。
+
+    少了这条，上一条会被改成"总能过"，那 `apps-lifecycle` 就会在搜错应用之后
+    继续往下点，比直接失败糟得多。
+    """
+    cfg, _seen = _stub_install_fixture(monkeypatch, ["微信", "WPS Office"])
+    monkeypatch.setattr(
+        apps, "open_detail_until_ready",
+        lambda *a, **k: pytest.fail("搜不到就不该进详情页"),
+    )
+
+    with pytest.raises(apps.LaunchError) as exc:
+        apps.install_fixture(cfg, main=object(), app_name="网易云音乐")
+    assert "搜不到" in str(exc.value)

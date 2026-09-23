@@ -121,6 +121,34 @@ def test_login_dialog_controls(ready_pid):
     assert "PasswordSecInput" not in sms, f"切到短信页签后密码框应消失: {sms}"
 
 
+def _assert_user_area_shows(user: str, name: str) -> None:
+    """断言用户区显示的账号能对应上**登录用的那个手机号**。
+
+    ⚠️ **这条断言的口径待开发确认**（2026-09-23 真机记录）。
+
+    真机现象：登录**成功**（`logged_in()` 通过、弹窗流程完整走完），
+    但用户区显示 `用户信息区域，已登录用户：asus_1883771273`，
+    不含登录手机号 `19552261935` 的尾号。
+
+    已经排除掉的两个猜测（别再重复推）：
+      - **不是「没退干净、复用了上次账号」**：两条用例在登录前都先调了 `logout()`，
+        而发码 / 填密码都需要登录弹窗**重新出现**（`login_dialog_open` 查 `MobileInputBox`）——
+        弹窗出现了，就说明确实是全新登录。
+      - **不是 `logged_in()` 太弱导致误判**：它查 `UserInfoPart` 的 name 里有没有「已登录」，
+        当前确实是已登录态。
+
+    剩下的可能：产品在用户区显示的是**账号昵称**（形如 `asus_<号>`）而不是登录手机号尾号 ——
+    那就是这条断言的口径过时。**改断言前先让开发确认用户区该显示什么**，别照着现象改。
+    """
+    assert user[-5:] in name, (
+        f"已登录态的用户区没带登录手机号的尾号：显示 {name!r}，期望含 {user[-5:]!r}。\n"
+        "  ⚠️ 这条断言的口径**待开发确认**（登录本身是成功的）。\n"
+        "  · 若产品在用户区显示的是账号昵称（形如 asus_<号>）→ 断言口径过时，改断言。\n"
+        "  · 若那串数字跟本次登录用的手机号**完全无关** → 是真 bug，别放过。\n"
+        "  两种情况都已记在《会话交接.md》，改之前先对一下。"
+    )
+
+
 @pytest.mark.login
 def test_password_login_success(cfg, ready_pid):
     """P1-B 账号密码登录：填手机号+密码勾选协议登录后进入已登录态，用户区带手机号尾号"""
@@ -130,7 +158,7 @@ def test_password_login_success(cfg, ready_pid):
     logout(ready_pid)
     name = login_with_password(cfg, ready_pid)
     assert logged_in(ready_pid)
-    assert user[-5:] in name, f"已登录态应带手机号尾号: {name!r}"
+    _assert_user_area_shows(user, name)
 
 
 @pytest.mark.login
@@ -264,7 +292,7 @@ def test_sms_login_manual(cfg, ready_pid):
         pytest.skip("人工放弃回填（验证码已发出）")
     name = login_with_sms_code(ready_pid, code)
     assert logged_in(ready_pid)
-    assert user[-5:] in name, f"已登录态应带手机号尾号: {name!r}"
+    _assert_user_area_shows(user, name)
     # 同微软那条：没绑过的账号会弹绑定弹窗，必须在 logout 之前处理掉。
     _bind_phone_if_prompted(cfg, ready_pid)
     logout(ready_pid)

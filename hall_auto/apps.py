@@ -633,9 +633,21 @@ def install_fixture(cfg: Config, main, app_name: str, timeout_sec: int | None = 
         raise LaunchError(f"P1-A：{app_name} 已经在机器上，先卸掉再当安装夹具")
     probe = dataclasses.replace(cfg, search_keyword=app_name, search_min_hits=1)
     hits = search_hits(probe, main)
-    if app_name not in hits:
-        raise LaunchError(f"P1-A：商店里搜不到夹具应用 {app_name}，命中 {hits}")
-    detail = open_detail_until_ready(probe, main, app_name)
+    # 用 `match_display_name` 而不是精确相等：它的 docstring 写的就是这件事
+    # ——「商店名和注册表 DisplayName 常有版本号/后缀差异」。
+    # 2026-09-23 真机踩出：这里原来写的是 `if app_name not in hits`（精确相等），
+    # 而商店里那个条目叫「网易云音乐官方版」→ `search_hits` 明明已经命中，
+    # 却因为不相等直接抛错，`apps-lifecycle` 整套 **1.15 秒就失败**，
+    # 报告上看着像"装卸功能坏了"，实际是名字对不上。注册表那边一直在用
+    # `match_display_name`，只有这条路径漏了。
+    store_name = match_display_name(app_name, hits)
+    if store_name is None:
+        raise LaunchError(
+            f"P1-A：商店里搜不到夹具应用 {app_name}，命中 {hits}。"
+            "命中非空却对不上时，核对 config.local.yaml 的 fixture_apps.install / uninstall "
+            "写的名字是不是商店里的那个（商店条目常带「官方版」这类后缀）。"
+        )
+    detail = open_detail_until_ready(probe, main, store_name)
     if detail.primary_action not in INSTALL_ACTIONS:
         raise LaunchError(f"P1-A：{app_name} 详情页主按钮是 {detail.primary_action!r}，不是安装类")
     button = _by_name(main, "Button", detail.primary_action, exact=True)
