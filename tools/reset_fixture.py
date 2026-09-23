@@ -129,13 +129,44 @@ def reset_update_fixture(cfg, timeout_sec: int = 180) -> bool:
     return False
 
 
+_NEED_ADMIN_HINT = """\
+需要管理员权限：复位夹具要写 HKLM，而**卸载程序本身是提权进程** ——
+非提权进程 `CreateProcess` 直接失败（WinError 740 请求的操作需要提升）。
+
+  做法（二选一）：
+    ① 用**管理员** PowerShell 重跑本脚本；
+    ② 让跑批的提权段去做 —— 投 `--suites apps-lifecycle` 会自动带这一步（零人工）。
+
+  注意：机器本来就干净时**不需要管理员**（本脚本会直接报「起点干净」）。
+  触发这一条说明**有东西要卸/要杀**，那就必须提权。
+"""
+
+
+def _is_needs_elevation(exc: OSError) -> bool:
+    """WinError 740 = ERROR_ELEVATION_REQUIRED：**被启动的那个程序**要求提权。
+
+    ⚠️ 是"被启动的程序要提权"，不是"我们权限不够" —— 厂商卸载器自带
+    `requireAdministrator` 清单，非提权进程连 `CreateProcess` 都过不去。
+    所以这个错误**必须翻成一句人话**，不能让一线看到裸 traceback 猜。
+    """
+    return getattr(exc, "winerror", None) == 740
+
+
 def main() -> int:
-    kill_leftover_installers()
-    cfg = load_config()
-    targets = {name for name in (cfg.fixture_apps.install, cfg.fixture_apps.uninstall) if name}
-    results = [reset(name) for name in sorted(targets)]
-    results.append(reset_update_fixture(cfg))
-    return 0 if all(results) else 1
+    try:
+        kill_leftover_installers()
+        cfg = load_config()
+        targets = {name for name in (cfg.fixture_apps.install, cfg.fixture_apps.uninstall) if name}
+        results = [reset(name) for name in sorted(targets)]
+        results.append(reset_update_fixture(cfg))
+        return 0 if all(results) else 1
+    except OSError as exc:
+        # 2026-09-23 真机：非管理员跑（或机器上有东西要卸）时裸抛 traceback，
+        # 而 docstring 早就写着「必须在管理员终端里跑」—— 写了约束却没检查，等于没写。
+        if not _is_needs_elevation(exc):
+            raise
+        print(_NEED_ADMIN_HINT, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
