@@ -1102,6 +1102,29 @@ def test_selftest_rerun_also_isolates(bm):
     assert "no:cacheprovider" in argv, f"重跑没关掉缓存：{argv}"
 
 
+# ---------------- 节点凭据文件模板 ----------------
+
+def test_node_env_template_says_where_to_change_the_test_phone(bm, tmp_path, monkeypatch):
+    """**防再问一次**：换测试号只改 `farm_node.env` 的 `HALL_TEST_USER`，模板要写明。
+
+    2026-09-23 用户问「换手机号在哪换，应该只改一处吧」。答案确实是**一处**
+    （控制机侧不用动、也不必重跑 bootstrap / 重起 agent），但模板里没写；
+    而且有个反直觉的坑：**窗口里的 `$env:HALL_TEST_USER` 优先级更高、会盖掉文件** ——
+    不知道这条的人改完文件发现没生效，会以为"改了没用"，去查别的地方。
+    """
+    monkeypatch.setattr(bm, "REPO_ROOT", tmp_path)
+    st = bm.step_node_env_template()
+    assert st.ok
+
+    text = (tmp_path / bm.NODE_ENV_FILENAME).read_text(encoding="utf-8")
+    assert "换测试号只改本文件的 HALL_TEST_USER" in text, "模板没写清「只改这一处」"
+    assert "$env:HALL_TEST_USER" in text, (
+        "要提醒窗口环境变量会盖掉文件 —— 否则改完没生效会被当成 bug 去查别处"
+    )
+    for key in bm.SUGGESTED_NODE_ENV:
+        assert f"{key}=" in text, f"模板少了 {key}"
+
+
 # ---------------- 手册与代码的一致性（防漂移）----------------
 #
 # 这轮踩的坑就是"文档说 A、代码做 B"，而且两轮复核都只核对了名字对不对、
