@@ -31,10 +31,10 @@ def pytest_addoption(parser):
     parser.addoption(
         "--evidence",
         choices=[MODE_ALL, MODE_FAILURE],
-        default=MODE_FAILURE,
+        default=MODE_ALL,
         help=(
-            "证据采集策略：failure-only=只留失败（默认）；all=成功失败都留证。"
-            "想让通过的用例也留原图时，显式加 --evidence=all。"
+            "证据采集策略：all=成功失败都留证（**默认**，2026-09-23 改）；"
+            "failure-only=只留失败（跑批产物少很多，盘紧张时用）。"
         ),
     )
     parser.addoption(
@@ -246,6 +246,23 @@ def _case_title(item) -> str:
     return doc.strip().splitlines()[0].strip() if doc.strip() else ""
 
 
+def _wants_screenshot(item) -> bool:
+    """这条用例要不要抓屏。
+
+    **`unit` 用例不抓**：`--evidence=all` 一开，每一条都抓一次屏，而 `tests/unit`
+    有 600+ 条**纯逻辑**用例 —— 抓下来的是**桌面**，一条都没有排查价值，
+    代价却是实测 `pytest tests/unit` 从 **16s → 149s**（633 次抓屏）。
+
+    单测的结论在 `summary.json` / `report.html` 里**一条都不少**，
+    省掉的只是"没用的桌面截图"，不是信息。
+
+    ⚠️ **别按"文件在 tests/unit/ 下"判** —— 按 **marker** 判。
+    一条用例属于哪个套件是由 marker 决定的（`-m` 过滤也是按 marker），
+    按目录判会在「单测文件里放一条 UI 用例」时判错。
+    """
+    return item.get_closest_marker("unit") is None
+
+
 def pytest_configure(config):
     config._evidence = EvidenceSession(new_run_dir(), config.getoption("--evidence"))
 
@@ -264,9 +281,11 @@ def pytest_runtest_makereport(item, call):
         else:
             detail = ""
         # 在 call 阶段结束、fixture 还没 teardown 时截图，才能拍到应用运行中的终态
-        session.record(item.nodeid, result, report.duration, detail, title=_case_title(item))
+        session.record(item.nodeid, result, report.duration, detail, title=_case_title(item),
+                       capture=_wants_screenshot(item))
     elif report.when == "setup" and report.skipped:
-        session.record(item.nodeid, OUTCOME_SKIPPED, report.duration, _skip_label(item, report), title=_case_title(item))
+        session.record(item.nodeid, OUTCOME_SKIPPED, report.duration, _skip_label(item, report),
+                       title=_case_title(item), capture=_wants_screenshot(item))
     elif report.when == "setup" and report.failed:
         # setup 阶段失败 = pytest 的 ERROR：fixture 崩了，用例**一行都没执行**。
         #
@@ -278,7 +297,8 @@ def pytest_runtest_makereport(item, call):
         # 汇总报告里 unit 显示 273 通过 / 0 失败，假绿。
         #
         # 记成 error 而不是 failed：混进失败列，看报告的人分不清「跑挂了」和「没跑起来」。
-        session.record(item.nodeid, OUTCOME_ERROR, report.duration, _assertion_text(report), title=_case_title(item))
+        session.record(item.nodeid, OUTCOME_ERROR, report.duration, _assertion_text(report),
+                       title=_case_title(item), capture=_wants_screenshot(item))
     # ⚠️ teardown 阶段失败（`when == "teardown"`）仍未覆盖：同一 nodeid 会因此产生两条记录，
     # 得先定下"一条用例只保留最后一条记录"的口径再动，别顺手补。
 

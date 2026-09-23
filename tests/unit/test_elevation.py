@@ -227,3 +227,17 @@ def test_trigger_task_passes_the_task_name_as_argv(monkeypatch):
     assert seen["argv"][:3] == ["schtasks", "/Run", "/TN"]
     assert seen["argv"][3] == elevation.ELEVATION_TASK_NAME
     assert not seen["shell"], "不能走 shell —— /Run 会被当路径转换"
+
+
+def test_validate_accepts_the_evidence_knob():
+    args, reject = elevation.validate_pytest_args(
+        ["tests/install", "-v", "--evidence=failure-only"]
+    )
+    assert reject == "" and "--evidence=failure-only" in args
+
+
+def test_validate_rejects_a_bogus_evidence_value():
+    """只认 conftest 那两个取值 —— 提权段跑的是管理员 pytest，参数必须可预期。"""
+    for bad in ("--evidence=everything", "--evidence=", "--evidence=all --extra"):
+        _args, reject = elevation.validate_pytest_args(["tests/install", "-v", bad])
+        assert reject, f"该拒绝：{bad}"

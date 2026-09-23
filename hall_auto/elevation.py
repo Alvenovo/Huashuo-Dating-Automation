@@ -163,6 +163,13 @@ def validate_pytest_args(raw: object) -> tuple[list[str], str]:
                 out.append(token)
                 continue
             return [], f"--basetemp 只许指向仓库内 reports/ 下：{value!r}"
+        if token.startswith("--evidence="):
+            # 只放行两个合法取值（`tests/conftest.py` 的 choices 就是这两个）。
+            # 不做成"任意值放行"：提权段跑的是管理员 pytest，参数来源必须可预期。
+            if token.split("=", 1)[1] in ("all", "failure-only"):
+                out.append(token)
+                continue
+            return [], f"--evidence 只认 all / failure-only：{token!r}"
         if token.startswith(_ALLOWED_PREFIXES):
             out.append(token)
             continue

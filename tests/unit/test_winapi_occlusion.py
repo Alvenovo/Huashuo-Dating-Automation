@@ -212,3 +212,46 @@ def test_ensure_window_shown_tolerates_no_hwnd(desk, monkeypatch):
     _use(monkeypatch, fake)
     assert winapi.ensure_window_shown(0) == ""
     assert fake.shown == []
+
+
+# ---------------- window_state_facts：诊断说"没问题"时也要给依据 ----------------
+#
+# 2026-09-23 真机：`occlusion_hint` 返回空（结论 = "窗口可见且在最上"），
+# 而失败截图里**大厅不在屏幕上** —— 结论和截图矛盾，两边都不足以定性。
+# **只报结论、不报依据**就会卡在这儿。所以再加一条「原始事实」。
+
+
+def test_window_state_facts_reports_the_numbers(desk, monkeypatch):
+    """**核心**：把 hwnd / rect / visible / iconic / 采样命中都打出来。"""
+    _use(monkeypatch, _FakeUser32(at={
+        (50, 50): 100, (25, 25): 100, (75, 75): 100, (75, 25): 100, (25, 75): 100,
+    }))
+    facts = winapi.window_state_facts(HALL_PID)
+    assert "rect=(0, 0, 100, 100)" in facts, facts
+    assert "visible=True" in facts and "iconic=False" in facts, facts
+    assert "采样命中大厅自己 5/5" in facts, f"要把「采样命中」这个关键数字报出来：{facts!r}"
+
+
+def test_window_state_facts_marks_samples_that_hit_nothing(desk, monkeypatch):
+    """采样点**什么都没碰到**（窗口被挪到屏幕外 / rect 不可信）必须和「大厅在最上」区分开。
+
+    原来两种都表现为"遮挡列表为空"，没法区分 —— 这正是 2026-09-23 卡住的地方。
+    """
+    _use(monkeypatch, _FakeUser32())          # WindowFromPoint 全返回 0
+    facts = winapi.window_state_facts(HALL_PID)
+    assert "采样命中大厅自己 0/5" in facts, (
+        f"0/5 时不能只说「遮挡=无」—— 那会被读成「没被挡」，实际是「没采到」：{facts!r}"
+    )
+
+
+def test_window_state_facts_reports_no_window_at_all(monkeypatch):
+    monkeypatch.setattr(winapi, "_top_hwnds", lambda: [])
+    assert "没有任何顶层窗" in winapi.window_state_facts(HALL_PID)
+
+
+def test_window_state_facts_names_the_occluders(desk, monkeypatch):
+    """真被挡时，依据里也要带上遮挡者名字（结论和依据对得上）。"""
+    _use(monkeypatch, _FakeUser32(at={(50, 50): 300}))
+    desk[1][300] = 777
+    monkeypatch.setattr(winapi, "_hwnd_text", lambda h: "微信")
+    assert "微信" in winapi.window_state_facts(HALL_PID)

@@ -10,7 +10,13 @@ from pywinauto.uia_element_info import UIAElementInfo
 from hall_auto.config import Config
 from hall_auto.launch import LaunchError, _press_button, popup_text
 from hall_auto.waiting import wait_until, wait_until_or_raise
-from hall_auto.winapi import _hwnd_pid, _hwnd_visible, _top_hwnds, occlusion_hint
+from hall_auto.winapi import (
+    _hwnd_pid,
+    _hwnd_visible,
+    _top_hwnds,
+    occlusion_hint,
+    window_state_facts,
+)
 
 LOGIN_DIALOG_TIMEOUT_SEC = 15
 LOGIN_SUBMIT_TIMEOUT_SEC = 25
@@ -866,9 +872,8 @@ def wait_microsoft_logged_in(pid: int) -> str:
             return popup_text(_by_aid(pid, "Button", "UserInfoPart").element_info.name)
         time.sleep(0.5)
     hint = occlusion_hint(pid)
-    raise LaunchError(
-        "微软登录：提交后未进入已登录态" + (f"\n  ⚠️ {hint}" if hint else "")
-    )
+    detail = hint or f"窗口诊断未发现问题。{window_state_facts(pid)}"
+    raise LaunchError(f"微软登录：提交后未进入已登录态\n  ⚠️ {detail}")
 
 
 # ---------------------------------------------------------------------------

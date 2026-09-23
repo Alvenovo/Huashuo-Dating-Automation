@@ -423,3 +423,23 @@ def test_prune_pytest_tmp_never_raises(tmp_path, monkeypatch):
     blocker.write_text("x", encoding="utf-8")       # 拿普通文件当目录根
     monkeypatch.setattr(suites, "PYTEST_TMP_ROOT", blocker)
     assert suites.prune_pytest_tmp() == 0           # 不能抛
+
+
+@pytest.mark.unit
+def test_build_command_honours_the_evidence_env_knob(monkeypatch):
+    """`HALL_EVIDENCE=failure-only` 能把证据量压回去（默认 `all`）。
+
+    放在 `build_command` 而不是调用方：普通段与提权段都经过它，一处就够 ——
+    分散到两处必然漏一个，漏的那段会静默用默认值（提权段的证据是唯一能复现
+    真装真卸现场的东西）。
+    """
+    monkeypatch.delenv("HALL_EVIDENCE", raising=False)
+    assert not any(a.startswith("--evidence=") for a in suites.build_command(get_suite("launch")))
+
+    monkeypatch.setenv("HALL_EVIDENCE", "failure-only")
+    assert "--evidence=failure-only" in suites.build_command(get_suite("launch"))
+
+    monkeypatch.setenv("HALL_EVIDENCE", "   ")
+    assert not any(
+        a.startswith("--evidence=") for a in suites.build_command(get_suite("launch"))
+    ), "空值/空白不该塞一个空的 --evidence= 进去"

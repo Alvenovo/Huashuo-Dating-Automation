@@ -328,6 +328,17 @@ def build_command(suite: Suite, *, shard: int = 1, of: int = 1, extra: list[str]
     # （2026-09-23 真机日志里就有）。我们**一条都不用** `--lf/--ff/cache` fixture，
     # 关掉零代价。守卫：tests/unit/test_suite_planning.py。
     argv += ["-p", "no:cacheprovider"]
+    # `HALL_EVIDENCE=failure-only` 把证据量压回去（默认 `all`，见 tests/conftest.py）。
+    #
+    # 放在**这里**而不是调用方：普通段（`farm_agent.run_suite`）和提权段
+    # （`run_suite_elevated`）都经过本函数，一处就够 —— 分散到两处必然漏一个，
+    # 而漏了的那段会静默用默认值（提权段的证据是唯一能复现真装真卸现场的东西）。
+    #
+    # 为什么不放 `pytest.ini` / 环境变量直通：`farm_agent` 已经把 `farm_node.env`
+    # 合进子进程环境，`pytest.ini` 里写死又改不了单次运行。这里读进程环境最省事。
+    evidence_mode = os.environ.get("HALL_EVIDENCE", "").strip()
+    if evidence_mode:
+        argv.append(f"--evidence={evidence_mode}")
     if basetemp:
         argv.append(f"--basetemp={basetemp}")
     if extra:

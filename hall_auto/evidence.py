@@ -110,10 +110,23 @@ class EvidenceSession:
         # error 也要留图：setup 崩掉时现场（临时目录被拒、夹具起不来）只能靠截图复现
         return self.mode == MODE_ALL or outcome in (OUTCOME_FAILED, OUTCOME_ERROR)
 
-    def record(self, nodeid: str, outcome: str, duration: float, assertion: str, title: str = "") -> CaseRecord:
+    def record(self, nodeid: str, outcome: str, duration: float, assertion: str,
+               title: str = "", capture: bool = True) -> CaseRecord:
+        """记一条用例。`capture=False` = **连证据目录都不建**（不只是不抓屏）。
+
+        ## 为什么要有这个开关（2026-09-23）
+
+        `--evidence=all` 一开，**每一条**用例都抓一次屏。而 `tests/unit` 有 600+ 条
+        **纯逻辑**用例，它们不碰 UI —— 抓下来的是**桌面**，一条都没有排查价值，
+        代价却是实测 `pytest tests/unit` 从 **16s → 149s**（633 次抓屏）。
+
+        单测的结论在 `summary.json` / `report.html` 里**一条都不少**，
+        所以这里省掉的只是"没用的桌面截图"，不是信息。
+        调用方（`tests/conftest.py`）按 marker 判定：带 `unit` 的用例传 `capture=False`。
+        """
         module, case = module_of(nodeid), case_of(nodeid)
         screenshot_rel = None
-        if self._should_capture(outcome):
+        if capture and self._should_capture(outcome):
             case_dir = self.run_dir / _safe_name(module) / _safe_name(case)
             case_dir.mkdir(parents=True, exist_ok=True)
             png = case_dir / "final.png"

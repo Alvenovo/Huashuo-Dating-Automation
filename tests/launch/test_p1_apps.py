@@ -33,7 +33,7 @@ from hall_auto.launch import (
 from hall_auto.login import logged_in, login_with_password, logout
 from hall_auto.product import _file_version, is_admin, stop_main_process
 from hall_auto.version import four_segment
-from hall_auto.winapi import occlusion_hint
+from hall_auto.winapi import occlusion_hint, window_state_facts
 
 
 @pytest.fixture(scope="module")
@@ -132,15 +132,20 @@ def test_update_fixture_via_hall(cfg, ready_main):
 
 
 def _occlusion_suffix(pid: int) -> str:
-    """把「大厅被谁挡住了」拼进失败信息；没被挡返回空串。
+    """把「大厅窗口当时是什么状态」拼进失败信息。
 
-    2026-09-23 真机：这条断言超时 45s，而失败截图里**大厅一个像素都没露**（微信在前台）。
-    大厅主内容区是 WebView2，**被遮挡时 Chromium 会暂停渲染** → 页面永远刷不出来，
-    而 Win32 控件层照样读得到。原来只能靠人逐张看 PNG 截图才能定性，
-    现在「谁挡着」直接写在报错里。
+    2026-09-23 真机：这条断言超时 45s，而失败截图里**大厅一个像素都没露**。
+    大厅主内容区是 WebView2，**被遮挡 / 最小化 / 不可见时 Chromium 不渲染** →
+    页面永远刷不出来，而 Win32 控件层照样读得到。原来只能靠人逐张看 PNG 截图才能定性。
+
+    ⚠️ **诊断说"没问题"时也要给依据**（`window_state_facts`）——
+    只报结论的话，遇到"结论说没事、截图说大厅不在屏幕上"就只能猜，
+    而两边都不足以定性（2026-09-23 就卡在这儿）。
     """
     hint = occlusion_hint(pid)
-    return f"\n  ⚠️ {hint}" if hint else ""
+    if hint:
+        return f"\n  ⚠️ {hint}"
+    return f"\n  ℹ️ 窗口诊断未发现问题。{window_state_facts(pid)}"
 
 
 @pytest.mark.apps

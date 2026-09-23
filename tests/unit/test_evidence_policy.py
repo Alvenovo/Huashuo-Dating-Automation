@@ -171,6 +171,14 @@ class _FakeItem:
     def iter_markers(self):
         return []
 
+    def get_closest_marker(self, name):
+        """conftest 的 `_wants_screenshot` 用它判「是不是 unit 用例」。
+
+        假 item 没有 marker → 返回 None → 按「要抓屏」处理，
+        和这些用例原来的预期一致。
+        """
+        return next((m for m in self.iter_markers() if getattr(m, "name", "") == name), None)
+
 
 def _feed_report(conftest_mod, item, report):
     """驱动 hookwrapper 版的 `pytest_runtest_makereport`：走到 yield，再把假 report 交回去。"""
@@ -296,14 +304,21 @@ def _conftest_evidence_default() -> str:
     raise AssertionError("`tests/conftest.py` 里找不到 `--evidence` 的 default —— 守卫失效了")
 
 
-def test_evidence_default_is_failure_only():
-    """2026-09-22 定调：默认 `failure-only`（跑批产物太多，`reports/` 已堆 3.8 万张 PNG）。
+def test_evidence_default_is_all():
+    """2026-09-23 定调：默认 `all`（成功失败都留证）。
+
+    **2026-09-22 曾定成 `failure-only`**（`reports/` 堆到 3.8 万张 PNG），
+    2026-09-23 用户要求改回 `all` —— 理由是排查时**通过用例的现场图也有用**
+    （"这一步界面长什么样" 只能从通过那刻的图看，失败图只有崩掉那一刻）。
+
+    ⚠️ **代价要知道**：每台机器每轮全量档约 650 张图（`unit` 618 条也各一张），
+    比 `failure-only` 多约 150-200MB/轮。盘紧张时用 `--evidence=failure-only` 压回去。
 
     锁住是为了**别被静默改回去**：这个值决定每台机器每轮跑批往盘上写多少东西，
     改它该是一次有意识的决定，不是顺手。
     """
-    assert _conftest_evidence_default() == ev.MODE_FAILURE
-    assert ev.MODE_FAILURE == "failure-only", "命令行取值变了，手册和脚本都在用字面量"
+    assert _conftest_evidence_default() == ev.MODE_ALL
+    assert ev.MODE_ALL == "all", "命令行取值变了，手册和脚本都在用字面量"
 
 
 def test_runbook_states_the_same_default_as_conftest():
@@ -364,3 +379,46 @@ def test_assertion_text_keeps_short_text_intact():
 def test_assertion_text_handles_empty_longrepr():
     conftest_mod = _load_conftest()
     assert conftest_mod._assertion_text(_LongRepr("")) == ""
+
+
+# ---------------- --evidence=all 下 unit 不抓屏（2026-09-23）----------------
+#
+# `--evidence=all` 一开，**每一条**用例都抓一次屏。而 `tests/unit` 有 600+ 条
+# **纯逻辑**用例，它们不碰 UI —— 抓下来的是**桌面**，一条都没有排查价值，
+# 代价却是实测 `pytest tests/unit` 从 **16s → 149s**（633 次抓屏）。
+# 单测的结论在 `summary.json` / `report.html` 里一条都不少，所以省掉的不是信息。
+
+
+def test_unit_cases_do_not_take_screenshots():
+    """**核心**：`unit` 用例不抓屏。这条红了**别改断言**，去看 `_wants_screenshot`。"""
+    conftest_mod = _load_conftest()
+
+    class _Item:
+        def __init__(self, unit: bool):
+            self._unit = unit
+
+        def get_closest_marker(self, name):
+            return types.SimpleNamespace(name=name) if (self._unit and name == "unit") else None
+
+    assert conftest_mod._wants_screenshot(_Item(unit=True)) is False, (
+        "unit 用例抓的是桌面，没价值还慢 10 倍"
+    )
+    assert conftest_mod._wants_screenshot(_Item(unit=False)) is True, (
+        "UI 套件要抓 —— `--evidence=all` 的意图就是「通过用例也留现场图」"
+    )
+
+
+def test_capture_false_writes_no_evidence_dir(tmp_path, fake_capture):
+    """`capture=False` **连目录都不建**（不只是不抓屏），但**结论仍要记进 summary**。
+
+    守卫这条是为了别被"顺手改成只跳过抓屏" —— 那会留下 600+ 个**空目录**，
+    回传时白拷一堆目录项。
+    """
+    s, run = _session(tmp_path, ev.MODE_ALL)
+    rec = s.record(NODEID_BAD, ev.OUTCOME_FAILED, 1.0, "boom", capture=False)
+
+    assert not _case_dir(run, NODEID_BAD).exists(), "capture=False 不该建证据目录"
+    assert fake_capture == [], "capture=False 连抓屏都不该尝试"
+    assert rec.outcome == ev.OUTCOME_FAILED, "结论仍要记进 summary（省的是图，不是信息）"
+    assert s.records == [rec]
+

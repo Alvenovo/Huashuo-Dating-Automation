@@ -188,8 +188,13 @@ def ensure_window_shown(hwnd: int) -> str:
     return ""
 
 
-def occluders_of(hwnd: int, samples: int = 5) -> list[str]:
-    """挡在这个窗口前面的、**属于别的进程**的窗口标题（去重保序）。空 = 没被挡。
+def _occlusion_scan(hwnd: int, samples: int = 5) -> tuple[list[str], int, int]:
+    """返回 (遮挡者名字, 落在大厅自己身上的采样点数, 总采样点数)。
+
+    ⚠️ **「采样点落在大厅自己身上」和「采样点什么都没碰到」是两回事**：
+    前者 = 大厅确实在最上；后者 = 采样点根本不在屏幕上（窗口被挪到屏幕外 / rect 不可信）。
+    原来只返回遮挡者列表，这两种情况都表现为"空列表"，**没法区分** ——
+    2026-09-23 真机就是这样：诊断报"没被挡"，而截图里大厅不在屏幕上，人只能在两者之间猜。
 
     ⚠️ **必须按 pid 过滤**：大厅自己的登录弹窗 / 绑定弹窗都是**独立顶层窗**，
     它们盖在主窗上时 `WindowFromPoint` 也会指到它们。不过滤的话，
@@ -198,7 +203,7 @@ def occluders_of(hwnd: int, samples: int = 5) -> list[str]:
     left, top, right, bottom = _hwnd_rect(hwnd)
     width, height = right - left, bottom - top
     if width <= 0 or height <= 0:
-        return []
+        return [], 0, 0
     points = [(left + width // 2, top + height // 2)]
     if samples >= 3:
         points += [
@@ -211,18 +216,53 @@ def occluders_of(hwnd: int, samples: int = 5) -> list[str]:
             (left + width // 4, bottom - height // 4),
         ]
     pid = _hwnd_pid(hwnd)
-    out: list[str] = []
+    names: list[str] = []
+    own = 0
     for x, y in points:
         at = int(_user32.WindowFromPoint(wintypes.POINT(x, y)) or 0)
         if not at:
             continue
         root = int(_user32.GetAncestor(at, GA_ROOT) or at)
         if root == hwnd or _hwnd_pid(root) == pid:
+            own += 1
             continue
         title = _hwnd_text(root) or _hwnd_class(root) or f"hwnd={root}"
-        if title not in out:
-            out.append(title)
-    return out
+        if title not in names:
+            names.append(title)
+    return names, own, len(points)
+
+
+def occluders_of(hwnd: int, samples: int = 5) -> list[str]:
+    """挡在这个窗口前面的、**属于别的进程**的窗口标题（去重保序）。空 = 没被挡。"""
+    return _occlusion_scan(hwnd, samples)[0]
+
+
+def window_state_facts(pid: int) -> str:
+    """一行**原始事实**：hwnd / rect / visible / iconic / 采样命中 / 遮挡列表。
+
+    `occlusion_hint` 给**结论**，这里给**依据** —— 两者都要有。
+
+    2026-09-23 真机教训：诊断返回空（按当时的逻辑 = "窗口可见且在最上"），
+    而失败截图里**大厅不在屏幕上**。**只报结论、不报依据**就会这样 ——
+    人只能在"截图"和"结论"之间反复猜，而两边都不足以定性。
+    把原始数字打出来，一眼就能看出是"真没问题"还是"诊断没覆盖到"。
+    """
+    hwnd = _main_window_hwnd(pid)
+    if not hwnd:
+        hidden = _main_window_hwnd(pid, visible_only=False)
+        if not hidden:
+            return f"窗口状态：pid={pid} **没有任何顶层窗**（进程可能已退出）"
+        return (
+            f"窗口状态：pid={pid} 无**可见**顶层窗；最大隐藏窗 hwnd=0x{hidden:X} "
+            f"rect={_hwnd_rect(hidden)} visible={_hwnd_visible(hidden)} "
+            f"iconic={bool(_user32.IsIconic(hidden))}"
+        )
+    names, own, total = _occlusion_scan(hwnd)
+    return (
+        f"窗口状态：pid={pid} hwnd=0x{hwnd:X} rect={_hwnd_rect(hwnd)} "
+        f"visible={_hwnd_visible(hwnd)} iconic={bool(_user32.IsIconic(hwnd))} "
+        f"采样命中大厅自己 {own}/{total} 遮挡={names or '无'}"
+    )
 
 
 def occlusion_hint(pid: int) -> str:
