@@ -7,9 +7,12 @@ import pytest
 from hall_auto.console import focus_console
 from hall_auto.launch import start_fresh, wait_main_window, wait_until_ready
 from hall_auto.login import (
+    BIND_DIALOG_TIMEOUT_SEC,
     _by_aid,
     _by_name,
     close_microsoft_login,
+    dismiss_bind_dialog,
+    find_bind_dialog,
     handle_bind_phone_popup,
     login_dialog_open,
     login_field_aids,
@@ -171,7 +174,9 @@ def test_microsoft_login_sso(cfg, ready_pid):
     """微软账号登录：填邮箱→下一步→点缓存账号磁贴走 SSO 免密→断言已登录→finally 还原登出。
 
     设计边界（主流程自动化设计.md）：微软账号测到系统/WebView 登录窗为止；
-    出现密码页(i0118) / MFA / 邮箱验证码页则标记人工、不算脚本失败（skip）。
+    出现密码页(i0118) / MFA / 邮箱验证码页 / **绑定手机号弹窗** 则标记人工、
+    不算脚本失败（skip）。**最后一种是 2026-09-23 真机补上的** —— 微软账号那个号
+    没绑过手机号时，SSO 成功后会弹「绑定手机号」，绑定要人收短信码，无人值守跑不通。
     本机有缓存的 Windows/MS 会话时，点「下一步」直接出账号选择器，可免密 SSO，
     所以这条在专用机上能无人值守跑通；无缓存会话的机器会落到 password / email_otp 分支 skip。
     邮箱走 HALL_MS_USER（或 config.local.yaml 的 accounts.microsoft.email），不进 git、不进对话。
@@ -204,6 +209,27 @@ def test_microsoft_login_sso(cfg, ready_pid):
     try:
         if state == "account_picker":
             microsoft_pick_account(ms_win, email)
+        # 2026-09-23 真机新增分支：**微软账号那个号没绑过手机号时，SSO 之后会弹「绑定手机号」**。
+        #
+        # 绑定必须人收短信码 → 无人值守跑不通。所以和已有的 password / mfa / email_otp
+        # 一样**标记人工、不算脚本失败（skip）** —— 这条用例的 docstring 本来就写了
+        # 这条设计边界，只是漏了「绑定」这一种。收码 + 绑定的流程在
+        # `test_microsoft_login_code_manual`（-m manual）。
+        #
+        # ⚠️ **必须在这里判，不能等 `wait_microsoft_logged_in`**：绑定弹窗是登录的
+        # **必填一步**，不绑就回不到已登录态。等下去只会 40s 超时后报
+        # 「提交后未进入已登录态」，把「这个号没绑手机号」这个真因**盖成"登录失败"**
+        # —— 2026-09-23 真机就是这么被带偏的（现场看到的是脚本把弹窗关掉了，很费解）。
+        #
+        # ⚠️ **弹窗要先收掉再 skip**：它是模态的，留着会把后面每条用例都点不动。
+        # 收掉 = 放弃这次登录，所以下面不会再走到"已登录态"。
+        if find_bind_dialog(ready_pid, timeout_sec=BIND_DIALOG_TIMEOUT_SEC) is not None:
+            dismiss_bind_dialog(ready_pid)
+            pytest.skip(
+                "微软 SSO 之后弹了「绑定手机号」：绑定要人收短信码，标记人工；"
+                "收码 + 绑定流程见 test_microsoft_login_code_manual（-m manual）。"
+                "**根治办法：手工把微软账号绑一次手机号**，之后这条就能无人值守跑通。"
+            )
         name = wait_microsoft_logged_in(ready_pid)
         assert logged_in(ready_pid), "SSO 后仍未进入已登录态"
         assert "已登录" in name, f"已登录态用户区文案异常: {name!r}"

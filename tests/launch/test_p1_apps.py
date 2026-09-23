@@ -131,8 +131,6 @@ def test_update_fixture_via_hall(cfg, ready_main):
     assert uf.name not in state.items, f"更新完 {uf.name} 还在更新列表里: {list(state.items)}"
 
 
-@pytest.mark.apps
-@pytest.mark.login
 def _occlusion_suffix(pid: int) -> str:
     """把「大厅被谁挡住了」拼进失败信息；没被挡返回空串。
 
@@ -145,6 +143,8 @@ def _occlusion_suffix(pid: int) -> str:
     return f"\n  ⚠️ {hint}" if hint else ""
 
 
+@pytest.mark.apps
+@pytest.mark.login
 def test_sync_list_logged_in(cfg):
     """登录后同步列表能刷出「其他电脑已装应用」。只读断言：
     页底「全部安装」（InstallAllBtn）和条目安装会真装 QQ/网盘这类日常软件，绝不点。
