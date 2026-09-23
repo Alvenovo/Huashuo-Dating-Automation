@@ -33,6 +33,7 @@ from hall_auto.launch import (
 from hall_auto.login import logged_in, login_with_password, logout
 from hall_auto.product import _file_version, is_admin, stop_main_process
 from hall_auto.version import four_segment
+from hall_auto.winapi import occlusion_hint
 
 
 @pytest.fixture(scope="module")
@@ -132,6 +133,18 @@ def test_update_fixture_via_hall(cfg, ready_main):
 
 @pytest.mark.apps
 @pytest.mark.login
+def _occlusion_suffix(pid: int) -> str:
+    """把「大厅被谁挡住了」拼进失败信息；没被挡返回空串。
+
+    2026-09-23 真机：这条断言超时 45s，而失败截图里**大厅一个像素都没露**（微信在前台）。
+    大厅主内容区是 WebView2，**被遮挡时 Chromium 会暂停渲染** → 页面永远刷不出来，
+    而 Win32 控件层照样读得到。原来只能靠人逐张看 PNG 截图才能定性，
+    现在「谁挡着」直接写在报错里。
+    """
+    hint = occlusion_hint(pid)
+    return f"\n  ⚠️ {hint}" if hint else ""
+
+
 def test_sync_list_logged_in(cfg):
     """登录后同步列表能刷出「其他电脑已装应用」。只读断言：
     页底「全部安装」（InstallAllBtn）和条目安装会真装 QQ/网盘这类日常软件，绝不点。
@@ -151,7 +164,11 @@ def test_sync_list_logged_in(cfg):
         logged_main = concrete_main(pid, cfg.display_name_contains)
         open_mine(logged_main)
         state = app_list_state(logged_main, "sync")
-        assert state.loaded and not state.needs_login, "登录后同步页仍没刷出列表（NoAppListBox 没出现）"
+        assert state.loaded and not state.needs_login, (
+            "登录后同步页仍没刷出列表（NoAppListBox 没出现）"
+            f"（loaded={state.loaded}, needs_login={state.needs_login}, items={len(state.items)}）"
+            + _occlusion_suffix(pid)
+        )
         assert state.items, "同步列表为空：该账号在其他电脑没有安装记录，或条目名没读出来"
         assert all(name != SYNC_ITEM_PLACEHOLDER for name in state.items), (
             f"条目名读到的还是占位内部类名: {list(state.items)}"

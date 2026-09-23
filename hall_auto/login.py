@@ -10,7 +10,7 @@ from pywinauto.uia_element_info import UIAElementInfo
 from hall_auto.config import Config
 from hall_auto.launch import LaunchError, _press_button, popup_text
 from hall_auto.waiting import wait_until, wait_until_or_raise
-from hall_auto.winapi import _hwnd_pid, _hwnd_visible, _top_hwnds
+from hall_auto.winapi import _hwnd_pid, _hwnd_visible, _top_hwnds, occlusion_hint
 
 LOGIN_DIALOG_TIMEOUT_SEC = 15
 LOGIN_SUBMIT_TIMEOUT_SEC = 25
@@ -853,13 +853,22 @@ def microsoft_pick_account(ms_win, email: str) -> None:
 
 
 def wait_microsoft_logged_in(pid: int) -> str:
-    """SSO/提交后等回大厅已登录态，返回用户区文案。"""
+    """SSO/提交后等回大厅已登录态，返回用户区文案。
+
+    超时时**必须把「大厅是不是被挡住了」写进报错**：2026-09-23 真机这条超时 40s，
+    而失败截图里大厅一个像素都没露（微信在前台）。大厅主内容区是 WebView2，
+    被遮挡时 Chromium 暂停渲染 —— 登录页永远提交不出去，而 Win32 控件照样读得到。
+    人得逐张看截图才能定性，所以这里直接给出「谁挡着」。
+    """
     deadline = time.time() + MICROSOFT_SSO_TIMEOUT_SEC
     while time.time() < deadline:
         if logged_in(pid):
             return popup_text(_by_aid(pid, "Button", "UserInfoPart").element_info.name)
         time.sleep(0.5)
-    raise LaunchError("微软登录：提交后未进入已登录态")
+    hint = occlusion_hint(pid)
+    raise LaunchError(
+        "微软登录：提交后未进入已登录态" + (f"\n  ⚠️ {hint}" if hint else "")
+    )
 
 
 # ---------------------------------------------------------------------------
